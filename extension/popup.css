@@ -1,0 +1,146 @@
+body {
+    background: #1e1e22;
+    color: #dcddde;
+    font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
+    font-size: 13px;
+    margin: 0;
+    padding: 14px 14px 12px;
+    width: 320px;
+}
+
+#header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+#header strong {
+    font-size: 15px;
+}
+
+#status {
+    color: #8e8e96;
+    font-size: 11px;
+    margin-left: auto;
+}
+
+button {
+    background: #7c6dd8;
+    color: white;
+    border: none;
+    padding: 6px 12px;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+}
+
+button:hover {
+    background: #8e7eea;
+}
+
+button.ghost {
+    background: transparent;
+    color: #8e8e96;
+    border: 1px solid #33333a;
+    padding: 4px 10px;
+    font-weight: normal;
+}
+
+button.ghost:hover {
+    color: #dcddde;
+    border-color: #7c6dd8;
+    background: transparent;
+}
+
+button.small {
+    font-size: 11px;
+    padding: 3px 8px;
+}
+
+input[type="text"], input[type="password"] {
+    width: 100%;
+    background: #18181c;
+    color: #dcddde;
+    border: 1px solid #33333a;
+    border-radius: 5px;
+    padding: 7px 9px;
+    font-size: 13px;
+    box-sizing: border-box;
+    font-family: inherit;
+}
+
+input:focus {
+    outline: none;
+    border-color: #7c6dd8;
+}
+
+label {
+    display: block;
+    margin: 10px 0 4px;
+    color: #8e8e96;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    font-weight: 600;
+}
+
+hr {
+    border: none;
+    border-top: 1px solid #26262c;
+    margin: 14px 0;
+}
+
+.account {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 0;
+    border-bottom: 1px solid #26262c;
+}
+
+.account:last-of-type {
+    border-bottom: none;
+}
+
+.account .name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.muted {
+    color: #8e8e96;
+    font-size: 11px;
+}
+
+.error {
+    color: #e06c75;
+    font-size: 12px;
+}
+
+.info {
+    color: #98c379;
+    font-size: 12px;
+}
+
+#banner {
+    margin-top: 10px;
+    min-height: 16px;
+}
+
+.row {
+    display: flex;
+    gap: 6px;
+    margin-top: 8px;
+}
+
+.row > * {
+    flex: 0 0 auto;
+}
+
+.row > .grow {
+    flex: 1 1 auto;
+}

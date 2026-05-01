@@ -1,0 +1,39 @@
+{
+    "manifest_version": 2,
+    "name": "Password Manager",
+    "version": "0.1.0",
+    "description": "Talks to the local Rust password-manager daemon via native messaging.",
+    "browser_specific_settings": {
+        "gecko": {
+            "id": "passwort-manager@local",
+            "strict_min_version": "60.0"
+        }
+    },
+    "permissions": [
+        "nativeMessaging",
+        "activeTab",
+        "tabs",
+        "clipboardWrite"
+    ],
+    "background": {
+        "scripts": ["background.js"],
+        "persistent": true
+    },
+    "browser_action": {
+        "default_popup": "popup.html",
+        "default_title": "Password Manager",
+        "default_icon": {
+            "48": "icons/icon-48.svg"
+        }
+    },
+    "icons": {
+        "48": "icons/icon-48.svg"
+    },
+    "content_scripts": [
+        {
+            "matches": ["<all_urls>"],
+            "js": ["content.js"],
+            "run_at": "document_idle"
+        }
+    ]
+}
