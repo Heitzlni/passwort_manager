@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Password Manager
+GenericName=Password Vault
+Comment=Local AES-256-GCM encrypted password vault
+Exec=BINARY_PATH
+Icon=passwort-manager
+Categories=Utility;Security;
+Terminal=false
+StartupWMClass=Password Manager
+Keywords=password;vault;security;passwort;
