@@ -1,1 +1,16 @@
+# Rust build artifacts
 /target
+**/*.rs.bk
+
+# Editor / OS junk
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Never commit a vault file accidentally dropped into the repo dir.
+# (The app stores its real vault in $XDG_DATA_HOME/passwort-manager/vault.json.)
+/accounts.json
+/accounts.json.tmp
+/vault.json
+/vault.json.tmp
