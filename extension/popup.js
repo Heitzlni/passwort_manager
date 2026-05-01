@@ -1,4 +1,4 @@
-// Popup logic: status, login, list-for-origin, fill, copy, save.
+// Popup logic.
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -21,8 +21,22 @@ async function rpc(payload) {
     try {
         return await browser.runtime.sendMessage({ type: "rpc", payload });
     } catch (e) {
-        return { kind: "error", message: e.message || String(e) };
+        return { kind: "error", code: "transport", message: e.message || String(e) };
     }
+}
+
+async function listCaptured() {
+    try {
+        return await browser.runtime.sendMessage({ type: "list_captured" });
+    } catch {
+        return [];
+    }
+}
+
+async function discardCaptured(origin) {
+    try {
+        await browser.runtime.sendMessage({ type: "discard_captured", origin });
+    } catch {}
 }
 
 async function currentTab() {
@@ -36,6 +50,16 @@ function originOf(urlStr) {
     } catch {
         return "";
     }
+}
+
+// Hostname-aware match: a saved name matches a host iff
+// it equals the host OR the host is a subdomain of it (host ends with "." + saved).
+// This avoids `notexample.com` matching a saved `example.com`.
+function nameMatchesHost(saved, host) {
+    if (!saved || !host) return false;
+    const s = saved.toLowerCase();
+    const h = host.toLowerCase();
+    return s === h || h.endsWith("." + s);
 }
 
 function showError(msg) {
@@ -57,28 +81,38 @@ async function refresh() {
     const status = await rpc({ op: "status" });
     if (status.kind === "error") {
         $("#status").textContent = "(error)";
-        const root = $("#content");
-        root.innerHTML = "";
-        root.appendChild(
+        $("#content").innerHTML = "";
+        $("#content").appendChild(
             el(
                 "div",
                 { class: "muted" },
                 "Cannot reach the daemon. Make sure passwortd is running."
             )
         );
-        showError(status.message);
+        showError(status.message || "transport error");
         return;
     }
 
     if (status.unlocked) {
-        $("#status").textContent = `unlocked · ${status.account_count} account${
-            status.account_count === 1 ? "" : "s"
-        }`;
+        const idle = status.idle_secs ?? 0;
+        const cap = status.auto_lock_secs ?? 0;
+        const remaining =
+            cap > 0 ? Math.max(0, cap - idle) : null;
+        const suffix = remaining != null ? ` · auto-locks in ${formatSecs(remaining)}` : "";
+        $("#status").textContent =
+            `unlocked · ${status.account_count} account${status.account_count === 1 ? "" : "s"}${suffix}`;
         await renderUnlocked();
     } else {
         $("#status").textContent = "locked";
         renderLogin();
     }
+}
+
+function formatSecs(s) {
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m`;
+    return `${Math.floor(m / 60)}h${m % 60}m`;
 }
 
 function renderLogin() {
@@ -118,9 +152,76 @@ async function renderUnlocked() {
     root.innerHTML = "";
     root.appendChild(el("div", { class: "muted" }, origin || "(no http origin)"));
 
-    // Section: matches for current origin
-    const list = await rpc({ op: "list", filter: origin });
-    const matches = list.kind === "names" ? list.names : [];
+    // Captured-this-session credentials (most useful when there's one for this origin).
+    const captured = await listCaptured();
+    const capturedForOrigin = captured.find((c) => c.origin === origin);
+
+    if (capturedForOrigin) {
+        const saveBtn = el(
+            "button",
+            {
+                onclick: async () => {
+                    const r = await rpc({
+                        op: "save",
+                        name: capturedForOrigin.origin,
+                        password: capturedForOrigin.password,
+                    });
+                    if (r.kind === "ok") {
+                        await discardCaptured(capturedForOrigin.origin);
+                        showInfo(`Saved "${capturedForOrigin.origin}".`);
+                        refresh();
+                    } else {
+                        await maybeHandleLocked(r);
+                        showError(r.message || "save failed");
+                    }
+                },
+            },
+            "Save"
+        );
+        const dismissBtn = el(
+            "button",
+            {
+                class: "ghost",
+                onclick: async () => {
+                    await discardCaptured(capturedForOrigin.origin);
+                    refresh();
+                },
+            },
+            "Dismiss"
+        );
+        const userPart = capturedForOrigin.username
+            ? ` (${capturedForOrigin.username})`
+            : "";
+        root.appendChild(el("hr"));
+        root.appendChild(el("label", {}, "Captured from this page"));
+        root.appendChild(
+            el(
+                "div",
+                { class: "captured" },
+                el(
+                    "span",
+                    { class: "muted", style: "flex: 1;" },
+                    `${capturedForOrigin.origin}${userPart}`
+                ),
+                saveBtn,
+                dismissBtn
+            )
+        );
+    }
+
+    // Section: matches for current origin (proper hostname match, not substring)
+    root.appendChild(el("hr"));
+    root.appendChild(el("label", {}, "On this site"));
+    const list = await rpc({ op: "list" });
+
+    if (list.kind === "error") {
+        await maybeHandleLocked(list);
+        return;
+    }
+    const allNames = list.kind === "names" ? list.names : [];
+    const matches = origin
+        ? allNames.filter((n) => nameMatchesHost(n, origin))
+        : [];
 
     if (matches.length === 0) {
         root.appendChild(
@@ -154,10 +255,9 @@ async function renderUnlocked() {
         }
     }
 
-    // Section: save
+    // Section: manual save (still useful even without capture)
     root.appendChild(el("hr"));
-    root.appendChild(el("label", {}, "Save this page"));
-
+    root.appendChild(el("label", {}, "Save this page manually"));
     const nameInput = el("input", { type: "text" });
     nameInput.value = origin;
     const pwInput = el("input", { type: "password", placeholder: "Password to save" });
@@ -178,6 +278,7 @@ async function renderUnlocked() {
                     showInfo(`Saved "${nameInput.value}".`);
                     refresh();
                 } else {
+                    await maybeHandleLocked(r);
                     showError(r.message || "save failed");
                 }
             },
@@ -241,10 +342,22 @@ async function renderUnlocked() {
     );
 }
 
+// If a response is a "locked" error, refresh the popup to show the unlock form.
+async function maybeHandleLocked(resp) {
+    if (resp && resp.kind === "error" && resp.code === "locked") {
+        await refresh();
+        return true;
+    }
+    return false;
+}
+
 async function fillOnTab(tab, name) {
     if (!tab) return showError("no active tab");
     const got = await rpc({ op: "get", name });
-    if (got.kind !== "credential") return showError(got.message || "not found");
+    if (got.kind !== "credential") {
+        if (await maybeHandleLocked(got)) return;
+        return showError(got.message || "not found");
+    }
     try {
         const r = await browser.tabs.sendMessage(tab.id, {
             type: "fill_password",
@@ -259,7 +372,10 @@ async function fillOnTab(tab, name) {
 
 async function copyPassword(name) {
     const got = await rpc({ op: "get", name });
-    if (got.kind !== "credential") return showError(got.message || "not found");
+    if (got.kind !== "credential") {
+        if (await maybeHandleLocked(got)) return;
+        return showError(got.message || "not found");
+    }
     try {
         await navigator.clipboard.writeText(got.password);
         showInfo(`Copied password for "${name}". Clear your clipboard when done.`);

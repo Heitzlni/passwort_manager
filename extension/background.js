@@ -1,12 +1,17 @@
-// Background page: keeps a single connection to the native messaging host
-// (which in turn talks to passwortd). Serializes RPCs since the host
-// processes one request at a time.
+// Background page:
+// - Single connection to the native messaging host (which relays to passwortd).
+// - Per-RPC serialization (the host processes one request at a time).
+// - Buffer of "captured" credentials reported by content scripts; the popup
+//   pulls these on demand so the user can choose to save them.
 
 const HOST = "passwort_manager";
 
 let port = null;
 let pending = null;
 const queue = [];
+
+// Map<origin, {origin, username, password, capturedAt}>
+const captured = new Map();
 
 function connect() {
     if (port) return;
@@ -53,9 +58,46 @@ function send(req) {
     });
 }
 
+function refreshBadge() {
+    const n = captured.size;
+    browser.browserAction.setBadgeText({ text: n > 0 ? String(n) : "" });
+    browser.browserAction.setBadgeBackgroundColor({ color: "#7c6dd8" });
+}
+
 browser.runtime.onMessage.addListener((msg) => {
-    if (msg && msg.type === "rpc") {
+    if (!msg) return;
+
+    if (msg.type === "rpc") {
         return send(msg.payload);
     }
-    return Promise.reject(new Error("unknown message type"));
+
+    if (msg.type === "captured_submit") {
+        if (!msg.origin || !msg.password) return;
+        captured.set(msg.origin, {
+            origin: msg.origin,
+            username: msg.username || "",
+            password: msg.password,
+            capturedAt: Date.now(),
+        });
+        refreshBadge();
+        return Promise.resolve({ ok: true });
+    }
+
+    if (msg.type === "list_captured") {
+        return Promise.resolve(Array.from(captured.values()));
+    }
+
+    if (msg.type === "discard_captured") {
+        captured.delete(msg.origin);
+        refreshBadge();
+        return Promise.resolve({ ok: true });
+    }
+
+    if (msg.type === "clear_captured") {
+        captured.clear();
+        refreshBadge();
+        return Promise.resolve({ ok: true });
+    }
+
+    return Promise.reject(new Error("unknown message type: " + msg.type));
 });

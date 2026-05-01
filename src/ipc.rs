@@ -28,6 +28,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 use crate::session::{self, InitialState, Session};
 use crate::storage;
@@ -300,13 +301,14 @@ fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
             }
         }
 
-        Request::Unlock { password } => {
+        Request::Unlock { mut password } => {
             let mut s = state.lock().unwrap();
             if s.session.is_some() {
                 s.last_activity = Instant::now();
+                password.zeroize();
                 return Response::Ok;
             }
-            match session::initial_state() {
+            let resp = match session::initial_state() {
                 InitialState::NeedsLogin(vault) => {
                     match session::login(&vault, password.as_bytes()) {
                         Ok(sess) => {
@@ -337,7 +339,10 @@ fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
                 InitialState::IoError(e) => {
                     error(codes::IO_ERROR, format!("vault io error: {}", e))
                 }
-            }
+            };
+            // Wipe the deserialized password regardless of which branch ran.
+            password.zeroize();
+            resp
         }
 
         Request::Lock => {

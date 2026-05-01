@@ -6,8 +6,8 @@
 //! relays the JSON to the daemon over its Unix socket as NDJSON, reads the
 //! NDJSON response, and writes it back to stdout with the same length frame.
 //!
-//! The host is stateless apart from a single open daemon connection; it
-//! runs only while the browser is connected and exits when stdin closes.
+//! If the daemon is unreachable, the host emits one structured error
+//! response (so the extension can show a useful message) and exits.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -16,16 +16,24 @@ const MAX_MESSAGE_SIZE: u32 = 1024 * 1024; // 1 MiB; browser default is also ~1 
 
 pub fn run() -> io::Result<()> {
     let socket_path = crate::ipc::socket_path();
-    let stream = UnixStream::connect(&socket_path).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!(
-                "could not connect to daemon at {}: {}. Is `passwortd` running?",
-                socket_path.display(),
-                e
-            ),
-        )
-    })?;
+    let stream = match UnixStream::connect(&socket_path) {
+        Ok(s) => s,
+        Err(e) => {
+            // Tell the browser, in our own protocol, why we couldn't proceed.
+            let err = serde_json::json!({
+                "kind": "error",
+                "code": "daemon_unavailable",
+                "message": format!(
+                    "could not connect to daemon at {}: {}. Is `passwortd` running?",
+                    socket_path.display(),
+                    e
+                )
+            });
+            let payload = err.to_string();
+            write_framed(payload.as_bytes())?;
+            return Ok(());
+        }
+    };
 
     let mut to_daemon = stream.try_clone()?;
     let mut from_daemon = BufReader::new(stream);
@@ -68,10 +76,19 @@ pub fn run() -> io::Result<()> {
             ));
         }
         let payload = response.trim_end_matches(['\n', '\r']).as_bytes();
-        let resp_len = payload.len() as u32;
-
-        output.write_all(&resp_len.to_le_bytes())?;
-        output.write_all(payload)?;
-        output.flush()?;
+        write_framed_to(&mut output, payload)?;
     }
+}
+
+fn write_framed(body: &[u8]) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    write_framed_to(&mut out, body)
+}
+
+fn write_framed_to<W: Write>(out: &mut W, body: &[u8]) -> io::Result<()> {
+    let len = body.len() as u32;
+    out.write_all(&len.to_le_bytes())?;
+    out.write_all(body)?;
+    out.flush()
 }

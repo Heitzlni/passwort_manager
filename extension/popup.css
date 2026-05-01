@@ -144,3 +144,19 @@ hr {
 .row > .grow {
     flex: 1 1 auto;
 }
+
+.captured {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px;
+    background: #26262c;
+    border: 1px solid #7c6dd8;
+    border-radius: 5px;
+    margin-top: 6px;
+}
+
+.captured button {
+    font-size: 11px;
+    padding: 3px 8px;
+}
