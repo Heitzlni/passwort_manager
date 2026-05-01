@@ -1,31 +1,4 @@
-mod crypto;
-mod gui;
-mod session;
-mod storage;
-mod vault;
-
-#[cfg(unix)]
-fn harden_process() {
-    unsafe {
-        let zero = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        libc::setrlimit(libc::RLIMIT_CORE, &zero);
-    }
-
-    #[cfg(target_os = "linux")]
-    unsafe {
-        libc::prctl(libc::PR_SET_DUMPABLE, 0);
-    }
-
-    unsafe {
-        let _ = libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE);
-    }
-}
-
-#[cfg(not(unix))]
-fn harden_process() {}
+use passwort_manager::{gui, harden_process, storage, vault};
 
 fn main() {
     harden_process();
