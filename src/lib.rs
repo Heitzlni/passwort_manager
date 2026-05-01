@@ -1,6 +1,7 @@
 pub mod crypto;
 pub mod gui;
 pub mod ipc;
+pub mod native_host;
 pub mod session;
 pub mod storage;
 pub mod vault;

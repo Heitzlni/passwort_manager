@@ -1,0 +1,7 @@
+{
+    "name": "passwort_manager",
+    "description": "Password Manager native messaging bridge",
+    "path": "BINARY_PATH",
+    "type": "stdio",
+    "allowed_origins": ["chrome-extension://EXTENSION_ID/"]
+}
