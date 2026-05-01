@@ -3,7 +3,7 @@
 //! ```text
 //!   passwortd ──── unix socket ──── passwortctl
 //!                        │
-//!                        └────── (later) native-messaging host
+//!                        └────── native-messaging host (browsers)
 //! ```
 //!
 //! Messages are NDJSON: one JSON object per line, terminated by `\n`.
@@ -13,6 +13,10 @@
 //!
 //! Every accepted connection has its peer UID checked against ours via
 //! `SO_PEERCRED` on Linux; same-host other-user processes are refused.
+//!
+//! The daemon auto-locks after a configurable idle timeout (env var
+//! `PASSWORT_IDLE_TIMEOUT_SECS`, default 600 s). Setting it to 0 disables
+//! auto-lock.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -21,11 +25,17 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use crate::session::{self, InitialState, Session};
 use crate::storage;
+
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;
+const ENV_IDLE_TIMEOUT: &str = "PASSWORT_IDLE_TIMEOUT_SECS";
+const MAX_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+const MIN_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 // =================== Protocol ===================
 
@@ -59,6 +69,11 @@ pub enum Response {
     Status {
         unlocked: bool,
         account_count: usize,
+        /// Seconds since the last vault-touching operation. Only set when unlocked.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        idle_secs: Option<u64>,
+        /// Configured auto-lock timeout in seconds. 0 means disabled. Always set.
+        auto_lock_secs: u64,
     },
     Names {
         names: Vec<String>,
@@ -68,8 +83,29 @@ pub enum Response {
         password: String,
     },
     Error {
+        /// Stable machine-readable code (e.g. "locked", "wrong_password",
+        /// "not_found"). Lets clients branch without parsing the message.
+        code: String,
         message: String,
     },
+}
+
+// Error code constants — kept in one place so clients and the daemon agree.
+pub mod codes {
+    pub const LOCKED: &str = "locked";
+    pub const WRONG_PASSWORD: &str = "wrong_password";
+    pub const NOT_FOUND: &str = "not_found";
+    pub const VAULT_UNINITIALIZED: &str = "vault_uninitialized";
+    pub const VAULT_CORRUPTED: &str = "vault_corrupted";
+    pub const IO_ERROR: &str = "io_error";
+    pub const BAD_REQUEST: &str = "bad_request";
+}
+
+fn error(code: &str, message: impl Into<String>) -> Response {
+    Response::Error {
+        code: code.into(),
+        message: message.into(),
+    }
 }
 
 // =================== Socket location ===================
@@ -85,15 +121,30 @@ pub fn socket_path() -> PathBuf {
     PathBuf::from(format!("/tmp/passwort-manager-{}.sock", uid))
 }
 
-// =================== Daemon ===================
+fn idle_timeout() -> Duration {
+    let secs = std::env::var(ENV_IDLE_TIMEOUT)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
 
-type SharedSession = Arc<Mutex<Option<Session>>>;
+// =================== Daemon state ===================
+
+struct DaemonState {
+    session: Option<Session>,
+    last_activity: Instant,
+}
+
+type SharedState = Arc<Mutex<DaemonState>>;
+
+// =================== Daemon ===================
 
 pub fn run_daemon() -> std::io::Result<()> {
     let path = socket_path();
 
-    // Detect a stale socket from a previous crashed daemon: try to connect.
-    // A successful connect means another daemon is alive — refuse to start.
+    // Stale-socket detection: if the file exists, try connecting. A successful
+    // connect means another daemon is alive, so refuse to start.
     if path.exists() {
         match UnixStream::connect(&path) {
             Ok(_) => {
@@ -115,10 +166,28 @@ pub fn run_daemon() -> std::io::Result<()> {
     let listener = UnixListener::bind(&path)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
 
+    let timeout = idle_timeout();
+
     eprintln!("passwortd listening on {}", path.display());
     eprintln!("  vault: {}", storage::vault_path().display());
+    if timeout.as_secs() == 0 {
+        eprintln!("  auto-lock: disabled");
+    } else {
+        eprintln!("  auto-lock: {}s idle", timeout.as_secs());
+    }
 
-    let state: SharedSession = Arc::new(Mutex::new(None));
+    let state: SharedState = Arc::new(Mutex::new(DaemonState {
+        session: None,
+        last_activity: Instant::now(),
+    }));
+
+    // Background thread: lock the session if it has been idle too long.
+    if timeout.as_secs() > 0 {
+        let state = state.clone();
+        thread::Builder::new()
+            .name("auto-lock".into())
+            .spawn(move || auto_lock_loop(state, timeout))?;
+    }
 
     for stream in listener.incoming() {
         let stream = match stream {
@@ -141,6 +210,20 @@ pub fn run_daemon() -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+fn auto_lock_loop(state: SharedState, timeout: Duration) {
+    // Check ~4× per timeout window, clamped so very long timeouts still get
+    // sub-minute granularity and very short timeouts don't hot-spin.
+    let interval = (timeout / 4).clamp(MIN_CHECK_INTERVAL, MAX_CHECK_INTERVAL);
+    loop {
+        thread::sleep(interval);
+        let mut s = state.lock().unwrap();
+        if s.session.is_some() && s.last_activity.elapsed() >= timeout {
+            s.session = None;
+            eprintln!("auto-locked after {}s idle", timeout.as_secs());
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -174,11 +257,10 @@ fn verify_peer_uid(stream: &UnixStream) -> std::io::Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 fn verify_peer_uid(_stream: &UnixStream) -> std::io::Result<()> {
-    // On non-Linux we rely on the socket's 0600 permissions only.
     Ok(())
 }
 
-fn handle_client(stream: UnixStream, state: SharedSession) -> std::io::Result<()> {
+fn handle_client(stream: UnixStream, state: SharedState) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
     let mut line = String::new();
@@ -186,13 +268,11 @@ fn handle_client(stream: UnixStream, state: SharedSession) -> std::io::Result<()
         line.clear();
         let n = reader.read_line(&mut line)?;
         if n == 0 {
-            return Ok(()); // peer closed
+            return Ok(());
         }
         let resp = match serde_json::from_str::<Request>(line.trim()) {
             Ok(req) => process_request(req, &state),
-            Err(e) => Response::Error {
-                message: format!("bad request: {}", e),
-            },
+            Err(e) => error(codes::BAD_REQUEST, format!("bad request: {}", e)),
         };
         let mut payload = serde_json::to_string(&resp).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::Other, format!("serialize: {}", e))
@@ -203,64 +283,72 @@ fn handle_client(stream: UnixStream, state: SharedSession) -> std::io::Result<()
     }
 }
 
-fn process_request(req: Request, state: &Mutex<Option<Session>>) -> Response {
+fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
     match req {
         Request::Status => {
             let s = state.lock().unwrap();
+            let unlocked = s.session.is_some();
             Response::Status {
-                unlocked: s.is_some(),
-                account_count: s.as_ref().map(|s| s.accounts.len()).unwrap_or(0),
+                unlocked,
+                account_count: s.session.as_ref().map(|s| s.accounts.len()).unwrap_or(0),
+                idle_secs: if unlocked {
+                    Some(s.last_activity.elapsed().as_secs())
+                } else {
+                    None
+                },
+                auto_lock_secs: idle_timeout().as_secs(),
             }
         }
 
         Request::Unlock { password } => {
             let mut s = state.lock().unwrap();
-            if s.is_some() {
+            if s.session.is_some() {
+                s.last_activity = Instant::now();
                 return Response::Ok;
             }
             match session::initial_state() {
                 InitialState::NeedsLogin(vault) => {
                     match session::login(&vault, password.as_bytes()) {
                         Ok(sess) => {
-                            *s = Some(sess);
+                            s.session = Some(sess);
+                            s.last_activity = Instant::now();
                             Response::Ok
                         }
-                        Err(_) => Response::Error {
-                            message: "wrong password".into(),
-                        },
+                        Err(_) => error(codes::WRONG_PASSWORD, "wrong password"),
                     }
                 }
                 InitialState::NeedsLoginLegacy(vault) => {
                     match session::login_legacy(&vault, password.as_bytes()) {
                         Ok(sess) => {
-                            *s = Some(sess);
+                            s.session = Some(sess);
+                            s.last_activity = Instant::now();
                             Response::Ok
                         }
-                        Err(_) => Response::Error {
-                            message: "wrong password".into(),
-                        },
+                        Err(_) => error(codes::WRONG_PASSWORD, "wrong password"),
                     }
                 }
-                InitialState::NeedsSetup(_) => Response::Error {
-                    message: "vault not initialized; create one with the GUI/CLI first".into(),
-                },
-                InitialState::Corrupted => Response::Error {
-                    message: "vault file is corrupted".into(),
-                },
-                InitialState::IoError(e) => Response::Error {
-                    message: format!("vault io error: {}", e),
-                },
+                InitialState::NeedsSetup(_) => error(
+                    codes::VAULT_UNINITIALIZED,
+                    "vault not initialized; create one with the GUI/CLI first",
+                ),
+                InitialState::Corrupted => {
+                    error(codes::VAULT_CORRUPTED, "vault file is corrupted")
+                }
+                InitialState::IoError(e) => {
+                    error(codes::IO_ERROR, format!("vault io error: {}", e))
+                }
             }
         }
 
         Request::Lock => {
-            *state.lock().unwrap() = None;
+            let mut s = state.lock().unwrap();
+            s.session = None;
             Response::Ok
         }
 
         Request::List { filter } => {
-            let s = state.lock().unwrap();
-            match s.as_ref() {
+            let mut s = state.lock().unwrap();
+            match s.session.as_ref() {
                 None => locked_error(),
                 Some(sess) => {
                     let names: Vec<String> = sess
@@ -272,46 +360,48 @@ fn process_request(req: Request, state: &Mutex<Option<Session>>) -> Response {
                         })
                         .map(|a| a.name.clone())
                         .collect();
+                    s.last_activity = Instant::now();
                     Response::Names { names }
                 }
             }
         }
 
         Request::Get { name } => {
-            let s = state.lock().unwrap();
-            match s.as_ref() {
+            let mut s = state.lock().unwrap();
+            match s.session.as_ref() {
                 None => locked_error(),
                 Some(sess) => match sess.accounts.iter().find(|a| a.name == name) {
-                    Some(acc) => Response::Credential {
-                        name: acc.name.clone(),
-                        password: acc.password.clone(),
-                    },
-                    None => Response::Error {
-                        message: "not found".into(),
-                    },
+                    Some(acc) => {
+                        let cred = Response::Credential {
+                            name: acc.name.clone(),
+                            password: acc.password.clone(),
+                        };
+                        s.last_activity = Instant::now();
+                        cred
+                    }
+                    None => error(codes::NOT_FOUND, "not found"),
                 },
             }
         }
 
         Request::Save { name, password } => {
             let mut s = state.lock().unwrap();
-            match s.as_mut() {
+            match s.session.as_mut() {
                 None => locked_error(),
                 Some(sess) => {
-                    if let Some(idx) = sess.accounts.iter().position(|a| a.name == name) {
-                        match sess.edit_account(idx, None, Some(password)) {
-                            Ok(_) => Response::Ok,
-                            Err(e) => Response::Error {
-                                message: e.to_string(),
-                            },
-                        }
+                    let result = if let Some(idx) =
+                        sess.accounts.iter().position(|a| a.name == name)
+                    {
+                        sess.edit_account(idx, None, Some(password))
                     } else {
-                        match sess.add_account(name, password) {
-                            Ok(_) => Response::Ok,
-                            Err(e) => Response::Error {
-                                message: e.to_string(),
-                            },
+                        sess.add_account(name, password)
+                    };
+                    match result {
+                        Ok(_) => {
+                            s.last_activity = Instant::now();
+                            Response::Ok
                         }
+                        Err(e) => error(codes::IO_ERROR, e.to_string()),
                     }
                 }
             }
@@ -319,20 +409,19 @@ fn process_request(req: Request, state: &Mutex<Option<Session>>) -> Response {
 
         Request::Delete { name } => {
             let mut s = state.lock().unwrap();
-            match s.as_mut() {
+            match s.session.as_mut() {
                 None => locked_error(),
                 Some(sess) => {
                     if let Some(idx) = sess.accounts.iter().position(|a| a.name == name) {
                         match sess.delete_account(idx) {
-                            Ok(_) => Response::Ok,
-                            Err(e) => Response::Error {
-                                message: e.to_string(),
-                            },
+                            Ok(_) => {
+                                s.last_activity = Instant::now();
+                                Response::Ok
+                            }
+                            Err(e) => error(codes::IO_ERROR, e.to_string()),
                         }
                     } else {
-                        Response::Error {
-                            message: "not found".into(),
-                        }
+                        error(codes::NOT_FOUND, "not found")
                     }
                 }
             }
@@ -341,9 +430,7 @@ fn process_request(req: Request, state: &Mutex<Option<Session>>) -> Response {
 }
 
 fn locked_error() -> Response {
-    Response::Error {
-        message: "vault is locked; run `passwortctl unlock` first".into(),
-    }
+    error(codes::LOCKED, "vault is locked; run `passwortctl unlock` first")
 }
 
 // =================== Control client (passwortctl) ===================
@@ -367,10 +454,7 @@ pub fn run_ctl() -> std::io::Result<()> {
             Request::Unlock { password: pw }
         }
         "get" => {
-            let name = args
-                .get(2)
-                .cloned()
-                .ok_or_else(|| usage_err("get <name>"))?;
+            let name = args.get(2).cloned().ok_or_else(|| usage_err("get <name>"))?;
             Request::Get { name }
         }
         "save" => {
@@ -430,10 +514,24 @@ pub fn run_ctl() -> std::io::Result<()> {
         Response::Status {
             unlocked,
             account_count,
+            idle_secs,
+            auto_lock_secs,
         } => {
             if unlocked {
-                println!("unlocked ({} account{})", account_count,
-                    if account_count == 1 { "" } else { "s" });
+                let suffix = if auto_lock_secs == 0 {
+                    String::new()
+                } else if let Some(idle) = idle_secs {
+                    let remaining = auto_lock_secs.saturating_sub(idle);
+                    format!(", auto-locks in {}s", remaining)
+                } else {
+                    String::new()
+                };
+                println!(
+                    "unlocked ({} account{}{})",
+                    account_count,
+                    if account_count == 1 { "" } else { "s" },
+                    suffix
+                );
             } else {
                 println!("locked");
             }
@@ -450,8 +548,8 @@ pub fn run_ctl() -> std::io::Result<()> {
         Response::Credential { name, password } => {
             println!("{}\t{}", name, password);
         }
-        Response::Error { message } => {
-            eprintln!("error: {}", message);
+        Response::Error { code, message } => {
+            eprintln!("error [{}]: {}", code, message);
             std::process::exit(2);
         }
     }
@@ -464,7 +562,6 @@ fn read_password(prompt: &str) -> std::io::Result<String> {
     if std::io::stdin().is_terminal() {
         rpassword::prompt_password(prompt).map_err(|e| std::io::Error::new(e.kind(), e))
     } else {
-        // Piped stdin (test/automation): can't suppress echo without a TTY.
         let mut stderr = std::io::stderr();
         let _ = stderr.write_all(prompt.as_bytes());
         let _ = stderr.flush();
@@ -485,11 +582,15 @@ fn print_usage() {
     eprintln!("    passwortctl <command> [args]");
     eprintln!();
     eprintln!("COMMANDS:");
-    eprintln!("    status              Show whether the vault is unlocked");
+    eprintln!("    status              Show whether the vault is unlocked + idle / auto-lock info");
     eprintln!("    unlock              Decrypt the vault into the daemon (prompts)");
     eprintln!("    lock                Drop the in-memory session");
     eprintln!("    list [filter]       List account names (optional substring match)");
     eprintln!("    get <name>          Print '<name>\\t<password>' for the named account");
     eprintln!("    save <name>         Create or update an account (prompts for password)");
     eprintln!("    delete <name>       Delete the named account");
+    eprintln!();
+    eprintln!("ENVIRONMENT:");
+    eprintln!("    PASSWORT_IDLE_TIMEOUT_SECS  daemon auto-lock idle timeout (default 600, 0 = off)");
+    eprintln!("    PASSWORT_VAULT_PATH         override vault file location");
 }
