@@ -76,26 +76,77 @@ async function refresh() {
     }
 }
 
-// Auto-fill on page load when there's exactly one credential for this site
-// and the form's fields are still empty. We never overwrite typed input.
+// Auto-fill on page load (and on later DOM mutations, e.g. SPA login flows
+// like Google's two-step page). We fill password and/or username
+// independently — many real login flows show only one at a time. We never
+// overwrite typed input, and we never overwrite the same field twice.
 async function maybeAutofill() {
     if (STATE.matches.length !== 1) return;
     const match = STATE.matches[0];
-    const pwField = document.querySelector('input[type="password"]');
-    if (!pwField || !isVisible(pwField)) return;
-    if (AUTOFILLED.has(pwField)) return;
-    if (pwField.value) return; // user already typing
-    const userField = findUsernameField(pwField);
-    if (userField && userField.value) return; // user already typing username
 
+    const pwField = visibleFirst('input[type="password"]');
+    const standaloneUser = pwField ? null : findStandaloneUsernameField();
+
+    // Nothing relevant to fill right now.
+    if (!pwField && !standaloneUser) return;
+    if (pwField && AUTOFILLED.has(pwField)) {
+        // password already filled this load; nothing else to do here
+        return;
+    }
+    if (standaloneUser && AUTOFILLED.has(standaloneUser)) return;
+
+    // Fetch the credential lazily; only once.
     const cred = await rpc({ op: "get", name: match.name });
     if (cred.kind !== "credential") return;
 
-    AUTOFILLED.add(pwField);
-    if (userField && (cred.username || match.username)) {
-        setFieldValue(userField, cred.username || match.username);
+    if (pwField) {
+        if (!pwField.value) {
+            AUTOFILLED.add(pwField);
+            setFieldValue(pwField, cred.password);
+        }
+        const userField = findUsernameField(pwField);
+        if (userField && !userField.value && cred.username) {
+            AUTOFILLED.add(userField);
+            setFieldValue(userField, cred.username);
+        }
+    } else if (standaloneUser && !standaloneUser.value && cred.username) {
+        AUTOFILLED.add(standaloneUser);
+        setFieldValue(standaloneUser, cred.username);
     }
-    setFieldValue(pwField, cred.password);
+}
+
+// Picks the first visible match for a CSS selector — `document.querySelector`
+// would happily return a hidden one.
+function visibleFirst(selector) {
+    for (const el of document.querySelectorAll(selector)) {
+        if (isVisible(el)) return el;
+    }
+    return null;
+}
+
+// Heuristic for "the username/email field" on a page that has *no* password
+// field (e.g. step 1 of Google's two-step login). Tries the strongest
+// signals first (autocomplete attribute, type="email") before name/id hints.
+function findStandaloneUsernameField() {
+    const selectors = [
+        'input[autocomplete="username"]',
+        'input[autocomplete="email"]',
+        'input[type="email"]',
+        'input[name*="email" i]',
+        'input[name*="user" i]',
+        'input[id*="email" i]',
+        'input[id*="user" i]',
+    ];
+    for (const sel of selectors) {
+        for (const el of document.querySelectorAll(sel)) {
+            if (!isVisible(el)) continue;
+            const t = (el.type || "text").toLowerCase();
+            if (t === "text" || t === "email" || t === "tel" || t === "") {
+                return el;
+            }
+        }
+    }
+    return null;
 }
 
 // =================== fill badge (small "P" overlay) ===================
@@ -553,10 +604,14 @@ function installMutationObserver() {
     }
     const obs = new MutationObserver(() => {
         if (mutationDebounce) return;
-        mutationDebounce = setTimeout(() => {
+        mutationDebounce = setTimeout(async () => {
             mutationDebounce = null;
             if (STATE.unlocked && STATE.matches.length > 0) {
                 decoratePasswordFields();
+                // Critical for SPA login flows (Google, etc.): the password
+                // field appears after the email step's "Next" button, so the
+                // initial maybeAutofill saw nothing useful.
+                await maybeAutofill();
             }
         }, 250);
     });
