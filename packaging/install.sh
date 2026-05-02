@@ -8,12 +8,25 @@ BIN_DIR="$HOME/.local/bin"
 APP_DIR="$HOME/.local/share/applications"
 ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
 
-echo "Building release binary (this can take a minute)..."
-cargo build --release
+# Source vs. pre-built binary. If a release tarball shipped a `bin/`
+# directory at the repo root, use that and skip the cargo build entirely.
+PREBUILT="$REPO_DIR/bin/passwort_manager"
+if [[ -x "$PREBUILT" ]]; then
+    BIN_SRC="$PREBUILT"
+else
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "ERROR: 'cargo' is not installed and no pre-built binary at $PREBUILT" >&2
+        echo "Either install Rust or use a release tarball that ships bin/." >&2
+        exit 1
+    fi
+    echo "Building release binary (this can take a minute)..."
+    cargo build --release --bin passwort_manager
+    BIN_SRC="$REPO_DIR/target/release/passwort_manager"
+fi
 
 mkdir -p "$BIN_DIR" "$APP_DIR" "$ICON_DIR"
 
-install -m 755 "$REPO_DIR/target/release/passwort_manager" "$BIN_DIR/passwort-manager"
+install -m 755 "$BIN_SRC" "$BIN_DIR/passwort-manager"
 install -m 644 "$REPO_DIR/packaging/passwort-manager.svg" "$ICON_DIR/passwort-manager.svg"
 
 sed "s|BINARY_PATH|$BIN_DIR/passwort-manager|g" \

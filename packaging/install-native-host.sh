@@ -25,14 +25,28 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-echo "Building passwortd, passwortctl, passwort_native_host..."
-cargo build --release --bin passwortd --bin passwortctl --bin passwort_native_host
-
 BIN_DIR="$HOME/.local/bin"
 mkdir -p "$BIN_DIR"
-install -m 755 "$REPO_DIR/target/release/passwortd"             "$BIN_DIR/passwortd"
-install -m 755 "$REPO_DIR/target/release/passwortctl"           "$BIN_DIR/passwortctl"
-install -m 755 "$REPO_DIR/target/release/passwort_native_host"  "$BIN_DIR/passwort-native-host"
+
+# Source vs. pre-built (release tarball ships bin/ at repo root).
+PREBUILT_DIR="$REPO_DIR/bin"
+if [[ -x "$PREBUILT_DIR/passwortd" \
+   && -x "$PREBUILT_DIR/passwortctl" \
+   && -x "$PREBUILT_DIR/passwort_native_host" ]]; then
+    install -m 755 "$PREBUILT_DIR/passwortd"             "$BIN_DIR/passwortd"
+    install -m 755 "$PREBUILT_DIR/passwortctl"           "$BIN_DIR/passwortctl"
+    install -m 755 "$PREBUILT_DIR/passwort_native_host"  "$BIN_DIR/passwort-native-host"
+else
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "ERROR: 'cargo' is not installed and no pre-built binaries in $PREBUILT_DIR" >&2
+        exit 1
+    fi
+    echo "Building passwortd, passwortctl, passwort_native_host..."
+    cargo build --release --bin passwortd --bin passwortctl --bin passwort_native_host
+    install -m 755 "$REPO_DIR/target/release/passwortd"             "$BIN_DIR/passwortd"
+    install -m 755 "$REPO_DIR/target/release/passwortctl"           "$BIN_DIR/passwortctl"
+    install -m 755 "$REPO_DIR/target/release/passwort_native_host"  "$BIN_DIR/passwort-native-host"
+fi
 
 # Firefox manifest
 FX_DIR="$HOME/.mozilla/native-messaging-hosts"

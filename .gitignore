@@ -14,3 +14,7 @@
 /accounts.json.tmp
 /vault.json
 /vault.json.tmp
+
+# Release-tarball artefacts produced by package-release.sh
+/bin
+/passwort-manager-*-linux-*.tar.gz
