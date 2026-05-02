@@ -2,9 +2,14 @@
 // - Single connection to the native messaging host (which relays to passwortd).
 // - Per-RPC serialization (the host processes one request at a time).
 // - Buffer of "captured" credentials reported by content scripts; the popup
-//   pulls these on demand so the user can choose to save them.
+//   and the in-page banner pull these on demand so the user can save them.
+// - Broadcasts `vault_state_changed` to all tabs after a successful unlock
+//   or lock, so existing pages can update their fill UI live.
+// - Expires captured credentials after 5 minutes so they don't sit in
+//   memory indefinitely if the user never saves them.
 
 const HOST = "passwort_manager";
+const CAPTURE_TTL_MS = 5 * 60 * 1000;
 
 let port = null;
 let pending = null;
@@ -55,7 +60,23 @@ function send(req) {
     return new Promise((resolve, reject) => {
         queue.push({ req, resolve, reject });
         pump();
+    }).then((resp) => {
+        if (resp && resp.kind === "ok" && (req.op === "unlock" || req.op === "lock")) {
+            broadcastToTabs({ type: "vault_state_changed" });
+        }
+        return resp;
     });
+}
+
+async function broadcastToTabs(msg) {
+    try {
+        const tabs = await browser.tabs.query({});
+        for (const t of tabs) {
+            browser.tabs.sendMessage(t.id, msg).catch(() => {});
+        }
+    } catch {
+        // ignore
+    }
 }
 
 function refreshBadge() {
@@ -63,6 +84,18 @@ function refreshBadge() {
     browser.browserAction.setBadgeText({ text: n > 0 ? String(n) : "" });
     browser.browserAction.setBadgeBackgroundColor({ color: "#7c6dd8" });
 }
+
+setInterval(() => {
+    const now = Date.now();
+    let changed = false;
+    for (const [origin, cred] of captured.entries()) {
+        if (now - cred.capturedAt > CAPTURE_TTL_MS) {
+            captured.delete(origin);
+            changed = true;
+        }
+    }
+    if (changed) refreshBadge();
+}, 60 * 1000);
 
 browser.runtime.onMessage.addListener((msg) => {
     if (!msg) return;
