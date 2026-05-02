@@ -17,6 +17,10 @@ const queue = [];
 
 // Map<origin, {origin, username, password, capturedAt}>
 const captured = new Map();
+// Map<tabId, {origin, username, password, capturedAt}> — same data keyed by
+// tab so the banner can follow the user across cross-origin redirects in
+// the same tab (Google login -> youtube.com, etc.).
+const tabCaptures = new Map();
 
 function connect() {
     if (port) return;
@@ -97,10 +101,20 @@ setInterval(() => {
             changed = true;
         }
     }
+    for (const [tabId, cap] of tabCaptures.entries()) {
+        if (now - cap.capturedAt > CAPTURE_TTL_MS) {
+            tabCaptures.delete(tabId);
+        }
+    }
     if (changed) refreshBadge();
 }, 60 * 1000);
 
-browser.runtime.onMessage.addListener((msg) => {
+// Drop the per-tab capture when the tab itself goes away.
+browser.tabs.onRemoved.addListener((tabId) => {
+    tabCaptures.delete(tabId);
+});
+
+browser.runtime.onMessage.addListener((msg, sender) => {
     if (!msg) return;
 
     if (msg.type === "rpc") {
@@ -109,17 +123,22 @@ browser.runtime.onMessage.addListener((msg) => {
 
     if (msg.type === "captured_submit") {
         if (!msg.origin) return;
-        // Merge with any existing partial capture for this origin. Multi-step
-        // logins (Google: email page → password page) only have one of the
-        // two fields available at any given moment, so we accumulate as the
-        // user advances rather than overwriting.
-        const prev = captured.get(msg.origin) || { username: "", password: "" };
-        captured.set(msg.origin, {
+        // Merge with any existing partial capture for this origin AND for
+        // this tab. Multi-step logins (Google: email page → password page)
+        // only have one of the two fields available at any given moment,
+        // so we accumulate as the user advances rather than overwriting.
+        const tabId = sender.tab ? sender.tab.id : null;
+        const prevByOrigin = captured.get(msg.origin) || { username: "", password: "" };
+        const prevByTab = tabId != null ? tabCaptures.get(tabId) : null;
+        const prev = prevByTab || prevByOrigin;
+        const merged = {
             origin: msg.origin,
             username: msg.username || prev.username || "",
             password: msg.password || prev.password || "",
             capturedAt: Date.now(),
-        });
+        };
+        captured.set(msg.origin, merged);
+        if (tabId != null) tabCaptures.set(tabId, merged);
         refreshBadge();
         return Promise.resolve({ ok: true });
     }
@@ -128,14 +147,40 @@ browser.runtime.onMessage.addListener((msg) => {
         return Promise.resolve(Array.from(captured.values()));
     }
 
+    // The capture (if any) attached to the sender's tab. Lets the in-page
+    // banner follow the user across cross-origin redirects.
+    if (msg.type === "list_tab_capture") {
+        if (!sender.tab) return Promise.resolve(null);
+        const cap = tabCaptures.get(sender.tab.id);
+        if (cap && cap.password) return Promise.resolve(cap);
+        return Promise.resolve(null);
+    }
+
+    // For the popup: it doesn't have its own tab, so it explicitly passes
+    // the active tab id.
+    if (msg.type === "get_tab_capture") {
+        if (typeof msg.tabId !== "number") return Promise.resolve(null);
+        const cap = tabCaptures.get(msg.tabId);
+        if (cap && cap.password) return Promise.resolve(cap);
+        return Promise.resolve(null);
+    }
+
     if (msg.type === "discard_captured") {
         captured.delete(msg.origin);
+        // Drop any per-tab entries for this origin so the banner doesn't
+        // re-pop on the same flow. Also drop the sender tab's entry if any
+        // (user explicitly dismissed it from this tab).
+        for (const [tabId, cap] of tabCaptures.entries()) {
+            if (cap.origin === msg.origin) tabCaptures.delete(tabId);
+        }
+        if (sender.tab) tabCaptures.delete(sender.tab.id);
         refreshBadge();
         return Promise.resolve({ ok: true });
     }
 
     if (msg.type === "clear_captured") {
         captured.clear();
+        tabCaptures.clear();
         refreshBadge();
         return Promise.resolve({ ok: true });
     }

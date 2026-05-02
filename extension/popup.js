@@ -173,12 +173,26 @@ async function renderUnlocked() {
     root.innerHTML = "";
     root.appendChild(el("div", { class: "muted" }, origin || "(no http origin)"));
 
-    // Captured-this-session credentials (most useful when there's one for this
-    // origin or any sibling under the same effective root).
-    const captured = await listCaptured();
-    const capturedForOrigin = captured.find(
-        (c) => c.password && originRelated(c.origin, origin)
-    );
+    // Captured-this-session credentials. First try the per-tab capture
+    // (covers cross-origin redirects: log in on google → land on youtube),
+    // then fall back to any related-origin capture from any tab.
+    let capturedForOrigin = null;
+    if (tab && typeof tab.id === "number") {
+        try {
+            capturedForOrigin = await browser.runtime.sendMessage({
+                type: "get_tab_capture",
+                tabId: tab.id,
+            });
+        } catch {
+            capturedForOrigin = null;
+        }
+    }
+    if (!capturedForOrigin) {
+        const captured = await listCaptured();
+        capturedForOrigin = captured.find(
+            (c) => c.password && originRelated(c.origin, origin)
+        );
+    }
 
     if (capturedForOrigin) {
         const saveBtn = el(

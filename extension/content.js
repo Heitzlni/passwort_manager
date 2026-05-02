@@ -482,12 +482,17 @@ async function maybeShowSaveBanner() {
     bannerCheckTimer = setTimeout(async () => {
         bannerCheckTimer = null;
         if (bannerHost) return;
+        // 1) Tab-level capture wins — covers cross-origin redirects in
+        //    the same tab (Google login → youtube.com, etc.).
+        const tabCap = await sendBg({ type: "list_tab_capture" });
+        if (tabCap && tabCap.password) {
+            showSaveBanner(tabCap);
+            return;
+        }
+        // 2) Fallback: origin-related capture from any tab.
         const captured = (await sendBg({ type: "list_captured" })) || [];
-        // Only banner once we actually have a password to save (a
-        // username-only partial from step 1 isn't actionable yet).
         const here = captured.find((c) => c.password && originRelated(c.origin, ORIGIN));
-        if (!here) return;
-        showSaveBanner(here);
+        if (here) showSaveBanner(here);
     }, 600);
 }
 
