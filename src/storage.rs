@@ -39,7 +39,13 @@ pub struct LegacyVerifierVault {
 fn xdg_data_home() -> PathBuf {
     if let Some(p) = std::env::var_os("XDG_DATA_HOME") {
         let p = PathBuf::from(p);
-        if p.is_absolute() {
+        // Snap-confined apps (e.g. VS Code installed via snap) re-set
+        // XDG_DATA_HOME to their own per-snap data dir. Honoring it would
+        // give the daemon/CLI/GUI different vault paths depending on which
+        // terminal launched them. Ignore snap-redirected paths so we
+        // always converge on $HOME/.local/share.
+        let is_snap_redirect = p.to_string_lossy().contains("/snap/");
+        if p.is_absolute() && !is_snap_redirect {
             return p;
         }
     }
