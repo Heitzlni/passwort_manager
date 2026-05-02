@@ -439,17 +439,40 @@ fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
             match s.session.as_mut() {
                 None => locked_error(),
                 Some(sess) => {
-                    let result = if let Some(idx) =
-                        sess.accounts.iter().position(|a| a.name == name)
-                    {
-                        // Only overwrite username if a non-empty one was sent;
-                        // empty means "keep existing".
-                        let username_opt = if username.is_empty() {
-                            None
+                    // Match by (name, username) so a site can hold multiple
+                    // accounts. Saving "github.com" / "alice" then
+                    // "github.com" / "bob" creates two distinct entries;
+                    // saving "github.com" / "alice" again updates that one.
+                    //
+                    // Special case for back-compat: if the request omitted
+                    // a username (empty string) AND there's exactly one
+                    // entry with this name regardless of username, update
+                    // that one rather than creating an empty-username
+                    // duplicate. This keeps single-entry-per-site users
+                    // unsurprised.
+                    let exact = sess
+                        .accounts
+                        .iter()
+                        .position(|a| a.name == name && a.username == username);
+                    let fallback = if username.is_empty() {
+                        let same_name: Vec<usize> = sess
+                            .accounts
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, a)| a.name == name)
+                            .map(|(i, _)| i)
+                            .collect();
+                        if same_name.len() == 1 {
+                            Some(same_name[0])
                         } else {
-                            Some(username)
-                        };
-                        sess.edit_account(idx, None, username_opt, Some(password))
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    let result = if let Some(idx) = exact.or(fallback) {
+                        sess.edit_account(idx, None, None, Some(password))
                     } else {
                         sess.add_account(name, username, password)
                     };

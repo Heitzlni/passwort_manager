@@ -23,11 +23,21 @@ const STATE = {
     matches: [], // saved {name, username} entries matching the current host
 };
 const DECORATED = new WeakSet(); // password fields already given a badge
-const AUTOFILLED = new WeakSet(); // password fields already auto-filled this load
+const AUTOFILLED = new WeakSet(); // fields already auto-filled this load
+const TRACKED = new WeakSet(); // fields we've already attached input listeners to
 let bannerHost = null;
 let menuHost = null;
 let onMenuOutsideClick = null;
 let mutationDebounce = null;
+
+// Buffer of what the user is currently typing. KeePassXC / Bitwarden both
+// take this approach: form `submit` events alone are unreliable on modern
+// SPAs (Google's "Next" / "Sign in" are <div role="button">s, not real
+// submit buttons). We snapshot the latest non-empty values and flush them
+// to the background on any plausible "submit" trigger.
+const BUFFER = { username: "", password: "" };
+const SUBMIT_BUTTON_REGEX =
+    /\b(sign\s*in|log\s*in|log\s*on|login|continue|next|submit|verify|weiter|anmelden|einloggen|fortfahren)\b/i;
 
 // =================== boot ===================
 
@@ -339,32 +349,109 @@ async function fillFromVault(pwField, name) {
 // =================== submit capture ===================
 
 function installSubmitListener() {
+    // Keep field values in BUFFER as the user types. A WeakSet prevents
+    // double-attaching listeners across mutation-observer re-runs.
+    function trackField(field, kind) {
+        if (TRACKED.has(field)) return;
+        TRACKED.add(field);
+        const update = () => {
+            if (!field.value) return;
+            if (kind === "password") BUFFER.password = field.value;
+            else BUFFER.username = field.value;
+        };
+        field.addEventListener("input", update);
+        field.addEventListener("change", update);
+        field.addEventListener("blur", update);
+    }
+
+    function trackVisibleFields() {
+        for (const f of document.querySelectorAll('input[type="password"]')) {
+            if (isVisible(f)) trackField(f, "password");
+        }
+        // Standalone username candidates (email step of multi-step login)
+        const u = findStandaloneUsernameField();
+        if (u) trackField(u, "username");
+        // Username fields adjacent to password fields
+        for (const f of document.querySelectorAll('input[type="password"]')) {
+            const u2 = findUsernameField(f);
+            if (u2) trackField(u2, "username");
+        }
+    }
+    trackVisibleFields();
+    // Re-scan on mutations (SPA flows that insert fields later)
+    new MutationObserver(() => {
+        if (mutationDebounce) return;
+        // share debounce with the badge observer; this is cheap
+        setTimeout(trackVisibleFields, 100);
+    }).observe(document.body || document.documentElement, {
+        childList: true,
+        subtree: true,
+    });
+
+    function flush() {
+        if (!BUFFER.username && !BUFFER.password) return;
+        sendBg({
+            type: "captured_submit",
+            origin: ORIGIN,
+            username: BUFFER.username,
+            password: BUFFER.password,
+        });
+        // Drop password locally so we don't keep re-sending it; keep
+        // username so the next page in a multi-step flow can re-flush it.
+        BUFFER.password = "";
+        // Show the banner here too in case the page doesn't navigate
+        setTimeout(() => maybeShowSaveBanner(), 250);
+    }
+
+    // Trigger 1: real form submit
+    document.addEventListener("submit", flush, true);
+
+    // Trigger 2: Enter inside a username/password field
     document.addEventListener(
-        "submit",
-        (event) => {
-            const form = event.target;
-            if (!(form instanceof HTMLFormElement)) return;
-            const pwField = form.querySelector('input[type="password"]');
-            if (!pwField || !pwField.value) return;
-            const userField = findUsernameField(pwField);
-            sendBg({
-                type: "captured_submit",
-                origin: ORIGIN,
-                username: userField ? userField.value || "" : "",
-                password: pwField.value,
-            });
-            // Show the banner here too in case the page doesn't navigate.
-            setTimeout(() => maybeShowSaveBanner(), 250);
+        "keydown",
+        (e) => {
+            if (e.key !== "Enter") return;
+            const t = e.target;
+            if (!t || (t.tagName !== "INPUT" && t.tagName !== "TEXTAREA")) return;
+            const ty = (t.type || "").toLowerCase();
+            if (ty === "password" || ty === "text" || ty === "email" || ty === "tel" || ty === "") {
+                setTimeout(flush, 50);
+            }
         },
         true
     );
+
+    // Trigger 3: click on a button/element with login-flow-y label text.
+    // Google's "Next" and "Sign in" are <div role="button">, not <button>.
+    document.addEventListener(
+        "click",
+        (e) => {
+            const target = e.target.closest(
+                'button, [role="button"], input[type="submit"], input[type="button"], a'
+            );
+            if (!target) return;
+            const text = ((target.innerText || target.value || target.textContent || "") + " " +
+                          (target.getAttribute("aria-label") || "")).trim();
+            if (SUBMIT_BUTTON_REGEX.test(text)) {
+                // Let the page's own click handler run first
+                setTimeout(flush, 100);
+            }
+        },
+        true
+    );
+
+    // Trigger 4: page is about to go away (real navigation, tab close, etc.)
+    window.addEventListener("beforeunload", flush);
+    window.addEventListener("pagehide", flush);
 }
 
 // =================== save banner (Shadow DOM) ===================
 
 async function maybeShowSaveBanner() {
     const captured = (await sendBg({ type: "list_captured" })) || [];
-    const here = captured.find((c) => c.origin === ORIGIN);
+    // Only banner once we actually have a password to save (a username-only
+    // partial from step 1 of a multi-step login isn't actionable yet).
+    const here = captured.find((c) => c.origin === ORIGIN && c.password);
     if (!here) return;
     showSaveBanner(here);
 }

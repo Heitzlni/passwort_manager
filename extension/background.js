@@ -80,7 +80,10 @@ async function broadcastToTabs(msg) {
 }
 
 function refreshBadge() {
-    const n = captured.size;
+    // Only count captures where we have an actual password — partial captures
+    // (just a username from step 1 of a multi-step login) shouldn't badge.
+    let n = 0;
+    for (const c of captured.values()) if (c.password) n++;
     browser.browserAction.setBadgeText({ text: n > 0 ? String(n) : "" });
     browser.browserAction.setBadgeBackgroundColor({ color: "#7c6dd8" });
 }
@@ -105,11 +108,16 @@ browser.runtime.onMessage.addListener((msg) => {
     }
 
     if (msg.type === "captured_submit") {
-        if (!msg.origin || !msg.password) return;
+        if (!msg.origin) return;
+        // Merge with any existing partial capture for this origin. Multi-step
+        // logins (Google: email page → password page) only have one of the
+        // two fields available at any given moment, so we accumulate as the
+        // user advances rather than overwriting.
+        const prev = captured.get(msg.origin) || { username: "", password: "" };
         captured.set(msg.origin, {
             origin: msg.origin,
-            username: msg.username || "",
-            password: msg.password,
+            username: msg.username || prev.username || "",
+            password: msg.password || prev.password || "",
             capturedAt: Date.now(),
         });
         refreshBadge();
