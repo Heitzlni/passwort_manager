@@ -64,14 +64,40 @@ if [[ $DO_CHROME -eq 1 ]]; then
     done
 fi
 
+# Install + enable the systemd user service so the daemon auto-starts at login.
+SERVICE_INSTALLED=0
+if command -v systemctl >/dev/null 2>&1; then
+    SD_DIR="$HOME/.config/systemd/user"
+    mkdir -p "$SD_DIR"
+    install -m 644 "$REPO_DIR/packaging/systemd/passwortd.service" "$SD_DIR/passwortd.service"
+
+    # Stop any manually-started passwortd so the service can take over the socket.
+    pkill -x passwortd 2>/dev/null || true
+    sleep 0.4
+
+    if systemctl --user daemon-reload 2>/dev/null \
+       && systemctl --user enable --now passwortd.service 2>/dev/null; then
+        SERVICE_INSTALLED=1
+    fi
+fi
+
 echo
 echo "Done."
 echo "  Daemon binary: $BIN_DIR/passwortd"
 echo "  Native host:   $BIN_DIR/passwort-native-host"
+if [[ $SERVICE_INSTALLED -eq 1 ]]; then
+    echo "  Service:       enabled (passwortd.service, starts at login,"
+    echo "                 already running)"
+    echo
+    echo "You're set. Open Firefox, click the Password Manager toolbar icon,"
+    echo "and enter your master password. It stays unlocked until idle for 10"
+    echo "minutes; you'll only need to re-unlock once per session after that."
+else
+    echo
+    echo "Systemd user service couldn't be enabled. To start the daemon:"
+    echo "  passwortd &"
+    echo "Then unlock the vault:"
+    echo "  passwortctl unlock"
+fi
 echo
-echo "Start the daemon (once per boot/session):"
-echo "  passwortd &"
-echo "Then unlock the vault:"
-echo "  passwortctl unlock"
-echo
-echo "Now load the browser extension in extension/ to talk to it."
+echo "If you haven't already, load the browser extension in extension/."

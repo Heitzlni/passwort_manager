@@ -1,0 +1,22 @@
+[Unit]
+Description=Password Manager Daemon (passwortd)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/passwortd
+Restart=on-failure
+RestartSec=5
+
+# Modest sandboxing — the daemon already applies its own hardening
+# (mlockall, no core dumps, non-dumpable) at startup, so we only need
+# coarse extra defenses here. Avoid directives that have caused
+# 218/CAPABILITIES on some kernels (RestrictNamespaces, RestrictRealtime).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/passwort-manager %t
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
