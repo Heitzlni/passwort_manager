@@ -1391,10 +1391,16 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                             if mods.command {
                                 modifiers.push("super".into());
                             }
-                            if modifiers.is_empty() {
+                            // Reject Shift-only and no-modifier hotkeys: they
+                            // collide with normal text input (capital letters,
+                            // shifted symbols), and X11 typically refuses to
+                            // grab Shift+letter anyway. Require at least one
+                            // of Ctrl / Alt / Super.
+                            let has_strong_modifier =
+                                mods.ctrl || mods.alt || mods.command;
+                            if !has_strong_modifier {
                                 *message = Some((
-                                    "Hotkey must include at least one modifier (Ctrl, Alt, Shift, or Super)."
-                                        .to_string(),
+                                    "Hotkey must include Ctrl, Alt, or Super. Shift alone collides with capital-letter typing and X11 won't grab it.".to_string(),
                                     true,
                                 ));
                                 *capturing = false;
