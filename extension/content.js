@@ -447,13 +447,48 @@ function installSubmitListener() {
 
 // =================== save banner (Shadow DOM) ===================
 
+// A capture made on accounts.google.com should still surface a banner if
+// Google then redirects you to myaccount.google.com / mail.google.com / etc.
+// Match by effective root domain (naive last-2-labels with awareness of
+// common multi-part TLDs).
+const MULTI_PART_TLDS = new Set([
+    "co.uk", "org.uk", "ac.uk", "co.jp", "co.kr", "com.au",
+    "com.br", "co.in", "co.za", "com.mx", "com.tr", "co.nz",
+]);
+function effectiveRoot(host) {
+    if (!host) return "";
+    const parts = host.toLowerCase().split(".");
+    if (parts.length < 2) return host;
+    if (parts.length >= 3 && MULTI_PART_TLDS.has(parts.slice(-2).join("."))) {
+        return parts.slice(-3).join(".");
+    }
+    return parts.slice(-2).join(".");
+}
+function originRelated(a, b) {
+    if (!a || !b) return false;
+    if (a === b) return true;
+    return effectiveRoot(a) === effectiveRoot(b);
+}
+
+let bannerCheckTimer = null;
+
 async function maybeShowSaveBanner() {
-    const captured = (await sendBg({ type: "list_captured" })) || [];
-    // Only banner once we actually have a password to save (a username-only
-    // partial from step 1 of a multi-step login isn't actionable yet).
-    const here = captured.find((c) => c.origin === ORIGIN && c.password);
-    if (!here) return;
-    showSaveBanner(here);
+    if (bannerHost) return; // already showing
+    // Delay the check to let quick intermediate redirects pass through. If
+    // the page navigates again within this window, the timer is silently
+    // discarded with the page; only the final page where the user actually
+    // lands fires the banner.
+    if (bannerCheckTimer) clearTimeout(bannerCheckTimer);
+    bannerCheckTimer = setTimeout(async () => {
+        bannerCheckTimer = null;
+        if (bannerHost) return;
+        const captured = (await sendBg({ type: "list_captured" })) || [];
+        // Only banner once we actually have a password to save (a
+        // username-only partial from step 1 isn't actionable yet).
+        const here = captured.find((c) => c.password && originRelated(c.origin, ORIGIN));
+        if (!here) return;
+        showSaveBanner(here);
+    }, 600);
 }
 
 function showSaveBanner(captured) {

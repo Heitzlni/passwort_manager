@@ -62,6 +62,27 @@ function nameMatchesHost(saved, host) {
     return s === h || h.endsWith("." + s);
 }
 
+// Effective-root match for surfacing captured credentials across same-org
+// redirects (e.g. accounts.google.com → myaccount.google.com).
+const MULTI_PART_TLDS = new Set([
+    "co.uk", "org.uk", "ac.uk", "co.jp", "co.kr", "com.au",
+    "com.br", "co.in", "co.za", "com.mx", "com.tr", "co.nz",
+]);
+function effectiveRoot(host) {
+    if (!host) return "";
+    const parts = host.toLowerCase().split(".");
+    if (parts.length < 2) return host;
+    if (parts.length >= 3 && MULTI_PART_TLDS.has(parts.slice(-2).join("."))) {
+        return parts.slice(-3).join(".");
+    }
+    return parts.slice(-2).join(".");
+}
+function originRelated(a, b) {
+    if (!a || !b) return false;
+    if (a === b) return true;
+    return effectiveRoot(a) === effectiveRoot(b);
+}
+
 function showError(msg) {
     $("#banner").innerHTML = "";
     $("#banner").appendChild(el("div", { class: "error" }, msg));
@@ -152,9 +173,12 @@ async function renderUnlocked() {
     root.innerHTML = "";
     root.appendChild(el("div", { class: "muted" }, origin || "(no http origin)"));
 
-    // Captured-this-session credentials (most useful when there's one for this origin).
+    // Captured-this-session credentials (most useful when there's one for this
+    // origin or any sibling under the same effective root).
     const captured = await listCaptured();
-    const capturedForOrigin = captured.find((c) => c.origin === origin);
+    const capturedForOrigin = captured.find(
+        (c) => c.password && originRelated(c.origin, origin)
+    );
 
     if (capturedForOrigin) {
         const saveBtn = el(
