@@ -135,6 +135,7 @@ pub fn login_legacy(legacy: &LegacyVerifierVault, password: &[u8]) -> Result<Ses
         let plain = crypto::decrypt_combined(&old.password, &*old_key).map_err(|_| ())?;
         accounts.push(Account {
             name: old.name.clone(),
+            username: old.username.clone(),
             password: (*plain).clone(),
         });
     }
@@ -157,8 +158,17 @@ pub enum ChangeMasterError {
 }
 
 impl Session {
-    pub fn add_account(&mut self, name: String, password: String) -> std::io::Result<()> {
-        self.accounts.push(Account { name, password });
+    pub fn add_account(
+        &mut self,
+        name: String,
+        username: String,
+        password: String,
+    ) -> std::io::Result<()> {
+        self.accounts.push(Account {
+            name,
+            username,
+            password,
+        });
         if let Err(e) = persist(self) {
             self.accounts.pop();
             return Err(e);
@@ -170,6 +180,7 @@ impl Session {
         &mut self,
         idx: usize,
         new_name: Option<String>,
+        new_username: Option<String>,
         new_password: Option<String>,
     ) -> std::io::Result<()> {
         if idx >= self.accounts.len() {
@@ -183,6 +194,10 @@ impl Session {
         if let Some(n) = new_name {
             self.accounts[idx].name.zeroize();
             self.accounts[idx].name = n;
+        }
+        if let Some(u) = new_username {
+            self.accounts[idx].username.zeroize();
+            self.accounts[idx].username = u;
         }
         if let Some(p) = new_password {
             self.accounts[idx].password.zeroize();

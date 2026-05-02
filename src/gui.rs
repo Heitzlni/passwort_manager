@@ -143,12 +143,14 @@ enum Screen {
 enum Modal {
     Add {
         name: String,
+        username: String,
         password: String,
         show_password: bool,
     },
     Edit {
         idx: usize,
         name: String,
+        username: String,
         password: String,
         show_password: bool,
         original_name: String,
@@ -167,17 +169,25 @@ enum Modal {
 impl Drop for Modal {
     fn drop(&mut self) {
         match self {
-            Modal::Add { name, password, .. } => {
+            Modal::Add {
+                name,
+                username,
+                password,
+                ..
+            } => {
                 name.zeroize();
+                username.zeroize();
                 password.zeroize();
             }
             Modal::Edit {
                 name,
+                username,
                 password,
                 original_name,
                 ..
             } => {
                 name.zeroize();
+                username.zeroize();
                 password.zeroize();
                 original_name.zeroize();
             }
@@ -599,6 +609,7 @@ impl App {
                 if ui.add(new_btn).clicked() {
                     *modal = Some(Modal::Add {
                         name: String::new(),
+                        username: String::new(),
                         password: String::new(),
                         show_password: false,
                     });
@@ -698,7 +709,14 @@ impl App {
                         let account = &session.accounts[idx];
                         ui.heading(&account.name);
                         ui.add_space(2.0);
-                        ui.colored_label(COLOR_MUTED, "Stored credential");
+                        if account.username.is_empty() {
+                            ui.colored_label(COLOR_MUTED, "Stored credential");
+                        } else {
+                            ui.colored_label(
+                                COLOR_MUTED,
+                                format!("Username: {}", account.username),
+                            );
+                        }
                         ui.add_space(20.0);
 
                         ui.colored_label(COLOR_MUTED, "PASSWORD");
@@ -752,6 +770,7 @@ impl App {
                                 *modal = Some(Modal::Edit {
                                     idx,
                                     name: account.name.clone(),
+                                    username: account.username.clone(),
                                     password: account.password.clone(),
                                     show_password: false,
                                     original_name: account.name.clone(),
@@ -856,12 +875,20 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
         .show(ctx, |ui| match modal {
             Modal::Add {
                 name,
+                username,
                 password,
                 show_password,
             } => {
-                ui.colored_label(COLOR_MUTED, "Name");
+                ui.colored_label(COLOR_MUTED, "Name (e.g. site / app)");
                 ui.add(
                     egui::TextEdit::singleline(name)
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::vec2(8.0, 6.0)),
+                );
+                ui.add_space(8.0);
+                ui.colored_label(COLOR_MUTED, "Username (optional)");
+                ui.add(
+                    egui::TextEdit::singleline(username)
                         .desired_width(f32::INFINITY)
                         .margin(egui::vec2(8.0, 6.0)),
                 );
@@ -890,8 +917,9 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                             return;
                         }
                         let n = std::mem::take(name);
+                        let u = std::mem::take(username);
                         let p = std::mem::take(password);
-                        match session.add_account(n, p) {
+                        match session.add_account(n, u, p) {
                             Ok(_) => {
                                 result =
                                     ModalResult::CloseWithInfo("Account added.".to_string())
@@ -916,6 +944,7 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
             Modal::Edit {
                 idx,
                 name,
+                username,
                 password,
                 show_password,
                 original_name,
@@ -928,6 +957,13 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                 ui.colored_label(COLOR_MUTED, "Name");
                 ui.add(
                     egui::TextEdit::singleline(name)
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::vec2(8.0, 6.0)),
+                );
+                ui.add_space(8.0);
+                ui.colored_label(COLOR_MUTED, "Username");
+                ui.add(
+                    egui::TextEdit::singleline(username)
                         .desired_width(f32::INFINITY)
                         .margin(egui::vec2(8.0, 6.0)),
                 );
@@ -956,8 +992,9 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                             return;
                         }
                         let n = std::mem::take(name);
+                        let u = std::mem::take(username);
                         let p = std::mem::take(password);
-                        match session.edit_account(*idx, Some(n), Some(p)) {
+                        match session.edit_account(*idx, Some(n), Some(u), Some(p)) {
                             Ok(_) => {
                                 result =
                                     ModalResult::CloseWithInfo("Account updated.".to_string())

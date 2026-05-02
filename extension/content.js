@@ -20,9 +20,10 @@
 const ORIGIN = location.hostname;
 const STATE = {
     unlocked: false,
-    matches: [], // saved names that match the current host
+    matches: [], // saved {name, username} entries matching the current host
 };
 const DECORATED = new WeakSet(); // password fields already given a badge
+const AUTOFILLED = new WeakSet(); // password fields already auto-filled this load
 let bannerHost = null;
 let menuHost = null;
 let onMenuOutsideClick = null;
@@ -66,11 +67,35 @@ async function refresh() {
         STATE.matches = [];
         return;
     }
-    const list = await rpc({ op: "list" });
-    STATE.matches = list.kind === "names" ? list.names.filter((n) => matchesHost(n, ORIGIN)) : [];
+    const list = await rpc({ op: "list_entries" });
+    STATE.matches =
+        list.kind === "entries" ? list.entries.filter((e) => matchesHost(e.name, ORIGIN)) : [];
     if (STATE.matches.length > 0) {
         decoratePasswordFields();
+        await maybeAutofill();
     }
+}
+
+// Auto-fill on page load when there's exactly one credential for this site
+// and the form's fields are still empty. We never overwrite typed input.
+async function maybeAutofill() {
+    if (STATE.matches.length !== 1) return;
+    const match = STATE.matches[0];
+    const pwField = document.querySelector('input[type="password"]');
+    if (!pwField || !isVisible(pwField)) return;
+    if (AUTOFILLED.has(pwField)) return;
+    if (pwField.value) return; // user already typing
+    const userField = findUsernameField(pwField);
+    if (userField && userField.value) return; // user already typing username
+
+    const cred = await rpc({ op: "get", name: match.name });
+    if (cred.kind !== "credential") return;
+
+    AUTOFILLED.add(pwField);
+    if (userField && (cred.username || match.username)) {
+        setFieldValue(userField, cred.username || match.username);
+    }
+    setFieldValue(pwField, cred.password);
 }
 
 // =================== fill badge (small "P" overlay) ===================
@@ -207,16 +232,18 @@ function toggleMenu(anchor, pwField) {
         e.textContent = "No matches.";
         m.appendChild(e);
     } else {
-        for (const name of STATE.matches) {
+        for (const entry of STATE.matches) {
             const item = document.createElement("div");
             item.className = "item";
-            item.textContent = name;
+            item.textContent = entry.username
+                ? `${entry.username} — ${entry.name}`
+                : entry.name;
             item.addEventListener("mousedown", (e) => e.preventDefault());
             item.addEventListener("click", async (e) => {
                 e.preventDefault();
                 e.stopPropagation();
                 closeMenu();
-                await fillFromVault(pwField, name);
+                await fillFromVault(pwField, entry.name);
             });
             m.appendChild(item);
         }
@@ -253,9 +280,9 @@ async function fillFromVault(pwField, name) {
         if (r.code === "locked") refresh();
         return;
     }
-    setFieldValue(pwField, r.password);
     const userField = findUsernameField(pwField);
     if (userField && r.username) setFieldValue(userField, r.username);
+    setFieldValue(pwField, r.password);
 }
 
 // =================== submit capture ===================
@@ -396,7 +423,12 @@ async function trySave(shadow, captured) {
         renderUnlockStep(shadow, captured);
         return;
     }
-    const r = await rpc({ op: "save", name: captured.origin, password: captured.password });
+    const r = await rpc({
+        op: "save",
+        name: captured.origin,
+        username: captured.username || "",
+        password: captured.password,
+    });
     if (r.kind === "ok") {
         await sendBg({ type: "discard_captured", origin: captured.origin });
         showSaved(shadow);
@@ -431,6 +463,7 @@ function renderUnlockStep(shadow, captured) {
         const s = await rpc({
             op: "save",
             name: captured.origin,
+            username: captured.username || "",
             password: captured.password,
         });
         if (s.kind === "ok") {

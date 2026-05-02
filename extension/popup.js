@@ -164,6 +164,7 @@ async function renderUnlocked() {
                     const r = await rpc({
                         op: "save",
                         name: capturedForOrigin.origin,
+                        username: capturedForOrigin.username || "",
                         password: capturedForOrigin.password,
                     });
                     if (r.kind === "ok") {
@@ -212,15 +213,15 @@ async function renderUnlocked() {
     // Section: matches for current origin (proper hostname match, not substring)
     root.appendChild(el("hr"));
     root.appendChild(el("label", {}, "On this site"));
-    const list = await rpc({ op: "list" });
+    const list = await rpc({ op: "list_entries" });
 
     if (list.kind === "error") {
         await maybeHandleLocked(list);
         return;
     }
-    const allNames = list.kind === "names" ? list.names : [];
+    const allEntries = list.kind === "entries" ? list.entries : [];
     const matches = origin
-        ? allNames.filter((n) => nameMatchesHost(n, origin))
+        ? allEntries.filter((e) => nameMatchesHost(e.name, origin))
         : [];
 
     if (matches.length === 0) {
@@ -232,25 +233,28 @@ async function renderUnlocked() {
             )
         );
     } else {
-        for (const name of matches) {
+        for (const entry of matches) {
             const fillBtn = el(
                 "button",
-                { class: "small", onclick: () => fillOnTab(tab, name) },
+                { class: "small", onclick: () => fillOnTab(tab, entry.name) },
                 "Fill"
             );
             const copyBtn = el(
                 "button",
-                { class: "ghost small", onclick: () => copyPassword(name) },
+                { class: "ghost small", onclick: () => copyPassword(entry.name) },
                 "Copy"
             );
+            const label = entry.username
+                ? el(
+                      "span",
+                      { class: "name" },
+                      el("strong", {}, entry.username),
+                      " · ",
+                      el("span", { class: "muted" }, entry.name)
+                  )
+                : el("span", { class: "name" }, entry.name);
             root.appendChild(
-                el(
-                    "div",
-                    { class: "account" },
-                    el("span", { class: "name" }, name),
-                    fillBtn,
-                    copyBtn
-                )
+                el("div", { class: "account" }, label, fillBtn, copyBtn)
             );
         }
     }
@@ -260,6 +264,7 @@ async function renderUnlocked() {
     root.appendChild(el("label", {}, "Save this page manually"));
     const nameInput = el("input", { type: "text" });
     nameInput.value = origin;
+    const userInput = el("input", { type: "text", placeholder: "Username (optional)" });
     const pwInput = el("input", { type: "password", placeholder: "Password to save" });
 
     const saveBtn = el(
@@ -271,6 +276,7 @@ async function renderUnlocked() {
                 const r = await rpc({
                     op: "save",
                     name: nameInput.value,
+                    username: userInput.value || "",
                     password: pwInput.value,
                 });
                 pwInput.value = "";
@@ -313,6 +319,8 @@ async function renderUnlocked() {
     root.append(
         el("label", {}, "Name"),
         nameInput,
+        el("label", {}, "Username"),
+        userInput,
         el("label", {}, "Password"),
         pwInput,
         el("div", { class: "row" }, saveBtn, readBtn)
@@ -361,9 +369,10 @@ async function fillOnTab(tab, name) {
     try {
         const r = await browser.tabs.sendMessage(tab.id, {
             type: "fill_password",
+            username: got.username || "",
             password: got.password,
         });
-        if (r && r.filled) showInfo(`Filled password for "${name}".`);
+        if (r && r.filled) showInfo(`Filled "${name}".`);
         else showError((r && r.reason) || "fill failed");
     } catch {
         showError("content script not loaded — try reloading the tab");

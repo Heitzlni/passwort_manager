@@ -55,12 +55,28 @@ pub enum Request {
         #[serde(default)]
         filter: Option<String>,
     },
-    /// Returns the password for an account by exact name.
+    /// Returns name + username for every account (no passwords).
+    /// Useful when a UI wants to show "user@site" entries before fill.
+    ListEntries,
+    /// Returns the credential (name, username, password) for the given name.
     Get { name: String },
-    /// Upserts: updates an existing account by name, or creates a new one.
-    Save { name: String, password: String },
+    /// Upserts. Username is optional for backward compatibility.
+    Save {
+        name: String,
+        #[serde(default)]
+        username: String,
+        password: String,
+    },
     /// Deletes the account with the given name.
     Delete { name: String },
+}
+
+/// Lightweight view of an account, no password attached.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EntryRef {
+    pub name: String,
+    #[serde(default)]
+    pub username: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -79,8 +95,13 @@ pub enum Response {
     Names {
         names: Vec<String>,
     },
+    Entries {
+        entries: Vec<EntryRef>,
+    },
     Credential {
         name: String,
+        #[serde(default)]
+        username: String,
         password: String,
     },
     Error {
@@ -371,6 +392,25 @@ fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
             }
         }
 
+        Request::ListEntries => {
+            let mut s = state.lock().unwrap();
+            match s.session.as_ref() {
+                None => locked_error(),
+                Some(sess) => {
+                    let entries: Vec<EntryRef> = sess
+                        .accounts
+                        .iter()
+                        .map(|a| EntryRef {
+                            name: a.name.clone(),
+                            username: a.username.clone(),
+                        })
+                        .collect();
+                    s.last_activity = Instant::now();
+                    Response::Entries { entries }
+                }
+            }
+        }
+
         Request::Get { name } => {
             let mut s = state.lock().unwrap();
             match s.session.as_ref() {
@@ -379,6 +419,7 @@ fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
                     Some(acc) => {
                         let cred = Response::Credential {
                             name: acc.name.clone(),
+                            username: acc.username.clone(),
                             password: acc.password.clone(),
                         };
                         s.last_activity = Instant::now();
@@ -389,7 +430,11 @@ fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
             }
         }
 
-        Request::Save { name, password } => {
+        Request::Save {
+            name,
+            username,
+            password,
+        } => {
             let mut s = state.lock().unwrap();
             match s.session.as_mut() {
                 None => locked_error(),
@@ -397,9 +442,16 @@ fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
                     let result = if let Some(idx) =
                         sess.accounts.iter().position(|a| a.name == name)
                     {
-                        sess.edit_account(idx, None, Some(password))
+                        // Only overwrite username if a non-empty one was sent;
+                        // empty means "keep existing".
+                        let username_opt = if username.is_empty() {
+                            None
+                        } else {
+                            Some(username)
+                        };
+                        sess.edit_account(idx, None, username_opt, Some(password))
                     } else {
-                        sess.add_account(name, password)
+                        sess.add_account(name, username, password)
                     };
                     match result {
                         Ok(_) => {
@@ -454,6 +506,7 @@ pub fn run_ctl() -> std::io::Result<()> {
         "list" => Request::List {
             filter: args.get(2).cloned(),
         },
+        "entries" => Request::ListEntries,
         "unlock" => {
             let pw = read_password("Master password: ")?;
             Request::Unlock { password: pw }
@@ -466,9 +519,14 @@ pub fn run_ctl() -> std::io::Result<()> {
             let name = args
                 .get(2)
                 .cloned()
-                .ok_or_else(|| usage_err("save <name>"))?;
+                .ok_or_else(|| usage_err("save <name> [<username>]"))?;
+            let username = args.get(3).cloned().unwrap_or_default();
             let pw = read_password(&format!("Password for '{}': ", name))?;
-            Request::Save { name, password: pw }
+            Request::Save {
+                name,
+                username,
+                password: pw,
+            }
         }
         "delete" => {
             let name = args
@@ -550,8 +608,29 @@ pub fn run_ctl() -> std::io::Result<()> {
                 }
             }
         }
-        Response::Credential { name, password } => {
-            println!("{}\t{}", name, password);
+        Response::Entries { entries } => {
+            if entries.is_empty() {
+                eprintln!("(no accounts)");
+            } else {
+                for e in entries {
+                    if e.username.is_empty() {
+                        println!("{}", e.name);
+                    } else {
+                        println!("{}\t{}", e.name, e.username);
+                    }
+                }
+            }
+        }
+        Response::Credential {
+            name,
+            username,
+            password,
+        } => {
+            if username.is_empty() {
+                println!("{}\t{}", name, password);
+            } else {
+                println!("{}\t{}\t{}", name, username, password);
+            }
         }
         Response::Error { code, message } => {
             eprintln!("error [{}]: {}", code, message);
@@ -591,8 +670,9 @@ fn print_usage() {
     eprintln!("    unlock              Decrypt the vault into the daemon (prompts)");
     eprintln!("    lock                Drop the in-memory session");
     eprintln!("    list [filter]       List account names (optional substring match)");
-    eprintln!("    get <name>          Print '<name>\\t<password>' for the named account");
-    eprintln!("    save <name>         Create or update an account (prompts for password)");
+    eprintln!("    entries             List name + username for every account");
+    eprintln!("    get <name>          Print '<name>\\t[<username>\\t]<password>' for the named account");
+    eprintln!("    save <name> [user]  Create or update an account (prompts for password)");
     eprintln!("    delete <name>       Delete the named account");
     eprintln!();
     eprintln!("ENVIRONMENT:");

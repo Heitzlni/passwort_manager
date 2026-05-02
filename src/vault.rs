@@ -145,8 +145,9 @@ fn add_account(session: &mut Session) {
         println!("\nName cannot be empty.\n");
         return;
     }
+    let username = read_input("Enter username (leave empty for none): ");
     let password = read_password("Enter password: ");
-    match session.add_account(name, password.to_string()) {
+    match session.add_account(name, username, password.to_string()) {
         Ok(_) => println!("\nAccount added successfully.\n"),
         Err(e) => eprintln!("Failed to save: {}", e),
     }
@@ -160,7 +161,10 @@ fn show_accounts(session: &Session) {
     println!("\n==== Stored Accounts ====");
     for account in &session.accounts {
         println!("------------------------");
-        println!("Account: {}", account.name);
+        println!("Account:  {}", account.name);
+        if !account.username.is_empty() {
+            println!("Username: {}", account.username);
+        }
         println!("Password: {}", account.password);
     }
     println!("------------------------\n");
@@ -171,23 +175,30 @@ fn edit_account(session: &mut Session) {
         Some(i) => i,
         None => return,
     };
-    println!("Current name: {}", session.accounts[idx].name);
+    println!("Current name:     {}", session.accounts[idx].name);
+    println!("Current username: {}", session.accounts[idx].username);
     let new_name = read_input("New name (leave empty to keep current): ");
+    let new_username = read_input("New username (leave empty to keep current): ");
     let new_password = read_password("New password (leave empty to keep current): ");
 
-    if new_name.is_empty() && new_password.is_empty() {
+    if new_name.is_empty() && new_username.is_empty() && new_password.is_empty() {
         println!("\nNothing changed.\n");
         return;
     }
 
     let name_opt = if new_name.is_empty() { None } else { Some(new_name) };
+    let user_opt = if new_username.is_empty() {
+        None
+    } else {
+        Some(new_username)
+    };
     let pw_opt = if new_password.is_empty() {
         None
     } else {
         Some(new_password.to_string())
     };
 
-    match session.edit_account(idx, name_opt, pw_opt) {
+    match session.edit_account(idx, name_opt, user_opt, pw_opt) {
         Ok(_) => println!("\nAccount updated.\n"),
         Err(e) => eprintln!("Failed to save: {}", e),
     }

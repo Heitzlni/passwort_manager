@@ -14,6 +14,10 @@ pub const CURRENT_VERSION: u32 = 1;
 #[derive(Serialize, Deserialize, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct Account {
     pub name: String,
+    /// Username for the site. May be empty (older entries didn't have one).
+    /// `#[serde(default)]` keeps existing vault files readable.
+    #[serde(default)]
+    pub username: String,
     pub password: String,
 }
 
