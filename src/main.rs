@@ -4,7 +4,22 @@ fn main() {
     harden_process();
     storage::migrate_local_vault_if_needed();
 
-    let use_cli = std::env::args().any(|a| a == "--cli");
+    let args: Vec<String> = std::env::args().collect();
+    let arg_after = |flag: &str| -> Option<String> {
+        args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1).cloned())
+    };
+
+    // Quick-pick mode (launched by passwort-autotype on hotkey press).
+    if args.iter().any(|a| a == "--picker") {
+        let target = arg_after("--target-title");
+        if let Err(e) = gui::run_picker(target) {
+            eprintln!("picker failed: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let use_cli = args.iter().any(|a| a == "--cli");
 
     if use_cli {
         println!("==== Password Manager ====");

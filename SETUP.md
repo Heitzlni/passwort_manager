@@ -77,6 +77,43 @@ Stable Firefox unloads unsigned extensions on restart. Two real options:
 * The vault auto-locks after 10 minutes idle. Unlock again the same way.
 * No terminal involved.
 
+## Auto-type for native apps (Steam, Discord, etc.)
+
+Browser extensions can't see native apps. For non-browser logins the workflow is:
+
+1. Add the credential once via the GUI app (name = e.g. "Steam", username, password).
+2. On the app's login screen, click the password field.
+3. Press the global hotkey (default **Ctrl+Alt+P**).
+4. A small picker pops up; type to filter, Enter to pick (or click).
+5. The manager re-focuses the original window and types `<username><Tab><password>`. You hit Enter / click Sign-In yourself.
+
+Requires `xdotool`:
+
+```sh
+sudo apt install xdotool
+```
+
+The auto-type helper (`passwort-autotype`) starts automatically next time you log in (via an `~/.config/autostart` entry). To start it now without re-logging in:
+
+```sh
+nohup passwort-autotype >/dev/null 2>&1 &
+```
+
+The hotkey is configurable in `~/.config/passwort-manager/config.json`:
+
+```json
+{
+    "hotkey": {
+        "modifiers": ["ctrl", "alt"],
+        "key": "p"
+    }
+}
+```
+
+Valid modifiers: `ctrl`, `alt`, `shift`, `super`. Valid keys: `a`–`z`, `0`–`9`, `f1`–`f12`, `space`, `enter`. The helper polls the file every 2 s, so changes apply without a restart.
+
+**Wayland note:** `passwort-autotype` uses X11 APIs for hotkey listening and `xdotool` for typing. On Wayland sessions neither works reliably. Use an X11 session if you need auto-type.
+
 ## Building a release tarball yourself
 
 If you change the code and want to ship it to friends without making them install Rust:

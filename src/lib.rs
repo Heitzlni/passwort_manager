@@ -1,3 +1,5 @@
+pub mod autotype;
+pub mod config;
 pub mod crypto;
 pub mod gui;
 pub mod ipc;

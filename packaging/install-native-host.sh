@@ -32,21 +32,37 @@ mkdir -p "$BIN_DIR"
 PREBUILT_DIR="$REPO_DIR/bin"
 if [[ -x "$PREBUILT_DIR/passwortd" \
    && -x "$PREBUILT_DIR/passwortctl" \
-   && -x "$PREBUILT_DIR/passwort_native_host" ]]; then
+   && -x "$PREBUILT_DIR/passwort_native_host" \
+   && -x "$PREBUILT_DIR/passwort_autotype" ]]; then
     install -m 755 "$PREBUILT_DIR/passwortd"             "$BIN_DIR/passwortd"
     install -m 755 "$PREBUILT_DIR/passwortctl"           "$BIN_DIR/passwortctl"
     install -m 755 "$PREBUILT_DIR/passwort_native_host"  "$BIN_DIR/passwort-native-host"
+    install -m 755 "$PREBUILT_DIR/passwort_autotype"     "$BIN_DIR/passwort-autotype"
 else
     if ! command -v cargo >/dev/null 2>&1; then
         echo "ERROR: 'cargo' is not installed and no pre-built binaries in $PREBUILT_DIR" >&2
         exit 1
     fi
-    echo "Building passwortd, passwortctl, passwort_native_host..."
-    cargo build --release --bin passwortd --bin passwortctl --bin passwort_native_host
+    echo "Building passwortd, passwortctl, passwort_native_host, passwort_autotype..."
+    cargo build --release --bin passwortd --bin passwortctl \
+                          --bin passwort_native_host --bin passwort_autotype
     install -m 755 "$REPO_DIR/target/release/passwortd"             "$BIN_DIR/passwortd"
     install -m 755 "$REPO_DIR/target/release/passwortctl"           "$BIN_DIR/passwortctl"
     install -m 755 "$REPO_DIR/target/release/passwort_native_host"  "$BIN_DIR/passwort-native-host"
+    install -m 755 "$REPO_DIR/target/release/passwort_autotype"     "$BIN_DIR/passwort-autotype"
 fi
+
+# XDG autostart entry for passwort-autotype. We use autostart instead of a
+# systemd user service because the autotype helper needs the graphical
+# session env (DISPLAY etc.), which user systemd services don't get by
+# default.
+AUTOSTART_DIR="$HOME/.config/autostart"
+mkdir -p "$AUTOSTART_DIR"
+sed "s|BINARY_PATH|$BIN_DIR/passwort-autotype|g" \
+    "$REPO_DIR/packaging/autostart/passwort-autotype.desktop" \
+    > "$AUTOSTART_DIR/passwort-autotype.desktop"
+chmod 644 "$AUTOSTART_DIR/passwort-autotype.desktop"
+echo "Auto-type autostart entry: $AUTOSTART_DIR/passwort-autotype.desktop"
 
 # Firefox manifest
 FX_DIR="$HOME/.mozilla/native-messaging-hosts"
@@ -97,15 +113,21 @@ fi
 
 echo
 echo "Done."
-echo "  Daemon binary: $BIN_DIR/passwortd"
-echo "  Native host:   $BIN_DIR/passwort-native-host"
+echo "  Daemon binary:    $BIN_DIR/passwortd"
+echo "  Native host:      $BIN_DIR/passwort-native-host"
+echo "  Auto-type helper: $BIN_DIR/passwort-autotype  (starts on next login)"
 if [[ $SERVICE_INSTALLED -eq 1 ]]; then
-    echo "  Service:       enabled (passwortd.service, starts at login,"
-    echo "                 already running)"
+    echo "  Service:          enabled (passwortd.service, starts at login,"
+    echo "                    already running)"
     echo
     echo "You're set. Open Firefox, click the Password Manager toolbar icon,"
-    echo "and enter your master password. It stays unlocked until idle for 10"
-    echo "minutes; you'll only need to re-unlock once per session after that."
+    echo "and enter your master password."
+    echo
+    echo "Auto-type helper: starts automatically next time you log in."
+    echo "To start it now without re-logging in:"
+    echo "  nohup passwort-autotype >/dev/null 2>&1 &"
+    echo
+    echo "Default global hotkey is Ctrl+Alt+P. Requires xdotool installed."
 else
     echo
     echo "Systemd user service couldn't be enabled. To start the daemon:"

@@ -21,7 +21,8 @@ bold "Building release binaries (clean release build)..."
 cargo build --release --bin passwort_manager \
                        --bin passwortd \
                        --bin passwortctl \
-                       --bin passwort_native_host
+                       --bin passwort_native_host \
+                       --bin passwort_autotype
 
 bold "Staging tarball at /tmp/${NAME}/"
 STAGE="/tmp/${NAME}"
@@ -29,7 +30,7 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/bin"
 
 # Pre-built binaries (stripped to shrink download size)
-for b in passwort_manager passwortd passwortctl passwort_native_host; do
+for b in passwort_manager passwortd passwortctl passwort_native_host passwort_autotype; do
     cp "target/release/$b" "$STAGE/bin/$b"
     strip "$STAGE/bin/$b" 2>/dev/null || true
 done

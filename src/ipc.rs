@@ -513,6 +513,45 @@ fn locked_error() -> Response {
     error(codes::LOCKED, "vault is locked; run `passwortctl unlock` first")
 }
 
+// =================== Generic client helper ===================
+//
+// Open a one-shot connection to the daemon, send a single Request, read back
+// the Response, hang up. Used by passwortctl, passwort-autotype, and the
+// picker mode of the GUI binary.
+
+pub fn rpc(req: &Request) -> std::io::Result<Response> {
+    let path = socket_path();
+    let stream = UnixStream::connect(&path).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "could not connect to daemon at {} ({}). Is `passwortd` running?",
+                path.display(),
+                e
+            ),
+        )
+    })?;
+    let mut writer = stream.try_clone()?;
+    let mut reader = BufReader::new(stream);
+
+    let mut payload = serde_json::to_string(req).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, format!("serialize: {}", e))
+    })?;
+    payload.push('\n');
+    writer.write_all(payload.as_bytes())?;
+    writer.flush()?;
+    drop(writer);
+
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    serde_json::from_str(line.trim()).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("bad response: {} ({:?})", e, line),
+        )
+    })
+}
+
 // =================== Control client (passwortctl) ===================
 
 pub fn run_ctl() -> std::io::Result<()> {

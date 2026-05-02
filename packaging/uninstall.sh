@@ -13,10 +13,15 @@ if command -v systemctl >/dev/null 2>&1 && [[ -f "$SD_DIR/passwortd.service" ]];
     systemctl --user daemon-reload 2>/dev/null || true
 fi
 
+# Stop the autotype helper if running, remove its autostart entry
+pkill -x passwort-autotype 2>/dev/null || true
+rm -f "$HOME/.config/autostart/passwort-autotype.desktop"
+
 rm -f "$BIN_DIR/passwort-manager"
 rm -f "$BIN_DIR/passwortd"
 rm -f "$BIN_DIR/passwortctl"
 rm -f "$BIN_DIR/passwort-native-host"
+rm -f "$BIN_DIR/passwort-autotype"
 rm -f "$APP_DIR/passwort-manager.desktop"
 rm -f "$ICON_DIR/passwort-manager.svg"
 rm -f "$HOME/.mozilla/native-messaging-hosts/passwort_manager.json"

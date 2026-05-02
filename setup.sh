@@ -53,11 +53,12 @@ if [[ "$PREBUILT" == "no" ]]; then
     ok "cargo present ($(cargo --version | awk '{print $2}'))"
 fi
 
-# 3. System libraries (Debian/Ubuntu detection only — other distros: skip)
+# 3. System packages (Debian/Ubuntu detection only — other distros: skip)
+#    xdotool is required at runtime by the auto-type helper for native apps.
 if command -v dpkg >/dev/null 2>&1; then
     MISSING=()
     for pkg in libxcb1 libxcb-render0 libxcb-shape0 libxcb-xfixes0 \
-               libxkbcommon0 libgl1 libfontconfig1; do
+               libxkbcommon0 libgl1 libfontconfig1 xdotool; do
         if ! dpkg -l "$pkg" 2>/dev/null | grep -q '^ii'; then
             MISSING+=("$pkg")
         fi
@@ -85,7 +86,8 @@ if [[ "$PREBUILT" == "no" ]]; then
     cargo build --release --bin passwort_manager \
                            --bin passwortd \
                            --bin passwortctl \
-                           --bin passwort_native_host
+                           --bin passwort_native_host \
+                           --bin passwort_autotype
     ok "build complete"
 fi
 echo

@@ -30,6 +30,200 @@ pub fn run() -> Result<(), eframe::Error> {
     )
 }
 
+/// Quick-pick mode: shown by `passwort-manager --picker` when the
+/// auto-type daemon fires the global hotkey. Lists vault entries
+/// (sorted by relevance to the active window's title), lets the user
+/// type to filter / arrow keys to move / Enter to pick / Esc to cancel.
+/// Prints the chosen entry name to stdout and exits.
+pub fn run_picker(target_title: Option<String>) -> Result<(), eframe::Error> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([420.0, 320.0])
+            .with_resizable(false)
+            .with_decorations(false)
+            .with_always_on_top(),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Password Manager — Pick",
+        options,
+        Box::new(|cc| {
+            setup_style(&cc.egui_ctx);
+            Box::new(picker::PickerApp::new(target_title))
+        }),
+    )
+}
+
+mod picker {
+    use super::{COLOR_ACCENT, COLOR_ERROR, COLOR_MUTED};
+    use crate::ipc::{self, EntryRef, Request, Response};
+    use eframe::egui;
+
+    pub struct PickerApp {
+        entries: Vec<EntryRef>,
+        filter: String,
+        selected: usize,
+        target_title: Option<String>,
+        load_error: Option<String>,
+    }
+
+    impl PickerApp {
+        pub fn new(target_title: Option<String>) -> Self {
+            let (entries, load_error) = match ipc::rpc(&Request::ListEntries) {
+                Ok(Response::Entries { mut entries }) => {
+                    // Sort: entries whose name appears in the target window
+                    // title come first; everything else stays in original order.
+                    if let Some(t) = target_title.as_deref() {
+                        let t_low = t.to_lowercase();
+                        entries.sort_by_key(|e| {
+                            let n = e.name.to_lowercase();
+                            !(t_low.contains(&n) || n.split('.').any(|p| t_low.contains(p)))
+                        });
+                    }
+                    (entries, None)
+                }
+                Ok(Response::Error { code, message }) => {
+                    let msg = if code == "locked" {
+                        "Vault is locked. Open the toolbar extension or the GUI to unlock.".to_string()
+                    } else {
+                        message
+                    };
+                    (Vec::new(), Some(msg))
+                }
+                Ok(_) => (Vec::new(), Some("unexpected response".into())),
+                Err(e) => (Vec::new(), Some(e.to_string())),
+            };
+            Self {
+                entries,
+                filter: String::new(),
+                selected: 0,
+                target_title,
+                load_error,
+            }
+        }
+
+        fn filtered(&self) -> Vec<&EntryRef> {
+            if self.filter.is_empty() {
+                return self.entries.iter().collect();
+            }
+            let f = self.filter.to_lowercase();
+            self.entries
+                .iter()
+                .filter(|e| {
+                    e.name.to_lowercase().contains(&f)
+                        || e.username.to_lowercase().contains(&f)
+                })
+                .collect()
+        }
+    }
+
+    impl eframe::App for PickerApp {
+        fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            // Compute filtered names + selection once per frame so the
+            // borrow-checker doesn't complain when we mutate self.selected.
+            let filtered_names: Vec<(String, String)> = self
+                .filtered()
+                .into_iter()
+                .map(|e| (e.name.clone(), e.username.clone()))
+                .collect();
+            if !filtered_names.is_empty() && self.selected >= filtered_names.len() {
+                self.selected = filtered_names.len() - 1;
+            }
+
+            // Keyboard navigation
+            let len = filtered_names.len();
+            let pick_now: Option<String> = ctx.input(|i| {
+                if i.key_pressed(egui::Key::Escape) {
+                    std::process::exit(1);
+                }
+                if i.key_pressed(egui::Key::ArrowDown) && len > 0 {
+                    self.selected = (self.selected + 1) % len;
+                }
+                if i.key_pressed(egui::Key::ArrowUp) && len > 0 {
+                    self.selected = (self.selected + len - 1) % len;
+                }
+                if i.key_pressed(egui::Key::Enter) && len > 0 {
+                    return Some(filtered_names[self.selected].0.clone());
+                }
+                None
+            });
+            if let Some(name) = pick_now {
+                println!("{}", name);
+                std::process::exit(0);
+            }
+
+            egui::CentralPanel::default().show(ctx, |ui| {
+                // Header showing what window we're filling for
+                if let Some(t) = &self.target_title {
+                    ui.colored_label(COLOR_MUTED, format!("→ {}", t));
+                    ui.add_space(4.0);
+                }
+
+                if let Some(err) = &self.load_error {
+                    ui.colored_label(COLOR_ERROR, err);
+                    ui.add_space(8.0);
+                    if ui
+                        .add_sized([100.0, 28.0], egui::Button::new("Close"))
+                        .clicked()
+                    {
+                        std::process::exit(1);
+                    }
+                    return;
+                }
+
+                // Filter input — auto-focused
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.filter)
+                        .hint_text("Type to filter…")
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::vec2(8.0, 6.0)),
+                );
+                if !resp.has_focus() {
+                    resp.request_focus();
+                }
+
+                ui.add_space(4.0);
+
+                if filtered_names.is_empty() {
+                    ui.colored_label(COLOR_MUTED, "No entries match.");
+                    return;
+                }
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (i, (name, username)) in filtered_names.iter().enumerate() {
+                        let is_sel = i == self.selected;
+                        let label = if username.is_empty() {
+                            name.clone()
+                        } else {
+                            format!("{} — {}", username, name)
+                        };
+                        let text = if is_sel {
+                            egui::RichText::new(label).color(egui::Color32::WHITE).strong()
+                        } else {
+                            egui::RichText::new(label)
+                        };
+                        let resp = ui.add_sized(
+                            egui::vec2(ui.available_width(), 26.0),
+                            egui::SelectableLabel::new(is_sel, text),
+                        );
+                        if resp.clicked() {
+                            println!("{}", name);
+                            std::process::exit(0);
+                        }
+                        if is_sel {
+                            ui.painter().rect_stroke(
+                                resp.rect,
+                                4.0,
+                                egui::Stroke::new(1.0, COLOR_ACCENT),
+                            );
+                        }
+                    }
+                });
+            });
+        }
+    }
+}
+
 // =================== Theme ===================
 fn setup_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();

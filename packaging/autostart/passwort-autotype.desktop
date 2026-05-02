@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Password Manager Auto-Type
+Comment=Background hotkey listener that types saved credentials into native apps
+Exec=BINARY_PATH
+NoDisplay=true
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
+Hidden=false
