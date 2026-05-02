@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use zeroize::Zeroize;
 
+use crate::config::{self as app_config, HotkeyConfig};
 use crate::session::{
     self, ChangeMasterError, InitialState, Session, MIN_MASTER_PASSWORD_LEN,
 };
@@ -358,6 +359,11 @@ enum Modal {
         new: String,
         confirm: String,
     },
+    HotkeySettings {
+        current: HotkeyConfig,
+        capturing: bool,
+        message: Option<(String, bool)>, // (text, is_error)
+    },
 }
 
 impl Drop for Modal {
@@ -396,6 +402,9 @@ impl Drop for Modal {
                 current.zeroize();
                 new.zeroize();
                 confirm.zeroize();
+            }
+            Modal::HotkeySettings { .. } => {
+                // No sensitive fields.
             }
         }
     }
@@ -780,6 +789,13 @@ impl App {
                                     confirm: String::new(),
                                 });
                             }
+                            if ui.button("Settings").clicked() {
+                                *modal = Some(Modal::HotkeySettings {
+                                    current: app_config::load().hotkey,
+                                    capturing: false,
+                                    message: None,
+                                });
+                            }
                         },
                     );
                 });
@@ -1059,6 +1075,7 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
         Modal::Edit { .. } => "Edit account",
         Modal::DeleteConfirm { .. } => "Delete account",
         Modal::ChangeMaster { .. } => "Change master password",
+        Modal::HotkeySettings { .. } => "Settings",
     };
 
     egui::Window::new(title)
@@ -1320,7 +1337,178 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                     }
                 });
             }
+
+            Modal::HotkeySettings {
+                current,
+                capturing,
+                message,
+            } => {
+                ui.colored_label(
+                    COLOR_MUTED,
+                    "Auto-type hotkey for native apps (e.g. Steam, Discord).",
+                );
+                ui.add_space(8.0);
+
+                if *capturing {
+                    ui.heading("Press your hotkey…");
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        COLOR_MUTED,
+                        "Hold modifiers (Ctrl, Alt, Shift, Super) and press a letter / digit / F-key.",
+                    );
+                    ui.add_space(4.0);
+                    ui.colored_label(COLOR_MUTED, "Esc to cancel.");
+                    ui.add_space(8.0);
+
+                    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        *capturing = false;
+                    } else {
+                        let captured = ctx.input(|i| {
+                            let mods = i.modifiers;
+                            for event in &i.events {
+                                if let egui::Event::Key {
+                                    key, pressed: true, ..
+                                } = event
+                                {
+                                    if let Some(name) = egui_key_to_config_key(*key) {
+                                        return Some((mods, name));
+                                    }
+                                }
+                            }
+                            None
+                        });
+                        if let Some((mods, key_name)) = captured {
+                            let mut modifiers: Vec<String> = Vec::new();
+                            if mods.ctrl {
+                                modifiers.push("ctrl".into());
+                            }
+                            if mods.alt {
+                                modifiers.push("alt".into());
+                            }
+                            if mods.shift {
+                                modifiers.push("shift".into());
+                            }
+                            if mods.command {
+                                modifiers.push("super".into());
+                            }
+                            if modifiers.is_empty() {
+                                *message = Some((
+                                    "Hotkey must include at least one modifier (Ctrl, Alt, Shift, or Super)."
+                                        .to_string(),
+                                    true,
+                                ));
+                                *capturing = false;
+                            } else {
+                                *current = HotkeyConfig {
+                                    modifiers,
+                                    key: key_name,
+                                };
+                                let cfg = app_config::Config {
+                                    hotkey: current.clone(),
+                                };
+                                match app_config::save(&cfg) {
+                                    Ok(_) => {
+                                        *message = Some((
+                                            format!("Saved: {}", current.human()),
+                                            false,
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        *message =
+                                            Some((format!("Save failed: {}", e), true));
+                                    }
+                                }
+                                *capturing = false;
+                            }
+                        }
+                    }
+                } else {
+                    ui.label(format!("Current hotkey: {}", current.human()));
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        let change = egui::Button::new(
+                            egui::RichText::new("Change…").strong(),
+                        )
+                        .fill(COLOR_ACCENT)
+                        .min_size(egui::vec2(110.0, 28.0));
+                        if ui.add(change).clicked() {
+                            *capturing = true;
+                            *message = None;
+                        }
+                        if ui
+                            .add_sized(
+                                egui::vec2(110.0, 28.0),
+                                egui::Button::new("Reset to default"),
+                            )
+                            .clicked()
+                        {
+                            *current = HotkeyConfig {
+                                modifiers: vec!["ctrl".into(), "alt".into()],
+                                key: "p".into(),
+                            };
+                            let cfg = app_config::Config {
+                                hotkey: current.clone(),
+                            };
+                            match app_config::save(&cfg) {
+                                Ok(_) => {
+                                    *message = Some((
+                                        format!("Reset to {}", current.human()),
+                                        false,
+                                    ))
+                                }
+                                Err(e) => {
+                                    *message = Some((format!("Save failed: {}", e), true))
+                                }
+                            }
+                        }
+                    });
+                    ui.add_space(10.0);
+                    ui.colored_label(
+                        COLOR_MUTED,
+                        "Auto-type changes apply within ~2 seconds (the helper polls the config file).",
+                    );
+                    ui.add_space(2.0);
+                    ui.colored_label(
+                        COLOR_MUTED,
+                        "Requires `xdotool` installed and `passwort-autotype` running.",
+                    );
+                }
+
+                if let Some((msg, is_err)) = message {
+                    ui.add_space(10.0);
+                    let color = if *is_err { COLOR_ERROR } else { COLOR_OK };
+                    ui.colored_label(color, msg.as_str());
+                }
+
+                ui.add_space(14.0);
+                if ui
+                    .add_sized(egui::vec2(80.0, 28.0), egui::Button::new("Close"))
+                    .clicked()
+                {
+                    result = ModalResult::Close;
+                }
+            }
         });
 
     result
+}
+
+fn egui_key_to_config_key(k: egui::Key) -> Option<String> {
+    use egui::Key::*;
+    let s = match k {
+        A => "a", B => "b", C => "c", D => "d", E => "e", F => "f",
+        G => "g", H => "h", I => "i", J => "j", K => "k", L => "l",
+        M => "m", N => "n", O => "o", P => "p", Q => "q", R => "r",
+        S => "s", T => "t", U => "u", V => "v", W => "w", X => "x",
+        Y => "y", Z => "z",
+        Num0 => "0", Num1 => "1", Num2 => "2", Num3 => "3", Num4 => "4",
+        Num5 => "5", Num6 => "6", Num7 => "7", Num8 => "8", Num9 => "9",
+        F1 => "f1", F2 => "f2", F3 => "f3", F4 => "f4",
+        F5 => "f5", F6 => "f6", F7 => "f7", F8 => "f8",
+        F9 => "f9", F10 => "f10", F11 => "f11", F12 => "f12",
+        Space => "space",
+        Enter => "enter",
+        _ => return None,
+    };
+    Some(s.to_string())
 }
