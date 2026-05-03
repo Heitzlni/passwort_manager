@@ -37,10 +37,12 @@ pub fn run() -> Result<(), eframe::Error> {
 /// type to filter / arrow keys to move / Enter to pick / Esc to cancel.
 /// Prints the chosen entry name to stdout and exits.
 pub fn run_picker(target_title: Option<String>) -> Result<(), eframe::Error> {
-    // Decorations stay ON so the user can find / move the window — under
-    // GNOME (Mutter) borderless + always-on-top isn't reliably enforced
-    // and the window can land somewhere invisible. With a title bar it's
-    // unmistakable. Always-on-top is still requested as best-effort.
+    eprintln!("[picker] starting, target={:?}", target_title);
+    eprintln!(
+        "[picker] DISPLAY={:?} XDG_SESSION_TYPE={:?}",
+        std::env::var_os("DISPLAY"),
+        std::env::var_os("XDG_SESSION_TYPE")
+    );
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([460.0, 360.0])
@@ -51,14 +53,17 @@ pub fn run_picker(target_title: Option<String>) -> Result<(), eframe::Error> {
         centered: true,
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "Password Manager — Pick",
         options,
         Box::new(|cc| {
             setup_style(&cc.egui_ctx);
+            eprintln!("[picker] creator callback invoked, building PickerApp");
             Box::new(picker::PickerApp::new(target_title))
         }),
-    )
+    );
+    eprintln!("[picker] eframe::run_native returned: {:?}", result.as_ref().err());
+    result
 }
 
 mod picker {
@@ -72,6 +77,7 @@ mod picker {
         selected: usize,
         target_title: Option<String>,
         load_error: Option<String>,
+        first_frame: bool,
     }
 
     impl PickerApp {
@@ -100,12 +106,18 @@ mod picker {
                 Ok(_) => (Vec::new(), Some("unexpected response".into())),
                 Err(e) => (Vec::new(), Some(e.to_string())),
             };
+            eprintln!(
+                "[picker] PickerApp built: {} entries, load_error={:?}",
+                entries.len(),
+                load_error
+            );
             Self {
                 entries,
                 filter: String::new(),
                 selected: 0,
                 target_title,
                 load_error,
+                first_frame: true,
             }
         }
 
@@ -126,6 +138,10 @@ mod picker {
 
     impl eframe::App for PickerApp {
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            if self.first_frame {
+                self.first_frame = false;
+                eprintln!("[picker] first frame — window should now be visible");
+            }
             // Compute filtered names + selection once per frame so the
             // borrow-checker doesn't complain when we mutate self.selected.
             let filtered_names: Vec<(String, String)> = self
