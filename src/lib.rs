@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod autotype;
 pub mod config;
 pub mod crypto;

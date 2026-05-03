@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
+use crate::auth;
 use crate::session::{self, InitialState, Session};
 use crate::storage;
 
@@ -40,11 +41,34 @@ const MIN_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 // =================== Protocol ===================
 
+/// Outer envelope: every request optionally carries an auth_token. Status
+/// and Register don't require it; everything else does.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Envelope {
+    #[serde(default)]
+    pub auth_token: Option<String>,
+    /// Optional human-readable label, sent on Register so the user knows
+    /// what they're approving.
+    #[serde(default)]
+    pub client_label: Option<String>,
+    #[serde(flatten)]
+    pub op: Request,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     /// Returns whether the daemon currently holds an unlocked vault.
+    /// No auth required.
     Status,
+    /// Submit this client's API token + label for approval. Returns
+    /// `pending_approval` (with a short_id the user must approve via
+    /// `passwortctl approve`) or `ok` if it was already approved.
+    /// No auth required (this IS the auth bootstrap).
+    Register,
+    /// Returns the current approval status of the auth_token in the
+    /// envelope. No auth required.
+    AuthStatus,
     /// Decrypts the vault from disk with this master password and caches
     /// the unlocked session in memory. Idempotent if already unlocked.
     Unlock { password: String },
@@ -110,6 +134,17 @@ pub enum Response {
         code: String,
         message: String,
     },
+    /// Auth bootstrap response: tells the client its short_id and that
+    /// it's pending user approval.
+    PendingApproval {
+        short_id: String,
+        message: String,
+    },
+    /// Returned by AuthStatus.
+    AuthStatusResp {
+        /// "approved" / "pending" / "unknown"
+        state: String,
+    },
 }
 
 // Error code constants — kept in one place so clients and the daemon agree.
@@ -121,6 +156,8 @@ pub mod codes {
     pub const VAULT_CORRUPTED: &str = "vault_corrupted";
     pub const IO_ERROR: &str = "io_error";
     pub const BAD_REQUEST: &str = "bad_request";
+    pub const CLIENT_UNAUTHORIZED: &str = "client_unauthorized";
+    pub const CLIENT_PENDING: &str = "client_pending";
 }
 
 fn error(code: &str, message: impl Into<String>) -> Response {
@@ -350,8 +387,8 @@ fn handle_client(stream: UnixStream, state: SharedState) -> std::io::Result<()> 
         if n == 0 {
             return Ok(());
         }
-        let resp = match serde_json::from_str::<Request>(line.trim()) {
-            Ok(req) => process_request(req, &state),
+        let resp = match serde_json::from_str::<Envelope>(line.trim()) {
+            Ok(env) => process_envelope(env, &state),
             Err(e) => error(codes::BAD_REQUEST, format!("bad request: {}", e)),
         };
         let mut payload = serde_json::to_string(&resp).map_err(|e| {
@@ -363,8 +400,114 @@ fn handle_client(stream: UnixStream, state: SharedState) -> std::io::Result<()> 
     }
 }
 
+/// Top-level dispatcher: enforces auth for protected ops, lets the auth
+/// bootstrap ops through unauthenticated.
+fn process_envelope(env: Envelope, state: &Mutex<DaemonState>) -> Response {
+    match &env.op {
+        // Always-allowed ops
+        Request::Status => return process_request(env.op, state),
+        Request::Register => {
+            let token = match env.auth_token.as_deref() {
+                Some(t) if !t.is_empty() => t,
+                _ => {
+                    return error(
+                        codes::BAD_REQUEST,
+                        "Register requires auth_token in envelope",
+                    )
+                }
+            };
+            let label = env.client_label.as_deref().unwrap_or("(unlabeled client)");
+            let mut list = auth::load();
+            // Check if already approved → return Ok immediately.
+            if auth::is_approved(&list, token) {
+                return Response::Ok;
+            }
+            let id = match auth::record_pending(&mut list, token, label) {
+                Some(id) => id,
+                None => {
+                    return error(codes::BAD_REQUEST, "auth_token must be valid base64")
+                }
+            };
+            if let Err(e) = auth::save(&list) {
+                return error(
+                    codes::IO_ERROR,
+                    format!("failed to record pending client: {}", e),
+                );
+            }
+            Response::PendingApproval {
+                short_id: id.clone(),
+                message: format!(
+                    "New client \"{}\" awaiting approval. Run: passwortctl approve {}",
+                    label, id
+                ),
+            }
+        }
+        Request::AuthStatus => {
+            let token = match env.auth_token.as_deref() {
+                Some(t) if !t.is_empty() => t,
+                _ => {
+                    return Response::AuthStatusResp {
+                        state: "unknown".into(),
+                    }
+                }
+            };
+            let list = auth::load();
+            if auth::is_approved(&list, token) {
+                return Response::AuthStatusResp {
+                    state: "approved".into(),
+                };
+            }
+            // Pending if its hash matches a pending entry
+            if let Some(h) = auth::token_hash_hex(token) {
+                let id = auth::short_id(&h);
+                if list.pending.contains_key(&id) {
+                    return Response::AuthStatusResp {
+                        state: "pending".into(),
+                    };
+                }
+            }
+            Response::AuthStatusResp {
+                state: "unknown".into(),
+            }
+        }
+        // Everything else requires an approved token.
+        _ => {
+            let token = match env.auth_token.as_deref() {
+                Some(t) if !t.is_empty() => t,
+                _ => {
+                    return error(
+                        codes::CLIENT_UNAUTHORIZED,
+                        "Missing auth_token. Send Register first, then ask the user to approve.",
+                    )
+                }
+            };
+            let list = auth::load();
+            if !auth::is_approved(&list, token) {
+                let h = auth::token_hash_hex(token);
+                let pending = h
+                    .as_ref()
+                    .map(|hh| list.pending.contains_key(&auth::short_id(hh)))
+                    .unwrap_or(false);
+                let code = if pending {
+                    codes::CLIENT_PENDING
+                } else {
+                    codes::CLIENT_UNAUTHORIZED
+                };
+                let msg = if pending {
+                    "Client is awaiting user approval. Run `passwortctl approvals` to see and approve."
+                } else {
+                    "Client is not approved. Send Register first."
+                };
+                return error(code, msg);
+            }
+            process_request(env.op, state)
+        }
+    }
+}
+
 fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
     match req {
+        Request::Register | Request::AuthStatus => unreachable!("handled in process_envelope"),
         Request::Status => {
             let s = state.lock().unwrap();
             let unlocked = s.session.is_some();
@@ -578,6 +721,16 @@ fn locked_error() -> Response {
 // picker mode of the GUI binary.
 
 pub fn rpc(req: &Request) -> std::io::Result<Response> {
+    rpc_with_auth(req, None, None)
+}
+
+/// Same as `rpc` but attaches an auth_token (and optional client label
+/// for Register requests) to the envelope.
+pub fn rpc_with_auth(
+    req: &Request,
+    auth_token: Option<&str>,
+    client_label: Option<&str>,
+) -> std::io::Result<Response> {
     let path = socket_path();
     let stream = UnixStream::connect(&path).map_err(|e| {
         std::io::Error::new(
@@ -592,7 +745,23 @@ pub fn rpc(req: &Request) -> std::io::Result<Response> {
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
 
-    let mut payload = serde_json::to_string(req).map_err(|e| {
+    // Build envelope JSON manually so we can keep `req` borrowed.
+    #[derive(serde::Serialize)]
+    struct Out<'a> {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        auth_token: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        client_label: Option<&'a str>,
+        #[serde(flatten)]
+        op: &'a Request,
+    }
+    let env = Out {
+        auth_token,
+        client_label,
+        op: req,
+    };
+
+    let mut payload = serde_json::to_string(&env).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::Other, format!("serialize: {}", e))
     })?;
     payload.push('\n');
@@ -610,6 +779,38 @@ pub fn rpc(req: &Request) -> std::io::Result<Response> {
     })
 }
 
+/// Read this client's API token from a config file. Auto-creates one
+/// (random 32 bytes, base64) on first call. The file is at:
+///   ~/.config/passwort-manager/<client>-token
+/// Each client (passwortctl, passwort-autotype, native host) gets its
+/// own so they can be approved/revoked independently.
+pub fn load_or_create_token(client_name: &str) -> std::io::Result<String> {
+    let dir = crate::config::config_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}-token", client_name));
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        let s = s.trim();
+        if !s.is_empty() {
+            return Ok(s.to_string());
+        }
+    }
+    let tok = crate::auth::random_token_b64();
+    std::fs::write(&path, &tok)?;
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    Ok(tok)
+}
+
+/// Convenience for clients: sends Register if necessary, then runs the
+/// real request. Returns the daemon's response to the real request.
+pub fn rpc_authed(client_name: &str, req: &Request) -> std::io::Result<Response> {
+    let token = load_or_create_token(client_name)?;
+    // Register on each call — daemon is a no-op if already approved, so
+    // this is cheap and recovers gracefully if the user revoked.
+    let _ = rpc_with_auth(&Request::Register, Some(&token), Some(client_name))?;
+    rpc_with_auth(req, Some(&token), None)
+}
+
 // =================== Control client (passwortctl) ===================
 
 pub fn run_ctl() -> std::io::Result<()> {
@@ -618,6 +819,21 @@ pub fn run_ctl() -> std::io::Result<()> {
     if cmd.is_empty() || cmd == "-h" || cmd == "--help" || cmd == "help" {
         print_usage();
         return Ok(());
+    }
+
+    // Approval-management commands operate on the local allowlist file
+    // directly (no IPC, no auth needed — the file is in the user's home).
+    match cmd {
+        "approvals" => return cmd_approvals(),
+        "approve" => {
+            let id = args.get(2).cloned().ok_or_else(|| usage_err("approve <id>"))?;
+            return cmd_approve(&id);
+        }
+        "revoke" => {
+            let id = args.get(2).cloned().ok_or_else(|| usage_err("revoke <id>"))?;
+            return cmd_revoke(&id);
+        }
+        _ => {}
     }
 
     let req = match cmd {
@@ -661,37 +877,7 @@ pub fn run_ctl() -> std::io::Result<()> {
         }
     };
 
-    let path = socket_path();
-    let stream = UnixStream::connect(&path).map_err(|e| {
-        std::io::Error::new(
-            e.kind(),
-            format!(
-                "could not connect to daemon at {} ({}). Is `passwortd` running?",
-                path.display(),
-                e
-            ),
-        )
-    })?;
-    let mut writer = stream.try_clone()?;
-    let mut reader = BufReader::new(stream);
-
-    let mut payload = serde_json::to_string(&req).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, format!("serialize: {}", e))
-    })?;
-    payload.push('\n');
-    writer.write_all(payload.as_bytes())?;
-    writer.flush()?;
-    drop(writer);
-
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    let resp: Response = serde_json::from_str(line.trim()).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("bad response: {} ({:?})", e, line),
-        )
-    })?;
-
+    let resp = rpc_authed("passwortctl", &req)?;
     match resp {
         Response::Ok => println!("ok"),
         Response::Status {
@@ -756,8 +942,58 @@ pub fn run_ctl() -> std::io::Result<()> {
             eprintln!("error [{}]: {}", code, message);
             std::process::exit(2);
         }
+        Response::PendingApproval { short_id, message } => {
+            eprintln!("pending approval (short_id={}): {}", short_id, message);
+            std::process::exit(3);
+        }
+        Response::AuthStatusResp { state } => {
+            println!("{}", state);
+        }
     }
 
+    Ok(())
+}
+
+fn cmd_approvals() -> std::io::Result<()> {
+    let list = auth::load();
+    if list.pending.is_empty() && list.approved.is_empty() {
+        println!("(no clients registered yet)");
+        return Ok(());
+    }
+    if !list.pending.is_empty() {
+        println!("PENDING (run `passwortctl approve <id>` to grant):");
+        for (id, p) in &list.pending {
+            println!("  {}  {}  ({})", id, p.label, p.requested_at);
+        }
+    }
+    if !list.approved.is_empty() {
+        println!("APPROVED (run `passwortctl revoke <id>` to remove):");
+        for (id, a) in &list.approved {
+            println!("  {}  {}  ({})", id, a.label, a.approved_at);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_approve(id: &str) -> std::io::Result<()> {
+    let mut list = auth::load();
+    if !auth::approve(&mut list, id) {
+        eprintln!("no pending client with id {}", id);
+        std::process::exit(2);
+    }
+    auth::save(&list)?;
+    println!("approved {}", id);
+    Ok(())
+}
+
+fn cmd_revoke(id: &str) -> std::io::Result<()> {
+    let mut list = auth::load();
+    if !auth::revoke(&mut list, id) {
+        eprintln!("no client with id {}", id);
+        std::process::exit(2);
+    }
+    auth::save(&list)?;
+    println!("revoked {}", id);
     Ok(())
 }
 
@@ -794,6 +1030,10 @@ fn print_usage() {
     eprintln!("    get <name>          Print '<name>\\t[<username>\\t]<password>' for the named account");
     eprintln!("    save <name> [user]  Create or update an account (prompts for password)");
     eprintln!("    delete <name>       Delete the named account");
+    eprintln!();
+    eprintln!("    approvals           List pending and approved API clients");
+    eprintln!("    approve <id>        Grant a pending client access to the vault");
+    eprintln!("    revoke <id>         Remove a client (pending or approved)");
     eprintln!();
     eprintln!("ENVIRONMENT:");
     eprintln!("    PASSWORT_IDLE_TIMEOUT_SECS  daemon auto-lock idle timeout (default 600, 0 = off)");

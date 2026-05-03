@@ -12,6 +12,8 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 
+use serde_json::Value;
+
 const MAX_MESSAGE_SIZE: u32 = 1024 * 1024; // 1 MiB; browser default is also ~1 MiB.
 
 pub fn run() -> io::Result<()> {
@@ -35,8 +37,28 @@ pub fn run() -> io::Result<()> {
         }
     };
 
+    // Load this client's token. Browser-side messages don't carry an
+    // auto-generated token — we attach the host's token before forwarding,
+    // and Register on first run so the user can approve via passwortctl.
+    let token = crate::ipc::load_or_create_token("passwort-native-host")?;
+
     let mut to_daemon = stream.try_clone()?;
     let mut from_daemon = BufReader::new(stream);
+
+    // Best-effort one-shot Register so the user can approve us before any
+    // real request comes in.
+    {
+        let reg = serde_json::json!({
+            "auth_token": &token,
+            "client_label": "Firefox extension (via native host)",
+            "op": "register",
+        });
+        let s = reg.to_string() + "\n";
+        let _ = to_daemon.write_all(s.as_bytes());
+        let _ = to_daemon.flush();
+        let mut sink = String::new();
+        let _ = from_daemon.read_line(&mut sink);
+    }
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -61,8 +83,17 @@ pub fn run() -> io::Result<()> {
         let mut body = vec![0u8; len as usize];
         input.read_exact(&mut body)?;
 
+        // Re-serialize the browser's body into an envelope that injects
+        // our auth_token. Parse → mutate → re-serialize is the cleanest
+        // way to keep the existing browser-side schema unchanged.
+        let mut json: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        if let Value::Object(map) = &mut json {
+            map.insert("auth_token".to_string(), Value::String(token.clone()));
+        }
+        let payload = json.to_string();
+
         // Forward to daemon as NDJSON.
-        to_daemon.write_all(&body)?;
+        to_daemon.write_all(payload.as_bytes())?;
         to_daemon.write_all(b"\n")?;
         to_daemon.flush()?;
 

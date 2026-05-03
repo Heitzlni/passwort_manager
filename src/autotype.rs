@@ -32,7 +32,7 @@ use global_hotkey::{
 };
 
 use crate::config::{self, HotkeyConfig};
-use crate::ipc::{rpc, EntryRef, Request, Response};
+use crate::ipc::{rpc_authed, EntryRef, Request, Response};
 
 const KEYSTROKE_DELAY_MS: u64 = 80; // small pause after focus return
 
@@ -74,6 +74,22 @@ pub fn run() -> std::io::Result<()> {
         current_save_hk.as_ref().map(|_| current_cfg.save_hotkey.human()).unwrap_or_else(|| "<unavailable>".into()),
         config::config_path().display()
     );
+
+    // Eager Register so the user can approve us once via passwortctl,
+    // instead of having to press the hotkey, see it silently fail with
+    // client_pending, then notice the new entry in `passwortctl approvals`.
+    match rpc_authed("passwort-autotype", &Request::AuthStatus) {
+        Ok(Response::AuthStatusResp { state }) => {
+            eprintln!("passwort-autotype: auth state = {}", state);
+            if state == "pending" {
+                eprintln!(
+                    "passwort-autotype: not yet approved. Run:  passwortctl approvals  →  passwortctl approve <id>"
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("passwort-autotype: initial register failed: {}", e),
+    }
 
     let receiver = GlobalHotKeyEvent::receiver();
 
@@ -277,7 +293,7 @@ fn unique_match_for_title(title: Option<&str>) -> Option<String> {
     if title.trim().is_empty() {
         return None;
     }
-    let resp = rpc(&Request::ListEntries).ok()?;
+    let resp = rpc_authed("passwort-autotype", &Request::ListEntries).ok()?;
     let entries: Vec<EntryRef> = match resp {
         Response::Entries { entries } => entries,
         _ => return None,
@@ -308,7 +324,7 @@ fn type_for_entry(name: &str, target_window_id: Option<&str>) {
             .status();
     }
     thread::sleep(Duration::from_millis(KEYSTROKE_DELAY_MS));
-    let resp = match rpc(&Request::Get {
+    let resp = match rpc_authed("passwort-autotype", &Request::Get {
         name: name.to_string(),
     }) {
         Ok(r) => r,

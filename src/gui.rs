@@ -185,7 +185,7 @@ mod quick_save {
                                 username: self.username.clone(),
                                 password: self.password.clone(),
                             };
-                            match ipc::rpc(&req) {
+                            match ipc::rpc_authed("passwort-quick-save", &req) {
                                 Ok(Response::Ok) => {
                                     self.saved = true;
                                     self.message = Some((
@@ -285,7 +285,7 @@ mod picker {
 
     impl PickerApp {
         pub fn new(target_title: Option<String>) -> Self {
-            let (entries, load_error) = match ipc::rpc(&Request::ListEntries) {
+            let (entries, load_error) = match ipc::rpc_authed("passwort-picker", &Request::ListEntries) {
                 Ok(Response::Entries { mut entries }) => {
                     // Sort: entries whose name appears in the target window
                     // title come first; everything else stays in original order.
