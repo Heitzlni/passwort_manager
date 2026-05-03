@@ -316,10 +316,16 @@ fn type_credential(username: &str, password: &str) {
         if !xdotool_type(username) {
             return;
         }
+        // Some apps (notably game launchers like Steam) need a real
+        // moment after the username is typed before Tab actually moves
+        // focus. With less than ~120 ms here we'd send the Tab and then
+        // start typing the password before the field switch took
+        // effect, dumping the password back into the username box.
+        thread::sleep(Duration::from_millis(120));
         let _ = Command::new("xdotool")
-            .args(["key", "--delay", "20", "Tab"])
+            .args(["key", "--clearmodifiers", "--delay", "30", "Tab"])
             .status();
-        thread::sleep(Duration::from_millis(30));
+        thread::sleep(Duration::from_millis(180));
     }
     xdotool_type(password);
     // Don't auto-press Enter — risky if focus is wrong, and many apps
