@@ -99,3 +99,35 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     }
     diff == 0
 }
+
+/// Generate the current 6-digit TOTP code (RFC 6238) for a Base32 secret.
+/// Returns `(code, seconds_remaining_in_window)` so callers can show a
+/// countdown. Returns `None` if the secret can't be parsed.
+///
+/// We bypass `TOTP::new`'s 128-bit minimum-length validation because some
+/// short test/demo secrets that real users paste in are still useful;
+/// browsers / authenticator apps don't enforce it either.
+pub fn totp_code(b32_secret: &str) -> Option<(String, u64)> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let cleaned: String = b32_secret
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    let raw = totp_rs::Secret::Encoded(cleaned).to_bytes().ok()?;
+    let totp = totp_rs::TOTP {
+        algorithm: totp_rs::Algorithm::SHA1,
+        digits: 6,
+        skew: 1,
+        step: 30,
+        secret: raw,
+        issuer: None,
+        account_name: String::new(),
+    };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let code = totp.generate(now);
+    let remaining = 30 - (now % 30);
+    Some((code, remaining))
+}

@@ -530,9 +530,9 @@ fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
                     };
 
                     let result = if let Some(idx) = exact.or(fallback) {
-                        sess.edit_account(idx, None, None, Some(password))
+                        sess.edit_account(idx, None, None, Some(password), None)
                     } else {
-                        sess.add_account(name, username, password)
+                        sess.add_account(name, username, password, String::new())
                     };
                     match result {
                         Ok(_) => {

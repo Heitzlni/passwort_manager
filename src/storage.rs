@@ -19,6 +19,10 @@ pub struct Account {
     #[serde(default)]
     pub username: String,
     pub password: String,
+    /// Optional Base32-encoded TOTP secret (RFC 6238). Empty = no 2FA.
+    /// Codes are derived on the fly via `crypto::totp_code`.
+    #[serde(default)]
+    pub totp_secret: String,
 }
 
 #[derive(Serialize, Deserialize)]

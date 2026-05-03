@@ -571,6 +571,7 @@ enum Modal {
         name: String,
         username: String,
         password: String,
+        totp_secret: String,
         show_password: bool,
     },
     Edit {
@@ -578,6 +579,7 @@ enum Modal {
         name: String,
         username: String,
         password: String,
+        totp_secret: String,
         show_password: bool,
         original_name: String,
     },
@@ -606,22 +608,26 @@ impl Drop for Modal {
                 name,
                 username,
                 password,
+                totp_secret,
                 ..
             } => {
                 name.zeroize();
                 username.zeroize();
                 password.zeroize();
+                totp_secret.zeroize();
             }
             Modal::Edit {
                 name,
                 username,
                 password,
+                totp_secret,
                 original_name,
                 ..
             } => {
                 name.zeroize();
                 username.zeroize();
                 password.zeroize();
+                totp_secret.zeroize();
                 original_name.zeroize();
             }
             Modal::DeleteConfirm { name, .. } => {
@@ -995,6 +1001,7 @@ impl App {
 
         let mut next: Option<Screen> = None;
         let mut copy_request: Option<usize> = None;
+        let mut totp_copy_request: Option<String> = None;
         let mut lock_request = false;
 
         // Top bar
@@ -1056,6 +1063,7 @@ impl App {
                         name: String::new(),
                         username: String::new(),
                         password: String::new(),
+                        totp_secret: String::new(),
                         show_password: false,
                     });
                 }
@@ -1204,6 +1212,45 @@ impl App {
                             }
                         });
 
+                        // TOTP code with countdown, refreshed every second.
+                        if !account.totp_secret.is_empty() {
+                            ui.add_space(20.0);
+                            ui.colored_label(COLOR_MUTED, "TWO-FACTOR CODE");
+                            ui.add_space(4.0);
+                            match crate::crypto::totp_code(&account.totp_secret) {
+                                Some((code, remaining)) => {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(&code)
+                                                .monospace()
+                                                .size(22.0),
+                                        );
+                                        ui.colored_label(
+                                            COLOR_MUTED,
+                                            format!("expires in {}s", remaining),
+                                        );
+                                        if ui
+                                            .add_sized(
+                                                egui::vec2(80.0, 24.0),
+                                                egui::Button::new("Copy"),
+                                            )
+                                            .clicked()
+                                        {
+                                            totp_copy_request = Some(code.clone());
+                                        }
+                                    });
+                                    // Repaint when the countdown ticks so it stays current
+                                    ctx.request_repaint_after(std::time::Duration::from_secs(1));
+                                }
+                                None => {
+                                    ui.colored_label(
+                                        COLOR_ERROR,
+                                        "Invalid TOTP secret (must be Base32).",
+                                    );
+                                }
+                            }
+                        }
+
                         ui.add_space(28.0);
                         ui.separator();
                         ui.add_space(14.0);
@@ -1217,6 +1264,7 @@ impl App {
                                     name: account.name.clone(),
                                     username: account.username.clone(),
                                     password: account.password.clone(),
+                                    totp_secret: account.totp_secret.clone(),
                                     show_password: false,
                                     original_name: account.name.clone(),
                                 });
@@ -1278,6 +1326,20 @@ impl App {
             }
         }
 
+        if let Some(code) = totp_copy_request {
+            match copy_to_clipboard(&code) {
+                Ok(_) => {
+                    *clipboard_clear_at = Some(Instant::now() + CLIPBOARD_CLEAR);
+                    *info = format!(
+                        "TOTP code copied. Clears in {}s.",
+                        CLIPBOARD_CLEAR.as_secs()
+                    );
+                    error.clear();
+                }
+                Err(e) => *error = format!("Clipboard error: {}", e),
+            }
+        }
+
         if lock_request {
             if let InitialState::NeedsLogin(vault) = session::initial_state() {
                 next = Some(Screen::Login {
@@ -1323,6 +1385,7 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                 name,
                 username,
                 password,
+                totp_secret,
                 show_password,
             } => {
                 ui.colored_label(COLOR_MUTED, "Name (e.g. site / app)");
@@ -1348,6 +1411,14 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                 );
                 ui.add_space(4.0);
                 ui.checkbox(show_password, "Show password");
+                ui.add_space(8.0);
+                ui.colored_label(COLOR_MUTED, "TOTP secret (optional, Base32)");
+                ui.add(
+                    egui::TextEdit::singleline(totp_secret)
+                        .hint_text("e.g. JBSWY3DPEHPK3PXP")
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::vec2(8.0, 6.0)),
+                );
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     let create = egui::Button::new(
@@ -1365,7 +1436,8 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                         let n = std::mem::take(name);
                         let u = std::mem::take(username);
                         let p = std::mem::take(password);
-                        match session.add_account(n, u, p) {
+                        let t = std::mem::take(totp_secret);
+                        match session.add_account(n, u, p, t) {
                             Ok(_) => {
                                 result =
                                     ModalResult::CloseWithInfo("Account added.".to_string())
@@ -1392,6 +1464,7 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                 name,
                 username,
                 password,
+                totp_secret,
                 show_password,
                 original_name,
             } => {
@@ -1423,6 +1496,14 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                 );
                 ui.add_space(4.0);
                 ui.checkbox(show_password, "Show password");
+                ui.add_space(8.0);
+                ui.colored_label(COLOR_MUTED, "TOTP secret (Base32)");
+                ui.add(
+                    egui::TextEdit::singleline(totp_secret)
+                        .hint_text("e.g. JBSWY3DPEHPK3PXP")
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::vec2(8.0, 6.0)),
+                );
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     let save = egui::Button::new(
@@ -1440,7 +1521,14 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                         let n = std::mem::take(name);
                         let u = std::mem::take(username);
                         let p = std::mem::take(password);
-                        match session.edit_account(*idx, Some(n), Some(u), Some(p)) {
+                        let t = std::mem::take(totp_secret);
+                        match session.edit_account(
+                            *idx,
+                            Some(n),
+                            Some(u),
+                            Some(p),
+                            Some(t),
+                        ) {
                             Ok(_) => {
                                 result =
                                     ModalResult::CloseWithInfo("Account updated.".to_string())
