@@ -37,12 +37,18 @@ pub fn run() -> Result<(), eframe::Error> {
 /// type to filter / arrow keys to move / Enter to pick / Esc to cancel.
 /// Prints the chosen entry name to stdout and exits.
 pub fn run_picker(target_title: Option<String>) -> Result<(), eframe::Error> {
+    // Decorations stay ON so the user can find / move the window — under
+    // GNOME (Mutter) borderless + always-on-top isn't reliably enforced
+    // and the window can land somewhere invisible. With a title bar it's
+    // unmistakable. Always-on-top is still requested as best-effort.
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 320.0])
+            .with_inner_size([460.0, 360.0])
             .with_resizable(false)
-            .with_decorations(false)
-            .with_always_on_top(),
+            .with_decorations(true)
+            .with_always_on_top()
+            .with_title("Password Manager — Pick"),
+        centered: true,
         ..Default::default()
     };
     eframe::run_native(
