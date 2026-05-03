@@ -241,11 +241,69 @@ fn auto_lock_loop(state: SharedState, timeout: Duration) {
     loop {
         thread::sleep(interval);
         let mut s = state.lock().unwrap();
-        if s.session.is_some() && s.last_activity.elapsed() >= timeout {
+        if s.session.is_none() {
+            continue;
+        }
+        if s.last_activity.elapsed() >= timeout {
             s.session = None;
             eprintln!("auto-locked after {}s idle", timeout.as_secs());
+        } else if is_session_locked() {
+            s.session = None;
+            eprintln!("auto-locked: desktop session is locked");
         }
     }
+}
+
+/// Returns true if any of the current user's logind sessions reports
+/// `LockedHint=yes` (screen locker engaged). systemd user services don't
+/// always inherit `XDG_SESSION_ID`, so we list the user's sessions and
+/// check each.
+fn is_session_locked() -> bool {
+    let user = match std::env::var("USER") {
+        Ok(u) if !u.is_empty() => u,
+        _ => return false,
+    };
+    let list = std::process::Command::new("loginctl")
+        .args(["list-sessions", "--no-legend", "--no-pager"])
+        .output();
+    let stdout = match list {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return false,
+    };
+    let text = String::from_utf8_lossy(&stdout);
+    for line in text.lines() {
+        // Format: SESSION_ID UID USER SEAT TTY ...
+        let mut parts = line.split_whitespace();
+        let session_id = match parts.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        let _uid = parts.next();
+        let user_field = match parts.next() {
+            Some(u) => u,
+            None => continue,
+        };
+        if user_field != user {
+            continue;
+        }
+        let out = std::process::Command::new("loginctl")
+            .args([
+                "show-session",
+                session_id,
+                "-p",
+                "LockedHint",
+                "--value",
+            ])
+            .output();
+        if let Ok(o) = out {
+            if o.status.success()
+                && String::from_utf8_lossy(&o.stdout).trim() == "yes"
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(target_os = "linux")]
