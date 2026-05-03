@@ -66,6 +66,209 @@ pub fn run_picker(target_title: Option<String>) -> Result<(), eframe::Error> {
     result
 }
 
+/// Quick-save mode: shown by `passwort-manager --quick-save` when the
+/// auto-type daemon's save hotkey fires. Small dialog with name (pre-filled
+/// from the active window's title), username, and password fields.
+/// Calls the daemon's Save RPC and exits.
+pub fn run_quick_save(target_title: Option<String>) -> Result<(), eframe::Error> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([420.0, 260.0])
+            .with_resizable(false)
+            .with_decorations(true)
+            .with_always_on_top()
+            .with_title("Save credential"),
+        centered: true,
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Save credential",
+        options,
+        Box::new(|cc| {
+            setup_style(&cc.egui_ctx);
+            Box::new(quick_save::QuickSaveApp::new(target_title))
+        }),
+    )
+}
+
+mod quick_save {
+    use super::{COLOR_ACCENT, COLOR_ERROR, COLOR_MUTED, COLOR_OK};
+    use crate::ipc::{self, Request, Response};
+    use eframe::egui;
+    use zeroize::Zeroize;
+
+    pub struct QuickSaveApp {
+        name: String,
+        username: String,
+        password: String,
+        show_password: bool,
+        message: Option<(String, bool)>, // (text, is_error)
+        saved: bool,
+    }
+
+    impl QuickSaveApp {
+        pub fn new(target_title: Option<String>) -> Self {
+            Self {
+                name: target_title
+                    .map(|t| sanitize_title(&t))
+                    .unwrap_or_default(),
+                username: String::new(),
+                password: String::new(),
+                show_password: false,
+                message: None,
+                saved: false,
+            }
+        }
+    }
+
+    impl Drop for QuickSaveApp {
+        fn drop(&mut self) {
+            self.username.zeroize();
+            self.password.zeroize();
+        }
+    }
+
+    impl eframe::App for QuickSaveApp {
+        fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                std::process::exit(if self.saved { 0 } else { 1 });
+            }
+
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.colored_label(COLOR_MUTED, "Save credential for the active app");
+                ui.add_space(8.0);
+
+                ui.label("Name");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.name)
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::vec2(8.0, 6.0)),
+                );
+                ui.add_space(6.0);
+
+                ui.label("Username");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.username)
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::vec2(8.0, 6.0)),
+                );
+                ui.add_space(6.0);
+
+                ui.label("Password");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.password)
+                            .password(!self.show_password)
+                            .desired_width(ui.available_width() - 70.0)
+                            .margin(egui::vec2(8.0, 6.0)),
+                    );
+                    ui.checkbox(&mut self.show_password, "show");
+                });
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    let save_btn = egui::Button::new(
+                        egui::RichText::new("Save").strong(),
+                    )
+                    .fill(COLOR_ACCENT)
+                    .min_size(egui::vec2(100.0, 28.0));
+                    let save_clicked = ui.add(save_btn).clicked()
+                        || ctx.input(|i| i.key_pressed(egui::Key::Enter));
+                    if save_clicked {
+                        if self.name.trim().is_empty() {
+                            self.message = Some(("Name is required.".into(), true));
+                        } else if self.password.is_empty() {
+                            self.message = Some(("Password is required.".into(), true));
+                        } else {
+                            let req = Request::Save {
+                                name: self.name.clone(),
+                                username: self.username.clone(),
+                                password: self.password.clone(),
+                            };
+                            match ipc::rpc(&req) {
+                                Ok(Response::Ok) => {
+                                    self.saved = true;
+                                    self.message = Some((
+                                        format!("Saved \u{201c}{}\u{201d}.", self.name),
+                                        false,
+                                    ));
+                                    self.password.zeroize();
+                                    self.username.zeroize();
+                                }
+                                Ok(Response::Error { code, message }) => {
+                                    let msg = if code == "locked" {
+                                        "Vault is locked. Open the toolbar or GUI to unlock, then try again.".into()
+                                    } else {
+                                        message
+                                    };
+                                    self.message = Some((msg, true));
+                                }
+                                Ok(_) => {
+                                    self.message =
+                                        Some(("Unexpected response from daemon.".into(), true))
+                                }
+                                Err(e) => self.message = Some((e.to_string(), true)),
+                            }
+                        }
+                    }
+                    if ui
+                        .add_sized(egui::vec2(80.0, 28.0), egui::Button::new("Cancel"))
+                        .clicked()
+                    {
+                        std::process::exit(if self.saved { 0 } else { 1 });
+                    }
+                });
+
+                if let Some((msg, is_err)) = &self.message {
+                    ui.add_space(8.0);
+                    let color = if *is_err { COLOR_ERROR } else { COLOR_OK };
+                    ui.colored_label(color, msg.as_str());
+                }
+            });
+        }
+    }
+
+    /// Trim common window-title noise: " — Mozilla Firefox", " - Chromium",
+    /// " — Login", trailing parens, and so on. Keeps the meaningful name
+    /// the user is most likely to want for the entry.
+    fn sanitize_title(t: &str) -> String {
+        let lower_strip = [
+            " - mozilla firefox",
+            " — mozilla firefox",
+            " - google chrome",
+            " — google chrome",
+            " - chromium",
+            " — chromium",
+            " - brave",
+            " — brave",
+            " - microsoft edge",
+            " — microsoft edge",
+            " - sign in",
+            " — sign in",
+            " - login",
+            " — login",
+            " - log in",
+            " — log in",
+        ];
+        let mut s = t.trim().to_string();
+        loop {
+            let lower = s.to_lowercase();
+            let mut shortened = false;
+            for suffix in &lower_strip {
+                if lower.ends_with(suffix) {
+                    s.truncate(s.len() - suffix.len());
+                    shortened = true;
+                    break;
+                }
+            }
+            if !shortened {
+                break;
+            }
+        }
+        s.trim().to_string()
+    }
+}
+
 mod picker {
     use super::{COLOR_ACCENT, COLOR_ERROR, COLOR_MUTED};
     use crate::ipc::{self, EntryRef, Request, Response};
@@ -357,6 +560,12 @@ enum Screen {
     Fatal(String),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HotkeySlot {
+    Fill,
+    Save,
+}
+
 enum Modal {
     Add {
         name: String,
@@ -382,8 +591,10 @@ enum Modal {
         confirm: String,
     },
     HotkeySettings {
-        current: HotkeyConfig,
-        capturing: bool,
+        fill: HotkeyConfig,
+        save: HotkeyConfig,
+        /// None = not capturing; Some(HotkeySlot) = capturing for that slot.
+        capturing: Option<HotkeySlot>,
         message: Option<(String, bool)>, // (text, is_error)
     },
 }
@@ -812,9 +1023,11 @@ impl App {
                                 });
                             }
                             if ui.button("Settings").clicked() {
+                                let cfg = app_config::load();
                                 *modal = Some(Modal::HotkeySettings {
-                                    current: app_config::load().hotkey,
-                                    capturing: false,
+                                    fill: cfg.hotkey,
+                                    save: cfg.save_hotkey,
+                                    capturing: None,
                                     message: None,
                                 });
                             }
@@ -1361,18 +1574,23 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
             }
 
             Modal::HotkeySettings {
-                current,
+                fill,
+                save,
                 capturing,
                 message,
             } => {
                 ui.colored_label(
                     COLOR_MUTED,
-                    "Auto-type hotkey for native apps (e.g. Steam, Discord).",
+                    "Hotkeys for native-app auto-type (e.g. Steam, Discord).",
                 );
                 ui.add_space(8.0);
 
-                if *capturing {
-                    ui.heading("Press your hotkey…");
+                if let Some(slot) = capturing {
+                    let what = match slot {
+                        HotkeySlot::Fill => "FILL hotkey",
+                        HotkeySlot::Save => "SAVE hotkey",
+                    };
+                    ui.heading(format!("Press your {}…", what));
                     ui.add_space(4.0);
                     ui.colored_label(
                         COLOR_MUTED,
@@ -1383,14 +1601,9 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                     ui.add_space(8.0);
 
                     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        *capturing = false;
+                        *capturing = None;
                     } else {
                         let captured = ctx.input(|i| {
-                            // Use the modifier state attached to the *event*,
-                            // not the frame-wide `i.modifiers`. The frame
-                            // value can include modifiers that were merely
-                            // held earlier; the event-level value is the
-                            // exact state at the moment of the keypress.
                             for event in &i.events {
                                 if let egui::Event::Key {
                                     key,
@@ -1408,43 +1621,31 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                         });
                         if let Some((mods, key_name)) = captured {
                             let mut modifiers: Vec<String> = Vec::new();
-                            if mods.ctrl {
-                                modifiers.push("ctrl".into());
-                            }
-                            if mods.alt {
-                                modifiers.push("alt".into());
-                            }
-                            if mods.shift {
-                                modifiers.push("shift".into());
-                            }
-                            if mods.command {
-                                modifiers.push("super".into());
-                            }
-                            // Reject Shift-only and no-modifier hotkeys: they
-                            // collide with normal text input (capital letters,
-                            // shifted symbols), and X11 typically refuses to
-                            // grab Shift+letter anyway. Require at least one
-                            // of Ctrl / Alt / Super.
-                            let has_strong_modifier =
-                                mods.ctrl || mods.alt || mods.command;
-                            if !has_strong_modifier {
+                            if mods.ctrl { modifiers.push("ctrl".into()); }
+                            if mods.alt { modifiers.push("alt".into()); }
+                            if mods.shift { modifiers.push("shift".into()); }
+                            if mods.command { modifiers.push("super".into()); }
+                            let has_strong = mods.ctrl || mods.alt || mods.command;
+                            if !has_strong {
                                 *message = Some((
-                                    "Hotkey must include Ctrl, Alt, or Super. Shift alone collides with capital-letter typing and X11 won't grab it.".to_string(),
+                                    "Hotkey must include Ctrl, Alt, or Super.".to_string(),
                                     true,
                                 ));
-                                *capturing = false;
+                                *capturing = None;
                             } else {
-                                *current = HotkeyConfig {
-                                    modifiers,
-                                    key: key_name,
-                                };
+                                let new_hk = HotkeyConfig { modifiers, key: key_name };
+                                match slot {
+                                    HotkeySlot::Fill => *fill = new_hk.clone(),
+                                    HotkeySlot::Save => *save = new_hk.clone(),
+                                }
                                 let cfg = app_config::Config {
-                                    hotkey: current.clone(),
+                                    hotkey: fill.clone(),
+                                    save_hotkey: save.clone(),
                                 };
                                 match app_config::save(&cfg) {
                                     Ok(_) => {
                                         *message = Some((
-                                            format!("Saved: {}", current.human()),
+                                            format!("Saved {}: {}", what, new_hk.human()),
                                             false,
                                         ));
                                     }
@@ -1453,59 +1654,86 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                                             Some((format!("Save failed: {}", e), true));
                                     }
                                 }
-                                *capturing = false;
+                                *capturing = None;
                             }
                         }
                     }
                 } else {
-                    ui.label(format!("Current hotkey: {}", current.human()));
-                    ui.add_space(12.0);
+                    // Fill hotkey row
                     ui.horizontal(|ui| {
-                        let change = egui::Button::new(
-                            egui::RichText::new("Change…").strong(),
-                        )
-                        .fill(COLOR_ACCENT)
-                        .min_size(egui::vec2(110.0, 28.0));
-                        if ui.add(change).clicked() {
-                            *capturing = true;
-                            *message = None;
-                        }
+                        ui.label(egui::RichText::new("Fill:").strong());
+                        ui.label(fill.human());
+                    });
+                    ui.colored_label(
+                        COLOR_MUTED,
+                        "Pressed on a focused login field — types your saved username + password.",
+                    );
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
                         if ui
-                            .add_sized(
-                                egui::vec2(110.0, 28.0),
-                                egui::Button::new("Reset to default"),
-                            )
+                            .add_sized(egui::vec2(110.0, 26.0), egui::Button::new("Change…"))
                             .clicked()
                         {
-                            *current = HotkeyConfig {
-                                modifiers: vec!["ctrl".into(), "alt".into()],
-                                key: "p".into(),
-                            };
-                            let cfg = app_config::Config {
-                                hotkey: current.clone(),
-                            };
-                            match app_config::save(&cfg) {
-                                Ok(_) => {
-                                    *message = Some((
-                                        format!("Reset to {}", current.human()),
-                                        false,
-                                    ))
-                                }
-                                Err(e) => {
-                                    *message = Some((format!("Save failed: {}", e), true))
-                                }
-                            }
+                            *capturing = Some(HotkeySlot::Fill);
+                            *message = None;
                         }
                     });
-                    ui.add_space(10.0);
+                    ui.add_space(12.0);
+
+                    // Save hotkey row
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Save:").strong());
+                        ui.label(save.human());
+                    });
                     ui.colored_label(
                         COLOR_MUTED,
-                        "Auto-type changes apply within ~2 seconds (the helper polls the config file).",
+                        "Pressed on a native-app login window — opens a small dialog to save the credential.",
                     );
-                    ui.add_space(2.0);
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_sized(egui::vec2(110.0, 26.0), egui::Button::new("Change…"))
+                            .clicked()
+                        {
+                            *capturing = Some(HotkeySlot::Save);
+                            *message = None;
+                        }
+                    });
+
+                    ui.add_space(12.0);
+                    if ui
+                        .add_sized(egui::vec2(160.0, 26.0), egui::Button::new("Reset both to default"))
+                        .clicked()
+                    {
+                        *fill = HotkeyConfig {
+                            modifiers: vec!["ctrl".into(), "alt".into()],
+                            key: "p".into(),
+                        };
+                        *save = HotkeyConfig {
+                            modifiers: vec!["ctrl".into(), "alt".into()],
+                            key: "s".into(),
+                        };
+                        let cfg = app_config::Config {
+                            hotkey: fill.clone(),
+                            save_hotkey: save.clone(),
+                        };
+                        match app_config::save(&cfg) {
+                            Ok(_) => {
+                                *message = Some((
+                                    format!("Reset: fill={} save={}", fill.human(), save.human()),
+                                    false,
+                                ));
+                            }
+                            Err(e) => {
+                                *message = Some((format!("Save failed: {}", e), true));
+                            }
+                        }
+                    }
+
+                    ui.add_space(8.0);
                     ui.colored_label(
                         COLOR_MUTED,
-                        "Requires `xdotool` installed and `passwort-autotype` running.",
+                        "Changes apply within ~2 seconds. Requires `xdotool` and `passwort-autotype` running.",
                     );
                 }
 

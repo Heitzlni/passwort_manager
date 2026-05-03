@@ -41,38 +41,52 @@ pub fn run() -> std::io::Result<()> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
     let mut current_cfg = config::load();
-    let mut current_hk = match register_hotkey(&manager, &current_cfg.hotkey) {
+    let mut current_fill_hk = match register_hotkey(&manager, &current_cfg.hotkey) {
         Ok(hk) => hk,
         Err(e) => {
             eprintln!(
-                "passwort-autotype: failed to register hotkey {}: {}",
+                "passwort-autotype: failed to register fill hotkey {}: {}",
                 current_cfg.hotkey.human(),
                 e
             );
             return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
         }
     };
+    // Save hotkey is best-effort: if it conflicts we still want to run
+    // for fill, so we just log and continue.
+    let mut current_save_hk: Option<HotKey> = match register_hotkey(&manager, &current_cfg.save_hotkey)
+    {
+        Ok(hk) => Some(hk),
+        Err(e) => {
+            eprintln!(
+                "passwort-autotype: failed to register save hotkey {}: {} (skipping)",
+                current_cfg.save_hotkey.human(),
+                e
+            );
+            None
+        }
+    };
     let mut current_mtime = config::mtime();
 
     eprintln!(
-        "passwort-autotype listening for {} (config: {})",
+        "passwort-autotype listening: fill={}  save={} (config: {})",
         current_cfg.hotkey.human(),
+        current_save_hk.as_ref().map(|_| current_cfg.save_hotkey.human()).unwrap_or_else(|| "<unavailable>".into()),
         config::config_path().display()
     );
 
     let receiver = GlobalHotKeyEvent::receiver();
 
     loop {
-        // Block on hotkey events, but wake up periodically to check for
-        // config-file changes (e.g. user changed the hotkey via the GUI).
-        // The receiver's error type is crossbeam_channel's, not std mpsc's,
-        // and we don't want to add crossbeam as a direct dep just to name
-        // it — so collapse Timeout / Disconnected into the same "wake up
-        // and check config" branch.
         match receiver.recv_timeout(Duration::from_secs(2)) {
             Ok(event) => {
-                if event.id == current_hk.id() && event.state == HotKeyState::Pressed {
-                    handle_hotkey_press();
+                if event.state != HotKeyState::Pressed {
+                    continue;
+                }
+                if event.id == current_fill_hk.id() {
+                    handle_fill_hotkey();
+                } else if Some(event.id) == current_save_hk.as_ref().map(|h| h.id()) {
+                    handle_save_hotkey();
                 }
             }
             Err(_) => {
@@ -82,26 +96,49 @@ pub fn run() -> std::io::Result<()> {
                     let new_cfg = config::load();
                     if new_cfg != current_cfg {
                         eprintln!(
-                            "passwort-autotype: hotkey changed → {}",
-                            new_cfg.hotkey.human()
+                            "passwort-autotype: config changed → fill={} save={}",
+                            new_cfg.hotkey.human(),
+                            new_cfg.save_hotkey.human()
                         );
-                        let _ = manager.unregister(current_hk);
-                        match register_hotkey(&manager, &new_cfg.hotkey) {
-                            Ok(hk) => {
-                                current_hk = hk;
-                                current_cfg = new_cfg;
-                            }
+                        let _ = manager.unregister(current_fill_hk);
+                        if let Some(h) = current_save_hk.take() {
+                            let _ = manager.unregister(h);
+                        }
+                        current_fill_hk = match register_hotkey(&manager, &new_cfg.hotkey) {
+                            Ok(hk) => hk,
                             Err(e) => {
                                 eprintln!(
-                                    "passwort-autotype: failed to reload hotkey: {}",
+                                    "passwort-autotype: failed to reload fill hotkey: {}",
                                     e
                                 );
-                                // Try to reinstall the previous one
-                                if let Ok(hk) = register_hotkey(&manager, &current_cfg.hotkey) {
-                                    current_hk = hk;
+                                // Try to reinstall the previous one so we
+                                // don't completely lose the listener
+                                match register_hotkey(&manager, &current_cfg.hotkey) {
+                                    Ok(hk) => hk,
+                                    Err(e2) => {
+                                        eprintln!(
+                                            "passwort-autotype: also failed to reinstall previous: {} — exiting",
+                                            e2
+                                        );
+                                        return Err(std::io::Error::new(
+                                            std::io::ErrorKind::Other,
+                                            e2,
+                                        ));
+                                    }
                                 }
                             }
-                        }
+                        };
+                        current_save_hk = match register_hotkey(&manager, &new_cfg.save_hotkey) {
+                            Ok(hk) => Some(hk),
+                            Err(e) => {
+                                eprintln!(
+                                    "passwort-autotype: failed to reload save hotkey: {} (skipping)",
+                                    e
+                                );
+                                None
+                            }
+                        };
+                        current_cfg = new_cfg;
                     }
                 }
             }
@@ -163,12 +200,30 @@ fn parse_key_code(key: &str) -> Result<Code, String> {
 
 // =================== hotkey handler ===================
 
-fn handle_hotkey_press() {
-    eprintln!("[hotkey] pressed");
+fn handle_save_hotkey() {
+    eprintln!("[save-hotkey] pressed");
+    let target_window_title = active_window_title();
+    eprintln!("[save-hotkey] target window title: {:?}", target_window_title);
+
+    let bin = picker_binary_path();
+    let mut cmd = Command::new(&bin);
+    cmd.arg("--quick-save");
+    if let Some(t) = &target_window_title {
+        cmd.arg("--target-title").arg(t);
+    }
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::inherit());
+    if let Err(e) = cmd.spawn() {
+        eprintln!("passwort-autotype: failed to launch quick-save dialog: {}", e);
+    }
+}
+
+fn handle_fill_hotkey() {
+    eprintln!("[fill-hotkey] pressed");
     let target_window_id = active_window_id();
     let target_window_title = active_window_title();
     eprintln!(
-        "[hotkey] target window: id={:?} title={:?}",
+        "[fill-hotkey] target window: id={:?} title={:?}",
         target_window_id, target_window_title
     );
 

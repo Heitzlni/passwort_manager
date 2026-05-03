@@ -13,6 +13,17 @@ const APP_DIR_NAME: &str = "passwort-manager";
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Config {
     pub hotkey: HotkeyConfig,
+    /// Hotkey for "save credential for the active native app". Optional —
+    /// older configs without this field default to Ctrl+Alt+S.
+    #[serde(default = "default_save_hotkey")]
+    pub save_hotkey: HotkeyConfig,
+}
+
+fn default_save_hotkey() -> HotkeyConfig {
+    HotkeyConfig {
+        modifiers: vec!["ctrl".into(), "alt".into()],
+        key: "s".into(),
+    }
 }
 
 /// e.g. modifiers=["ctrl","alt"], key="p" → Ctrl+Alt+P
@@ -29,6 +40,7 @@ impl Default for Config {
                 modifiers: vec!["ctrl".into(), "alt".into()],
                 key: "p".into(),
             },
+            save_hotkey: default_save_hotkey(),
         }
     }
 }
