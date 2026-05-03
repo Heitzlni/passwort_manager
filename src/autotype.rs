@@ -32,7 +32,7 @@ use global_hotkey::{
 };
 
 use crate::config::{self, HotkeyConfig};
-use crate::ipc::{rpc, Request, Response};
+use crate::ipc::{rpc, EntryRef, Request, Response};
 
 const KEYSTROKE_DELAY_MS: u64 = 80; // small pause after focus return
 
@@ -164,7 +164,7 @@ fn parse_key_code(key: &str) -> Result<Code, String> {
 // =================== hotkey handler ===================
 
 fn handle_hotkey_press() {
-    eprintln!("[hotkey] pressed → opening picker");
+    eprintln!("[hotkey] pressed");
     let target_window_id = active_window_id();
     let target_window_title = active_window_title();
     eprintln!(
@@ -172,8 +172,17 @@ fn handle_hotkey_press() {
         target_window_id, target_window_title
     );
 
-    let picker_bin = picker_binary_path();
+    // Fast path: if exactly one saved entry matches the active window's
+    // title, skip the picker entirely and type immediately. KeePassXC does
+    // the same — it only shows the chooser when the title is ambiguous.
+    if let Some(name) = unique_match_for_title(target_window_title.as_deref()) {
+        eprintln!("[hotkey] auto-pick → '{}' (unique match for title)", name);
+        type_for_entry(&name, target_window_id.as_deref());
+        return;
+    }
 
+    eprintln!("[hotkey] no unique match → opening picker");
+    let picker_bin = picker_binary_path();
     let mut cmd = Command::new(&picker_bin);
     cmd.arg("--picker");
     if let Some(t) = &target_window_title {
@@ -201,23 +210,62 @@ fn handle_hotkey_press() {
         return; // cancelled or no selection
     }
 
-    // Re-focus the original window so our keystrokes land in the right place.
-    if let Some(id) = &target_window_id {
+    type_for_entry(&chosen, target_window_id.as_deref());
+}
+
+/// Case-insensitive substring match: an entry's name must appear in the
+/// active window title (or vice-versa). Returns Some(name) only when
+/// EXACTLY one entry matches — picker is shown otherwise so the user
+/// disambiguates.
+fn unique_match_for_title(title: Option<&str>) -> Option<String> {
+    let title = title?.to_lowercase();
+    if title.trim().is_empty() {
+        return None;
+    }
+    let resp = rpc(&Request::ListEntries).ok()?;
+    let entries: Vec<EntryRef> = match resp {
+        Response::Entries { entries } => entries,
+        _ => return None,
+    };
+    let matches: Vec<&EntryRef> = entries
+        .iter()
+        .filter(|e| {
+            let n = e.name.to_lowercase();
+            // Either name appears in the window title (e.g. "Steam" in
+            // "Steam Sign In"), or, for short titles, the title appears
+            // in the name (e.g. window "Discord" matches saved
+            // "discord.com").
+            (!n.is_empty() && title.contains(&n))
+                || (title.len() >= 3 && n.contains(&title))
+        })
+        .collect();
+    if matches.len() == 1 {
+        Some(matches[0].name.clone())
+    } else {
+        None
+    }
+}
+
+fn type_for_entry(name: &str, target_window_id: Option<&str>) {
+    if let Some(id) = target_window_id {
         let _ = Command::new("xdotool")
             .args(["windowactivate", "--sync", id])
             .status();
     }
     thread::sleep(Duration::from_millis(KEYSTROKE_DELAY_MS));
-
-    // Fetch credential and type it.
-    let resp = match rpc(&Request::Get { name: chosen }) {
+    let resp = match rpc(&Request::Get {
+        name: name.to_string(),
+    }) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("passwort-autotype: rpc(get) failed: {}", e);
             return;
         }
     };
-    if let Response::Credential { username, password, .. } = resp {
+    if let Response::Credential {
+        username, password, ..
+    } = resp
+    {
         type_credential(&username, &password);
     }
 }
