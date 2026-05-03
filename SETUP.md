@@ -57,6 +57,18 @@ Open the **Password Manager** entry in your application launcher (or run `passwo
 
 The icon should appear in your toolbar.
 
+> **Snap-Firefox gotcha (Ubuntu 22.04+):** if Firefox says "the addon is
+> damaged and can't be opened", it's because **snap Firefox can't read files
+> outside its sandbox** — and `~/code/...` is outside. Copy the extension
+> folder to `~/Downloads/` first:
+> ```sh
+> cp -r extension ~/Downloads/passwort-manager-extension
+> ```
+> then load `~/Downloads/passwort-manager-extension/manifest.json` in
+> about:debugging. `install-native-host.sh` already detects snap Firefox and
+> writes the native messaging manifest to *both* `~/.mozilla/...` and
+> `~/snap/firefox/common/.mozilla/...` so the daemon side works either way.
+
 ### Permanent extension install (avoid the per-restart reload)
 
 Stable Firefox unloads unsigned extensions on restart. Two real options:

@@ -64,14 +64,23 @@ sed "s|BINARY_PATH|$BIN_DIR/passwort-autotype|g" \
 chmod 644 "$AUTOSTART_DIR/passwort-autotype.desktop"
 echo "Auto-type autostart entry: $AUTOSTART_DIR/passwort-autotype.desktop"
 
-# Firefox manifest
-FX_DIR="$HOME/.mozilla/native-messaging-hosts"
-mkdir -p "$FX_DIR"
-sed "s|BINARY_PATH|$BIN_DIR/passwort-native-host|g" \
-    "$REPO_DIR/packaging/native-messaging/passwort_manager.firefox.json" \
-    > "$FX_DIR/passwort_manager.json"
-chmod 644 "$FX_DIR/passwort_manager.json"
-echo "Firefox manifest installed: $FX_DIR/passwort_manager.json"
+# Firefox manifest. We write to BOTH the standard location AND the
+# snap-confined location, because snap-installed Firefox (Ubuntu's default
+# since 22.04) only reads from its own confined dir and can't see
+# ~/.mozilla.
+for FX_DIR in "$HOME/.mozilla/native-messaging-hosts" \
+              "$HOME/snap/firefox/common/.mozilla/native-messaging-hosts"; do
+    # Only create the snap dir if snap-firefox is actually installed
+    if [[ "$FX_DIR" == *"/snap/firefox/"* ]] && ! [[ -d "$HOME/snap/firefox" ]]; then
+        continue
+    fi
+    mkdir -p "$FX_DIR"
+    sed "s|BINARY_PATH|$BIN_DIR/passwort-native-host|g" \
+        "$REPO_DIR/packaging/native-messaging/passwort_manager.firefox.json" \
+        > "$FX_DIR/passwort_manager.json"
+    chmod 644 "$FX_DIR/passwort_manager.json"
+    echo "Firefox manifest installed: $FX_DIR/passwort_manager.json"
+done
 
 # Chrome manifest (only if --chrome given)
 if [[ $DO_CHROME -eq 1 ]]; then

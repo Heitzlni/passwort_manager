@@ -25,6 +25,7 @@ rm -f "$BIN_DIR/passwort-autotype"
 rm -f "$APP_DIR/passwort-manager.desktop"
 rm -f "$ICON_DIR/passwort-manager.svg"
 rm -f "$HOME/.mozilla/native-messaging-hosts/passwort_manager.json"
+rm -f "$HOME/snap/firefox/common/.mozilla/native-messaging-hosts/passwort_manager.json"
 
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$APP_DIR" >/dev/null 2>&1 || true
