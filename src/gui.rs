@@ -1364,14 +1364,21 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                         *capturing = false;
                     } else {
                         let captured = ctx.input(|i| {
-                            let mods = i.modifiers;
+                            // Use the modifier state attached to the *event*,
+                            // not the frame-wide `i.modifiers`. The frame
+                            // value can include modifiers that were merely
+                            // held earlier; the event-level value is the
+                            // exact state at the moment of the keypress.
                             for event in &i.events {
                                 if let egui::Event::Key {
-                                    key, pressed: true, ..
+                                    key,
+                                    pressed: true,
+                                    modifiers,
+                                    ..
                                 } = event
                                 {
                                     if let Some(name) = egui_key_to_config_key(*key) {
-                                        return Some((mods, name));
+                                        return Some((*modifiers, name));
                                     }
                                 }
                             }

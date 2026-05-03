@@ -164,8 +164,13 @@ fn parse_key_code(key: &str) -> Result<Code, String> {
 // =================== hotkey handler ===================
 
 fn handle_hotkey_press() {
+    eprintln!("[hotkey] pressed → opening picker");
     let target_window_id = active_window_id();
     let target_window_title = active_window_title();
+    eprintln!(
+        "[hotkey] target window: id={:?} title={:?}",
+        target_window_id, target_window_title
+    );
 
     let picker_bin = picker_binary_path();
 
