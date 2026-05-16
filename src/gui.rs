@@ -1095,7 +1095,10 @@ impl App {
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
-                            ui.add_space(4.0);
+                            // Keep the toolbar off the window's right
+                            // edge so buttons don't sit flush against it
+                            // on a small window.
+                            ui.add_space(12.0);
                             // Always-on: Lock (security-core) and Settings
                             // (the only way back to re-enable hidden buttons).
                             if ui.button("Lock").clicked() {
@@ -1176,10 +1179,15 @@ impl App {
                 });
             });
 
-        // Sidebar
+        // Sidebar — width scales with the window instead of a fixed
+        // 240 px. On a small/non-maximized window a fixed sidebar eats a
+        // huge share of the width; proportional-with-clamp keeps it
+        // sensible at every size (never thinner than a name fits, never
+        // wider than it needs).
+        let sidebar_w = (ctx.screen_rect().width() * 0.26).clamp(170.0, 260.0);
         egui::SidePanel::left("sidebar")
             .resizable(false)
-            .exact_width(240.0)
+            .exact_width(sidebar_w)
             .frame(
                 egui::Frame::default()
                     .fill(egui::Color32::from_rgb(0x18, 0x18, 0x1c))
@@ -1651,13 +1659,27 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
         Modal::Tokens => "Authenticator — 2FA codes",
     };
 
-    // Audit + Import + Tokens need more horizontal room.
-    let default_width = match modal {
-        Modal::Audit { .. } => 640.0,
-        Modal::Import { .. } => 520.0,
-        Modal::Tokens => 460.0,
+    // Audit + Import + Tokens want more horizontal room when there's room
+    // to give. These are the *preferred* widths on a roomy window.
+    let preferred_width: f32 = match modal {
+        Modal::Audit { .. } => 620.0,
+        Modal::Import { .. } => 500.0,
+        Modal::Tokens => 440.0,
         _ => 360.0,
     };
+    // Size the modal relative to the *app window*, not absolutely. Two
+    // bounds, both needed:
+    //   * `width - 64`  → always leave a clear margin so the dialog reads
+    //     as floating inside the app, never jammed edge-to-edge (this is
+    //     why a 620 px Audit modal still looked huge in a 640 px window).
+    //   * `width * 0.92` → on a genuinely small window, scale the dialog
+    //     down with it instead of pinning it near full width.
+    // Floor keeps it usable; the vertical scroll handles height.
+    let sr = ctx.screen_rect();
+    let default_width = preferred_width
+        .min(sr.width() - 64.0)
+        .min(sr.width() * 0.92)
+        .max(260.0);
 
     egui::Window::new(title)
         .collapsible(false)
@@ -1672,6 +1694,28 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
             // window grows, every frame. Bounding it here fixes every
             // modal at once.
             ui.set_max_width(default_width);
+
+            // Bound the modal's height to the visible window, not to its
+            // content. A tall modal (Settings, Add, Import…) shown in a
+            // small, non-maximized app window would otherwise grow past
+            // the viewport — and because the window is centered, the
+            // bottom (the Close / Create buttons) ends up clipped off the
+            // screen and unreachable, so the modal can't be dismissed.
+            // Cap the body to the available height and let it scroll, so
+            // the buttons stay in reach at any window size. The title bar
+            // stays fixed on top; only the body scrolls.
+            //
+            // Vertical-only on purpose: horizontal overflow is solved by
+            // shrinking the window width to fit (see `default_width`
+            // above), which lets text wrap. Enabling horizontal scroll
+            // here instead would give content infinite width, stopping
+            // wrapping and defeating the `set_max_width` bound — which
+            // breaks the layout and the vertical scroll with it.
+            let max_body_h = (ctx.screen_rect().height() - 120.0).max(160.0);
+            egui::ScrollArea::vertical()
+                .max_height(max_body_h)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
             match modal {
             Modal::Add {
                 name,
@@ -2802,6 +2846,7 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                 }
             }
             }
+            });
         });
 
     result
