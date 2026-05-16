@@ -195,13 +195,55 @@ mod quick_save {
                                     self.password.zeroize();
                                     self.username.zeroize();
                                 }
-                                Ok(Response::Error { code, message }) => {
-                                    let msg = if code == "locked" {
-                                        "Vault is locked. Open the toolbar or GUI to unlock, then try again.".into()
-                                    } else {
-                                        message
+                                Ok(Response::Error { code, message })
+                                    if code == "locked" =>
+                                {
+                                    // Vault locked — don't dead-end. Stash
+                                    // the credential in the sealed inbox so
+                                    // it's reviewable at the next unlock,
+                                    // exactly like the browser extension.
+                                    let stash = Request::SaveLocked {
+                                        name: self.name.clone(),
+                                        url: String::new(),
+                                        username: self.username.clone(),
+                                        password: self.password.clone(),
+                                        totp_secret: String::new(),
+                                        notes: String::new(),
                                     };
-                                    self.message = Some((msg, true));
+                                    match ipc::rpc_authed(
+                                        "passwort-quick-save",
+                                        &stash,
+                                    ) {
+                                        Ok(Response::Ok) => {
+                                            self.saved = true;
+                                            self.message = Some((
+                                                "Vault locked — stashed. It'll \
+                                                 appear for review when you next \
+                                                 unlock the app."
+                                                    .into(),
+                                                false,
+                                            ));
+                                            self.password.zeroize();
+                                            self.username.zeroize();
+                                        }
+                                        Ok(Response::Error { message, .. }) => {
+                                            self.message = Some((message, true));
+                                        }
+                                        Ok(_) => {
+                                            self.message = Some((
+                                                "Unexpected response from daemon."
+                                                    .into(),
+                                                true,
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            self.message =
+                                                Some((e.to_string(), true));
+                                        }
+                                    }
+                                }
+                                Ok(Response::Error { message, .. }) => {
+                                    self.message = Some((message, true));
                                 }
                                 Ok(_) => {
                                     self.message =
