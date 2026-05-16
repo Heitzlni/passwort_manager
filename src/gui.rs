@@ -73,8 +73,9 @@ pub fn run_picker(target_title: Option<String>) -> Result<(), eframe::Error> {
 pub fn run_quick_save(target_title: Option<String>) -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 260.0])
-            .with_resizable(false)
+            .with_inner_size([440.0, 360.0])
+            .with_min_inner_size([380.0, 280.0])
+            .with_resizable(true)
             .with_decorations(true)
             .with_always_on_top()
             .with_title("Save credential"),
@@ -135,6 +136,9 @@ mod quick_save {
             }
 
             egui::CentralPanel::default().show(ctx, |ui| {
+              egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
                 ui.colored_label(COLOR_MUTED, "Save credential for the active app");
                 ui.add_space(8.0);
 
@@ -266,6 +270,7 @@ mod quick_save {
                     let color = if *is_err { COLOR_ERROR } else { COLOR_OK };
                     ui.colored_label(color, msg.as_str());
                 }
+              });
             });
         }
     }
