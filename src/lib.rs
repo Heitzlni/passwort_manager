@@ -4,6 +4,7 @@ pub mod config;
 pub mod crypto;
 pub mod generator;
 pub mod gui;
+pub mod health;
 pub mod hibp;
 pub mod ipc;
 pub mod native_host;

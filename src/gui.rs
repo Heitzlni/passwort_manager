@@ -624,6 +624,9 @@ enum Modal {
     /// with its current 6-digit code + countdown, refreshed each second.
     /// No fields — reads from the live session every frame.
     Tokens,
+    /// Offline vault health report: weak + reused passwords. No fields —
+    /// recomputed from the live session each frame (cheap, O(n)).
+    Health,
     Import {
         /// Path the user picked, or empty until they click Browse.
         path: String,
@@ -718,6 +721,9 @@ impl Drop for Modal {
                 // No sensitive fields — result is just a path.
             }
             Modal::Tokens => {
+                // Reads live session; nothing owned here.
+            }
+            Modal::Health => {
                 // Reads live session; nothing owned here.
             }
             Modal::Import { password, path, .. } => {
@@ -1223,6 +1229,16 @@ impl App {
                                     ),
                                     worker: None,
                                 });
+                            }
+                            if tb.health
+                                && ui
+                                    .button("Health")
+                                    .on_hover_text(
+                                        "Offline check for weak and reused passwords (no network)",
+                                    )
+                                    .clicked()
+                            {
+                                *modal = Some(Modal::Health);
                             }
                             if tb.export
                                 && ui
@@ -1757,12 +1773,14 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
         Modal::Export { .. } => "Export vault",
         Modal::Import { .. } => "Import vault",
         Modal::Tokens => "Authenticator — 2FA codes",
+        Modal::Health => "Vault health",
     };
 
     // Audit + Import + Tokens want more horizontal room when there's room
     // to give. These are the *preferred* widths on a roomy window.
     let preferred_width: f32 = match modal {
         Modal::Audit { .. } => 620.0,
+        Modal::Health => 560.0,
         Modal::Import { .. } => 500.0,
         Modal::Tokens => 440.0,
         _ => 360.0,
@@ -2451,6 +2469,7 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                     ui.checkbox(&mut cfg.toolbar.change_master, "Change master");
                     ui.checkbox(&mut cfg.toolbar.tokens, "Tokens (2FA codes)");
                     ui.checkbox(&mut cfg.toolbar.audit, "Audit (HIBP)");
+                    ui.checkbox(&mut cfg.toolbar.health, "Health (offline check)");
                     ui.checkbox(&mut cfg.toolbar.export, "Export");
                     ui.checkbox(&mut cfg.toolbar.import, "Import");
                     if cfg.toolbar != before {
@@ -2829,6 +2848,136 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                     // Keep the countdown live.
                     ctx.request_repaint_after(std::time::Duration::from_secs(1));
                 }
+                ui.add_space(12.0);
+                if ui
+                    .add_sized(egui::vec2(80.0, 28.0), egui::Button::new("Close"))
+                    .clicked()
+                {
+                    result = ModalResult::Close;
+                }
+            }
+
+            Modal::Health => {
+                let report = crate::health::analyze(&session.accounts);
+                ui.colored_label(
+                    COLOR_MUTED,
+                    "Local-only — nothing leaves this machine. For breach \
+                     checking against haveibeenpwned.com, use Audit instead.",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{} accounts", report.total))
+                            .strong(),
+                    );
+                    ui.colored_label(COLOR_MUTED, "·");
+                    let wc = report.weak_count();
+                    ui.colored_label(
+                        if wc > 0 { COLOR_ERROR } else { COLOR_OK },
+                        format!("{} weak", wc),
+                    );
+                    ui.colored_label(COLOR_MUTED, "·");
+                    let rc = report.reused_count();
+                    ui.colored_label(
+                        if rc > 0 { COLOR_ERROR } else { COLOR_OK },
+                        format!("{} reused", rc),
+                    );
+                });
+                ui.add_space(10.0);
+
+                if report.total == 0 {
+                    ui.colored_label(COLOR_MUTED, "Vault is empty.");
+                } else if report.all_clear() {
+                    ui.colored_label(
+                        COLOR_OK,
+                        "\u{2713} No weak or reused passwords. Nice.",
+                    );
+                } else {
+                    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                        let weak: Vec<&crate::health::EntryHealth> =
+                            report.entries.iter().filter(|e| e.weak).collect();
+                        if !weak.is_empty() {
+                            ui.label(
+                                egui::RichText::new("Weak passwords").strong(),
+                            );
+                            ui.colored_label(
+                                COLOR_MUTED,
+                                "Short or low-variety — replace with generated ones.",
+                            );
+                            ui.add_space(4.0);
+                            for e in weak {
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(COLOR_ERROR, "\u{2022}");
+                                    let label = if e.username.is_empty() {
+                                        truncate_chars(&e.name, 32)
+                                    } else {
+                                        format!(
+                                            "{} ({})",
+                                            truncate_chars(&e.name, 24),
+                                            truncate_chars(&e.username, 18)
+                                        )
+                                    };
+                                    ui.label(label);
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(
+                                            egui::Align::Center,
+                                        ),
+                                        |ui| {
+                                            ui.colored_label(
+                                                COLOR_MUTED,
+                                                if e.bits == 0 {
+                                                    "empty".to_string()
+                                                } else {
+                                                    format!("~{} bits", e.bits)
+                                                },
+                                            );
+                                        },
+                                    );
+                                });
+                            }
+                            ui.add_space(12.0);
+                        }
+
+                        if !report.reused_groups.is_empty() {
+                            ui.label(
+                                egui::RichText::new("Reused passwords").strong(),
+                            );
+                            ui.colored_label(
+                                COLOR_MUTED,
+                                "Each group shares one password — a breach of \
+                                 one breaches them all.",
+                            );
+                            ui.add_space(4.0);
+                            for (gi, group) in
+                                report.reused_groups.iter().enumerate()
+                            {
+                                ui.colored_label(
+                                    COLOR_ERROR,
+                                    format!(
+                                        "Group {} — {} entries:",
+                                        gi + 1,
+                                        group.len()
+                                    ),
+                                );
+                                for &idx in group {
+                                    let e = &report.entries[idx];
+                                    let label = if e.username.is_empty() {
+                                        truncate_chars(&e.name, 36)
+                                    } else {
+                                        format!(
+                                            "{} ({})",
+                                            truncate_chars(&e.name, 26),
+                                            truncate_chars(&e.username, 20)
+                                        )
+                                    };
+                                    ui.label(format!("    \u{2022} {}", label));
+                                }
+                                ui.add_space(6.0);
+                            }
+                        }
+                    });
+                }
+
                 ui.add_space(12.0);
                 if ui
                     .add_sized(egui::vec2(80.0, 28.0), egui::Button::new("Close"))

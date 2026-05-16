@@ -55,6 +55,8 @@ pub struct ToolbarConfig {
     #[serde(default = "default_true")]
     pub audit: bool,
     #[serde(default = "default_true")]
+    pub health: bool,
+    #[serde(default = "default_true")]
     pub export: bool,
     #[serde(default = "default_true")]
     pub import: bool,
@@ -66,6 +68,7 @@ impl Default for ToolbarConfig {
             change_master: true,
             tokens: true,
             audit: true,
+            health: true,
             export: true,
             import: true,
         }
