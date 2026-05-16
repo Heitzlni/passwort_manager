@@ -282,6 +282,15 @@ async function renderUnlocked() {
                 { class: "ghost small", onclick: () => copyPassword(entry.name) },
                 "Copy"
             );
+            const pwnedBtn = el(
+                "button",
+                {
+                    class: "ghost small",
+                    title: "Check this password against haveibeenpwned.com (k-anonymous)",
+                    onclick: () => checkPwned(entry.name),
+                },
+                "Pwned?"
+            );
             const label = entry.username
                 ? el(
                       "span",
@@ -292,7 +301,7 @@ async function renderUnlocked() {
                   )
                 : el("span", { class: "name" }, entry.name);
             root.appendChild(
-                el("div", { class: "account" }, label, fillBtn, copyBtn)
+                el("div", { class: "account" }, label, fillBtn, copyBtn, pwnedBtn)
             );
         }
     }
@@ -354,6 +363,20 @@ async function renderUnlocked() {
         "Read from page"
     );
 
+    const generateBtn = el(
+        "button",
+        {
+            class: "ghost",
+            title: "Generate a random 20-char password (~131 bits of entropy)",
+            onclick: () => {
+                pwInput.type = "text"; // reveal so user can see what was put in
+                pwInput.value = generatePassword();
+                showInfo("Generated. Click Save to store it.");
+            },
+        },
+        "✨ Generate"
+    );
+
     root.append(
         el("label", {}, "Name"),
         nameInput,
@@ -361,10 +384,10 @@ async function renderUnlocked() {
         userInput,
         el("label", {}, "Password"),
         pwInput,
-        el("div", { class: "row" }, saveBtn, readBtn)
+        el("div", { class: "row" }, saveBtn, readBtn, generateBtn)
     );
 
-    // Footer: lock
+    // Footer: lock + audit-all
     root.appendChild(el("hr"));
     root.appendChild(
         el(
@@ -383,7 +406,95 @@ async function renderUnlocked() {
                     },
                 },
                 "Lock"
+            ),
+            el(
+                "button",
+                {
+                    class: "ghost",
+                    title: "Check every saved password against haveibeenpwned.com. Takes a few seconds per entry.",
+                    onclick: () => auditAll(),
+                },
+                "Audit all"
             )
+        )
+    );
+}
+
+async function checkPwned(name) {
+    showInfo(`Checking "${name}"…`);
+    const r = await rpc({ op: "pwned_one", name });
+    if (r.kind === "error") {
+        if (r.code === "hibp_disabled") {
+            return showError("HIBP check is disabled. Enable it in config.json (hibp_enabled: true).");
+        }
+        await maybeHandleLocked(r);
+        return showError(r.message || "check failed");
+    }
+    if (r.kind !== "pwned_report" || !r.results || r.results.length === 0) {
+        return showError("unexpected response");
+    }
+    const e = r.results[0];
+    if (e.error) return showError(`${name}: ${e.error}`);
+    if (e.breach_count === 0) {
+        showInfo(`✓ "${name}" — not in any known breach.`);
+    } else {
+        showError(`⚠ "${name}" — appears in ${e.breach_count} breach${e.breach_count === 1 ? "" : "es"}. Change it.`);
+    }
+}
+
+async function auditAll() {
+    showInfo("Auditing all entries — this takes a few seconds…");
+    const r = await rpc({ op: "pwned_all" });
+    if (r.kind === "error") {
+        if (r.code === "hibp_disabled") {
+            return showError("HIBP check is disabled. Enable it in config.json (hibp_enabled: true).");
+        }
+        await maybeHandleLocked(r);
+        return showError(r.message || "audit failed");
+    }
+    if (r.kind !== "pwned_report") return showError("unexpected response");
+    const bad = r.results.filter((x) => x.breach_count && x.breach_count > 0);
+    const errs = r.results.filter((x) => x.error);
+    const root = $("#content");
+    root.innerHTML = "";
+    root.appendChild(el("h3", {}, "Audit results"));
+    root.appendChild(
+        el(
+            "div",
+            { class: "muted" },
+            `${r.results.length - bad.length - errs.length} clean · ${bad.length} compromised · ${errs.length} errors`
+        )
+    );
+    if (bad.length > 0) {
+        root.appendChild(el("hr"));
+        root.appendChild(el("label", { style: "color:#e06c75" }, "Compromised — change these:"));
+        for (const e of bad) {
+            const u = e.username ? ` (${e.username})` : "";
+            root.appendChild(
+                el(
+                    "div",
+                    { class: "account" },
+                    el("span", { class: "name" }, `${e.name}${u}`),
+                    el("span", { class: "muted small" }, `${e.breach_count} breaches`)
+                )
+            );
+        }
+    }
+    if (errs.length > 0) {
+        root.appendChild(el("hr"));
+        root.appendChild(el("label", {}, "Errors:"));
+        for (const e of errs) {
+            root.appendChild(
+                el("div", { class: "muted small" }, `${e.name}: ${e.error}`)
+            );
+        }
+    }
+    root.appendChild(el("hr"));
+    root.appendChild(
+        el(
+            "button",
+            { class: "ghost", onclick: () => refresh() },
+            "Back"
         )
     );
 }
@@ -415,6 +526,29 @@ async function fillOnTab(tab, name) {
     } catch {
         showError("content script not loaded — try reloading the tab");
     }
+}
+
+// Random password generator. Uses crypto.getRandomValues + rejection
+// sampling so each character of the alphabet is equally likely (no modulo
+// bias). Mirrors src/generator.rs on the Rust side.
+const GEN_ALPHABET =
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+[]{};:,.<>?/~";
+const GEN_DEFAULT_LENGTH = 20;
+function generatePassword(length = GEN_DEFAULT_LENGTH) {
+    const n = GEN_ALPHABET.length;
+    const max = Math.floor(256 / n) * n;
+    const buf = new Uint8Array(64);
+    let out = "";
+    while (out.length < length) {
+        crypto.getRandomValues(buf);
+        for (const b of buf) {
+            if (b < max) {
+                out += GEN_ALPHABET[b % n];
+                if (out.length >= length) break;
+            }
+        }
+    }
+    return out;
 }
 
 async function copyPassword(name) {

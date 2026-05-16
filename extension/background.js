@@ -88,8 +88,8 @@ function refreshBadge() {
     // (just a username from step 1 of a multi-step login) shouldn't badge.
     let n = 0;
     for (const c of captured.values()) if (c.password) n++;
-    browser.browserAction.setBadgeText({ text: n > 0 ? String(n) : "" });
-    browser.browserAction.setBadgeBackgroundColor({ color: "#7c6dd8" });
+    browser.action.setBadgeText({ text: n > 0 ? String(n) : "" });
+    browser.action.setBadgeBackgroundColor({ color: "#7c6dd8" });
 }
 
 setInterval(() => {

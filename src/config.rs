@@ -17,6 +17,50 @@ pub struct Config {
     /// older configs without this field default to Ctrl+Alt+S.
     #[serde(default = "default_save_hotkey")]
     pub save_hotkey: HotkeyConfig,
+    /// Allow the daemon to query haveibeenpwned.com for breach checks.
+    /// Default: enabled. Set to false in config.json to disable the
+    /// outbound HTTPS calls entirely (no audit, no per-entry pwned check).
+    /// Even when enabled, only a 5-char SHA-1 prefix is sent — never the
+    /// password or its full hash. See src/hibp.rs.
+    #[serde(default = "default_hibp_enabled")]
+    pub hibp_enabled: bool,
+    /// Which optional top-bar buttons the GUI shows. Lets a user who
+    /// doesn't use, say, HIBP or 2FA hide those buttons for a cleaner
+    /// window. Missing in old config files → all on (see Default).
+    #[serde(default)]
+    pub toolbar: ToolbarConfig,
+}
+
+fn default_hibp_enabled() -> bool { true }
+fn default_true() -> bool { true }
+
+/// Visibility flags for the optional top-bar buttons. `Settings` and
+/// `Lock` are deliberately NOT here — they're always shown (hiding
+/// Settings would make the toggles unreachable; Lock is security-core).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct ToolbarConfig {
+    #[serde(default = "default_true")]
+    pub change_master: bool,
+    #[serde(default = "default_true")]
+    pub tokens: bool,
+    #[serde(default = "default_true")]
+    pub audit: bool,
+    #[serde(default = "default_true")]
+    pub export: bool,
+    #[serde(default = "default_true")]
+    pub import: bool,
+}
+
+impl Default for ToolbarConfig {
+    fn default() -> Self {
+        Self {
+            change_master: true,
+            tokens: true,
+            audit: true,
+            export: true,
+            import: true,
+        }
+    }
 }
 
 fn default_save_hotkey() -> HotkeyConfig {
@@ -41,6 +85,8 @@ impl Default for Config {
                 key: "p".into(),
             },
             save_hotkey: default_save_hotkey(),
+            hibp_enabled: default_hibp_enabled(),
+            toolbar: ToolbarConfig::default(),
         }
     }
 }

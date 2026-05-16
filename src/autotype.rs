@@ -20,7 +20,7 @@
 //! register and the keystrokes will go nowhere; we fall back to writing
 //! the password to the clipboard so the user can paste it (TODO).
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -37,6 +37,25 @@ use crate::ipc::{rpc_authed, EntryRef, Request, Response};
 const KEYSTROKE_DELAY_MS: u64 = 80; // small pause after focus return
 
 pub fn run() -> std::io::Result<()> {
+    // Wayland short-circuit: there's no reliable cross-compositor way to
+    // grab a global hotkey today (the GlobalShortcuts portal exists but
+    // requires per-app interactive opt-in, and most compositors don't
+    // implement it yet). Tell the user how to wire things up themselves
+    // and exit cleanly so the systemd service doesn't keep restarting.
+    if std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland") {
+        eprintln!("passwort-autotype: Wayland session detected.");
+        eprintln!("Global hotkeys aren't portably supported under Wayland.");
+        eprintln!("Bind your compositor's own hotkey to one of these commands instead:");
+        eprintln!("    passwortctl fill         # pick + type credential into the focused window");
+        eprintln!("    passwortctl quick-save   # capture credential from a native app");
+        eprintln!("Examples:");
+        eprintln!("  GNOME: Settings → Keyboard → Custom Shortcuts → Add");
+        eprintln!("    Command: {}/.local/bin/passwortctl fill", std::env::var("HOME").unwrap_or_default());
+        eprintln!("  Sway/Hyprland: bindsym <key> exec passwortctl fill");
+        eprintln!("Also install ydotool (sudo apt install ydotool) and enable ydotoold —");
+        eprintln!("see SETUP.md for the input-group / ydotoold details.");
+        return Ok(());
+    }
     let manager = GlobalHotKeyManager::new()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
@@ -236,23 +255,39 @@ fn handle_save_hotkey() {
 
 fn handle_fill_hotkey() {
     eprintln!("[fill-hotkey] pressed");
-    let target_window_id = active_window_id();
-    let target_window_title = active_window_title();
+    run_fill_flow();
+}
+
+/// Run the "pick an entry, then type its credential" flow once. Used by
+/// the X11 hotkey path AND by the standalone `passwortctl fill` command
+/// (which is how Wayland users trigger it — they bind their compositor's
+/// own hotkey to the CLI command since there's no portable Wayland
+/// global-hotkey API).
+///
+/// Window-context features (auto-pick by title, focus return) require
+/// xdotool and only run on X11; on Wayland we skip them and always show
+/// the picker.
+pub fn run_fill_flow() {
+    let on_x11 = crate::typing::detect() == crate::typing::Backend::Xdotool;
+    let target_window_id = if on_x11 { active_window_id() } else { None };
+    let target_window_title = if on_x11 { active_window_title() } else { None };
     eprintln!(
-        "[fill-hotkey] target window: id={:?} title={:?}",
-        target_window_id, target_window_title
+        "[fill] target window: id={:?} title={:?} backend={:?}",
+        target_window_id, target_window_title, crate::typing::detect()
     );
 
-    // Fast path: if exactly one saved entry matches the active window's
-    // title, skip the picker entirely and type immediately. KeePassXC does
-    // the same — it only shows the chooser when the title is ambiguous.
-    if let Some(name) = unique_match_for_title(target_window_title.as_deref()) {
-        eprintln!("[hotkey] auto-pick → '{}' (unique match for title)", name);
-        type_for_entry(&name, target_window_id.as_deref());
-        return;
+    // Fast path (X11 only): if exactly one saved entry matches the active
+    // window's title, skip the picker entirely and type immediately.
+    // KeePassXC does the same — picker only shows when title is ambiguous.
+    if on_x11 {
+        if let Some(name) = unique_match_for_title(target_window_title.as_deref()) {
+            eprintln!("[fill] auto-pick → '{}' (unique match for title)", name);
+            type_for_entry(&name, target_window_id.as_deref());
+            return;
+        }
     }
 
-    eprintln!("[hotkey] no unique match → opening picker");
+    eprintln!("[fill] no unique match → opening picker");
     let picker_bin = picker_binary_path();
     let mut cmd = Command::new(&picker_bin);
     cmd.arg("--picker");
@@ -282,6 +317,26 @@ fn handle_fill_hotkey() {
     }
 
     type_for_entry(&chosen, target_window_id.as_deref());
+}
+
+/// Standalone "save the credential for the active app" flow. Wayland
+/// counterpart to `handle_save_hotkey`. Same as that function, except we
+/// don't depend on having been triggered by a global hotkey — the user
+/// invoked us directly via `passwortctl save`.
+pub fn run_save_flow() {
+    let on_x11 = crate::typing::detect() == crate::typing::Backend::Xdotool;
+    let target_window_title = if on_x11 { active_window_title() } else { None };
+    let bin = picker_binary_path();
+    let mut cmd = Command::new(&bin);
+    cmd.arg("--quick-save");
+    if let Some(t) = &target_window_title {
+        cmd.arg("--target-title").arg(t);
+    }
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::inherit());
+    if let Err(e) = cmd.spawn() {
+        eprintln!("passwort-autotype: failed to launch quick-save dialog: {}", e);
+    }
 }
 
 /// Case-insensitive substring match: an entry's name must appear in the
@@ -318,10 +373,16 @@ fn unique_match_for_title(title: Option<&str>) -> Option<String> {
 }
 
 fn type_for_entry(name: &str, target_window_id: Option<&str>) {
+    // X11-only: snap focus back to the original window before typing.
+    // On Wayland the compositor restores focus when our picker window
+    // closes, and we have no portable way to force-focus an arbitrary
+    // window anyway.
     if let Some(id) = target_window_id {
-        let _ = Command::new("xdotool")
-            .args(["windowactivate", "--sync", id])
-            .status();
+        if crate::typing::detect() == crate::typing::Backend::Xdotool {
+            let _ = Command::new("xdotool")
+                .args(["windowactivate", "--sync", id])
+                .status();
+        }
     }
     thread::sleep(Duration::from_millis(KEYSTROKE_DELAY_MS));
     let resp = match rpc_authed("passwort-autotype", &Request::Get {
@@ -378,13 +439,12 @@ fn active_window_title() -> Option<String> {
 }
 
 fn type_credential(username: &str, password: &str) {
-    // We shell out to xdotool. It already handles every X11 weirdness
-    // (modifier maps, dead keys, key release timing) and we already
-    // depend on it for window-id / title detection above. Pass the text
-    // via stdin (`type --file -`) so it doesn't appear on the command
-    // line where /proc/<pid>/cmdline could leak it.
+    // Backend (xdotool / ydotool) is auto-detected from XDG_SESSION_TYPE;
+    // see crate::typing. Both backends stream via stdin so the credential
+    // never appears on the command line.
     if !username.is_empty() {
-        if !xdotool_type(username) {
+        if let Err(e) = crate::typing::type_text(username) {
+            eprintln!("passwort-autotype: type username failed: {}", e);
             return;
         }
         // Some apps (notably game launchers like Steam) need a real
@@ -392,50 +452,17 @@ fn type_credential(username: &str, password: &str) {
         // focus. With less than ~120 ms here we'd send the Tab and then
         // start typing the password before the field switch took
         // effect, dumping the password back into the username box.
-        thread::sleep(Duration::from_millis(120));
-        let _ = Command::new("xdotool")
-            .args(["key", "--clearmodifiers", "--delay", "30", "Tab"])
-            .status();
-        thread::sleep(Duration::from_millis(180));
+        crate::typing::sleep_ms(120);
+        if let Err(e) = crate::typing::press_key("Tab") {
+            eprintln!("passwort-autotype: Tab keypress failed: {}", e);
+            return;
+        }
+        crate::typing::sleep_ms(180);
     }
-    xdotool_type(password);
+    if let Err(e) = crate::typing::type_text(password) {
+        eprintln!("passwort-autotype: type password failed: {}", e);
+    }
     // Don't auto-press Enter — risky if focus is wrong, and many apps
     // need an explicit user click anyway (CAPTCHAs, 2FA prompts).
-}
-
-fn xdotool_type(text: &str) -> bool {
-    let child = Command::new("xdotool")
-        .args(["type", "--delay", "12", "--clearmodifiers", "--file", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn();
-    let mut child = match child {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "passwort-autotype: failed to spawn xdotool ({}). Install with: sudo apt install xdotool",
-                e
-            );
-            return false;
-        }
-    };
-    if let Some(stdin) = child.stdin.as_mut() {
-        if let Err(e) = stdin.write_all(text.as_bytes()) {
-            eprintln!("passwort-autotype: failed to write to xdotool stdin: {}", e);
-            return false;
-        }
-    }
-    match child.wait() {
-        Ok(s) if s.success() => true,
-        Ok(s) => {
-            eprintln!("passwort-autotype: xdotool exited with {}", s);
-            false
-        }
-        Err(e) => {
-            eprintln!("passwort-autotype: xdotool wait failed: {}", e);
-            false
-        }
-    }
 }
 

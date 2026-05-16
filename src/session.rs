@@ -9,7 +9,7 @@ use crate::storage::{
 };
 
 const LEGACY_VERIFIER_PLAINTEXT: &str = "VERIFY";
-pub const MIN_MASTER_PASSWORD_LEN: usize = 8;
+pub const MIN_MASTER_PASSWORD_LEN: usize = 12;
 
 pub struct Session {
     pub key: Zeroizing<[u8; KEY_LEN]>,
@@ -61,6 +61,35 @@ pub fn setup(password: &[u8], existing: Vec<Account>) -> std::io::Result<Session
     };
     persist(&session)?;
     Ok(session)
+}
+
+/// Decrypt an `EncryptedVault` with the given password and return just the
+/// account list. Doesn't touch any persistent state — used by the import
+/// path to merge a foreign vault into the current one.
+pub fn decrypt_accounts(vault: &EncryptedVault, password: &[u8]) -> Result<Vec<Account>, ()> {
+    let salt_vec = general_purpose::STANDARD
+        .decode(&vault.salt)
+        .map_err(|_| ())?;
+    if salt_vec.len() != SALT_LEN {
+        return Err(());
+    }
+    let mut salt = [0u8; SALT_LEN];
+    salt.copy_from_slice(&salt_vec);
+    let nonce = general_purpose::STANDARD
+        .decode(&vault.nonce)
+        .map_err(|_| ())?;
+    let ciphertext = general_purpose::STANDARD
+        .decode(&vault.ciphertext)
+        .map_err(|_| ())?;
+    let key = crypto::derive_key(
+        password,
+        &salt,
+        vault.kdf_m_cost,
+        vault.kdf_t_cost,
+        vault.kdf_p_cost,
+    );
+    let plaintext = crypto::decrypt(&ciphertext, &nonce, &*key)?;
+    serde_json::from_slice::<Vec<Account>>(&plaintext).map_err(|_| ())
 }
 
 pub fn login(vault: &EncryptedVault, password: &[u8]) -> Result<Session, ()> {
@@ -219,6 +248,52 @@ impl Session {
         Ok(())
     }
 
+    /// Merge a list of accounts into the session. Skips entries whose
+    /// (name, username) pair already exists. Returns `(added, skipped)`.
+    /// Persists once at the end on success.
+    pub fn merge_accounts(
+        &mut self,
+        incoming: Vec<Account>,
+    ) -> std::io::Result<(usize, usize)> {
+        let prev_len = self.accounts.len();
+        let mut skipped = 0;
+        for inc in incoming {
+            let dup = self
+                .accounts
+                .iter()
+                .any(|a| a.name == inc.name && a.username == inc.username);
+            if dup {
+                skipped += 1;
+                continue;
+            }
+            self.accounts.push(inc);
+        }
+        let added = self.accounts.len() - prev_len;
+        if added == 0 {
+            return Ok((0, skipped));
+        }
+        if let Err(e) = persist(self) {
+            // Roll back the appended entries on disk failure.
+            self.accounts.truncate(prev_len);
+            return Err(e);
+        }
+        Ok((added, skipped))
+    }
+
+    /// Replace the entire account list with `incoming`. Persists; rolls
+    /// back the in-memory state on disk failure.
+    pub fn replace_accounts(
+        &mut self,
+        incoming: Vec<Account>,
+    ) -> std::io::Result<usize> {
+        let backup = std::mem::replace(&mut self.accounts, incoming);
+        if let Err(e) = persist(self) {
+            self.accounts = backup;
+            return Err(e);
+        }
+        Ok(self.accounts.len())
+    }
+
     pub fn delete_account(&mut self, idx: usize) -> std::io::Result<()> {
         if idx >= self.accounts.len() {
             return Err(std::io::Error::new(
@@ -266,9 +341,13 @@ impl Session {
 }
 
 fn persist(session: &Session) -> std::io::Result<()> {
-    let json = serde_json::to_vec(&session.accounts)
+    // Use a Vec writer so the intermediate plaintext JSON lives in a
+    // Zeroizing buffer for its entire lifetime rather than being handed
+    // back from serde_json as a fresh allocation we then *try* to wrap.
+    let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
+    serde_json::to_writer(&mut *buf, &session.accounts)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let plaintext = Zeroizing::new(json);
+    let plaintext = buf;
     let (nonce, ciphertext) = crypto::encrypt(&plaintext, &*session.key);
 
     let vault = EncryptedVault {

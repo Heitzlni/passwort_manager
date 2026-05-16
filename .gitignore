@@ -19,3 +19,6 @@
 /bin
 /passwort-manager-*-linux-*.tar.gz
 PROJECT_REPORT.txt
+
+# Packaged browser-extension zips (regenerate with `zip -r` from extension/)
+/passwort-manager-*.zip

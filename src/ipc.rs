@@ -93,6 +93,14 @@ pub enum Request {
     },
     /// Deletes the account with the given name.
     Delete { name: String },
+    /// Check a single saved entry against HIBP "Pwned Passwords"
+    /// (k-anonymity API). Daemon-side, so the password never leaves the
+    /// daemon — only the SHA-1 prefix is sent to the API.
+    PwnedOne { name: String },
+    /// Check every entry. Returns one `PwnedReport` per account. Slow on
+    /// big vaults (one HTTP request per entry), so the GUI should run it
+    /// in a worker.
+    PwnedAll,
 }
 
 /// Lightweight view of an account, no password attached.
@@ -145,6 +153,23 @@ pub enum Response {
         /// "approved" / "pending" / "unknown"
         state: String,
     },
+    /// HIBP per-entry verdict.
+    PwnedReport {
+        results: Vec<PwnedEntry>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PwnedEntry {
+    pub name: String,
+    #[serde(default)]
+    pub username: String,
+    /// `breach_count > 0` means the password is in HIBP. `Some(0)` means
+    /// it was checked and found clean. `None` means the check failed for
+    /// this entry (network error etc.) — see `error`.
+    pub breach_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 // Error code constants — kept in one place so clients and the daemon agree.
@@ -158,6 +183,8 @@ pub mod codes {
     pub const BAD_REQUEST: &str = "bad_request";
     pub const CLIENT_UNAUTHORIZED: &str = "client_unauthorized";
     pub const CLIENT_PENDING: &str = "client_pending";
+    pub const RATE_LIMITED: &str = "rate_limited";
+    pub const HIBP_DISABLED: &str = "hibp_disabled";
 }
 
 fn error(code: &str, message: impl Into<String>) -> Response {
@@ -193,9 +220,29 @@ fn idle_timeout() -> Duration {
 struct DaemonState {
     session: Option<Session>,
     last_activity: Instant,
+    /// Consecutive failed Unlock attempts since the last successful unlock.
+    /// Reset to 0 on success.
+    unlock_failures: u32,
+    /// If set, refuse Unlock requests until this Instant. Returned to the
+    /// client as a `rate_limited` error with seconds remaining.
+    unlock_lockout_until: Option<Instant>,
 }
 
 type SharedState = Arc<Mutex<DaemonState>>;
+
+/// Lockout schedule for failed master-password attempts. The first 4 wrong
+/// guesses are free (typos), then the lockout grows. Argon2 already gives
+/// ~100 ms/guess on a fast CPU; this layer caps the worst-case sustained
+/// guess rate from a local attacker who has somehow gotten an approved
+/// auth token.
+fn unlock_lockout_for(failures: u32) -> Option<Duration> {
+    match failures {
+        0..=4 => None,
+        5..=9 => Some(Duration::from_secs(30)),
+        10..=19 => Some(Duration::from_secs(5 * 60)),
+        _ => Some(Duration::from_secs(60 * 60)),
+    }
+}
 
 // =================== Daemon ===================
 
@@ -238,6 +285,8 @@ pub fn run_daemon() -> std::io::Result<()> {
     let state: SharedState = Arc::new(Mutex::new(DaemonState {
         session: None,
         last_activity: Instant::now(),
+        unlock_failures: 0,
+        unlock_lockout_until: None,
     }));
 
     // Background thread: lock the session if it has been idle too long.
@@ -530,12 +579,28 @@ fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
                 password.zeroize();
                 return Response::Ok;
             }
+            let now = Instant::now();
+            if let Some(until) = s.unlock_lockout_until {
+                if now < until {
+                    let remaining = until.saturating_duration_since(now).as_secs();
+                    password.zeroize();
+                    return error(
+                        codes::RATE_LIMITED,
+                        format!(
+                            "too many failed unlock attempts; locked for {}s",
+                            remaining.max(1)
+                        ),
+                    );
+                }
+            }
             let resp = match session::initial_state() {
                 InitialState::NeedsLogin(vault) => {
                     match session::login(&vault, password.as_bytes()) {
                         Ok(sess) => {
                             s.session = Some(sess);
-                            s.last_activity = Instant::now();
+                            s.last_activity = now;
+                            s.unlock_failures = 0;
+                            s.unlock_lockout_until = None;
                             Response::Ok
                         }
                         Err(_) => error(codes::WRONG_PASSWORD, "wrong password"),
@@ -545,7 +610,9 @@ fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
                     match session::login_legacy(&vault, password.as_bytes()) {
                         Ok(sess) => {
                             s.session = Some(sess);
-                            s.last_activity = Instant::now();
+                            s.last_activity = now;
+                            s.unlock_failures = 0;
+                            s.unlock_lockout_until = None;
                             Response::Ok
                         }
                         Err(_) => error(codes::WRONG_PASSWORD, "wrong password"),
@@ -562,6 +629,17 @@ fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
                     error(codes::IO_ERROR, format!("vault io error: {}", e))
                 }
             };
+            // Track wrong-password failures for backoff. Other error kinds
+            // (uninitialized, corrupted, io) are bug states, not guesses,
+            // so don't count them.
+            if let Response::Error { code, .. } = &resp {
+                if code == codes::WRONG_PASSWORD {
+                    s.unlock_failures = s.unlock_failures.saturating_add(1);
+                    if let Some(d) = unlock_lockout_for(s.unlock_failures) {
+                        s.unlock_lockout_until = Some(now + d);
+                    }
+                }
+            }
             // Wipe the deserialized password regardless of which branch ran.
             password.zeroize();
             resp
@@ -707,6 +785,89 @@ fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
                 }
             }
         }
+
+        Request::PwnedOne { name } => {
+            if !crate::config::load().hibp_enabled {
+                return error(
+                    codes::HIBP_DISABLED,
+                    "HIBP check is disabled in config; enable hibp_enabled in config.json",
+                );
+            }
+            let (acc_name, acc_user, password) = {
+                let mut s = state.lock().unwrap();
+                let sess = match s.session.as_ref() {
+                    Some(s) => s,
+                    None => return locked_error(),
+                };
+                let acc = match sess.accounts.iter().find(|a| a.name == name) {
+                    Some(a) => a,
+                    None => return error(codes::NOT_FOUND, "not found"),
+                };
+                let trio = (acc.name.clone(), acc.username.clone(), acc.password.clone());
+                s.last_activity = Instant::now();
+                trio
+            };
+            let entry = match crate::hibp::check_password(&password) {
+                Ok(r) => PwnedEntry {
+                    name: acc_name,
+                    username: acc_user,
+                    breach_count: Some(r.breach_count),
+                    error: None,
+                },
+                Err(e) => PwnedEntry {
+                    name: acc_name,
+                    username: acc_user,
+                    breach_count: None,
+                    error: Some(e.to_string()),
+                },
+            };
+            Response::PwnedReport { results: vec![entry] }
+        }
+
+        Request::PwnedAll => {
+            if !crate::config::load().hibp_enabled {
+                return error(
+                    codes::HIBP_DISABLED,
+                    "HIBP check is disabled in config; enable hibp_enabled in config.json",
+                );
+            }
+            // Snapshot (name, username, password) under lock, drop the
+            // lock, then do the slow HTTP work without blocking other
+            // clients. Each entry is a separate HTTP request — for very
+            // large vaults the GUI should fire this in a worker thread.
+            let snapshot: Vec<(String, String, String)> = {
+                let mut s = state.lock().unwrap();
+                let sess = match s.session.as_ref() {
+                    Some(s) => s,
+                    None => return locked_error(),
+                };
+                let v = sess
+                    .accounts
+                    .iter()
+                    .map(|a| (a.name.clone(), a.username.clone(), a.password.clone()))
+                    .collect();
+                s.last_activity = Instant::now();
+                v
+            };
+            let mut results = Vec::with_capacity(snapshot.len());
+            for (name, username, password) in snapshot {
+                match crate::hibp::check_password(&password) {
+                    Ok(r) => results.push(PwnedEntry {
+                        name,
+                        username,
+                        breach_count: Some(r.breach_count),
+                        error: None,
+                    }),
+                    Err(e) => results.push(PwnedEntry {
+                        name,
+                        username,
+                        breach_count: None,
+                        error: Some(e.to_string()),
+                    }),
+                }
+            }
+            Response::PwnedReport { results }
+        }
     }
 }
 
@@ -833,6 +994,45 @@ pub fn run_ctl() -> std::io::Result<()> {
             let id = args.get(2).cloned().ok_or_else(|| usage_err("revoke <id>"))?;
             return cmd_revoke(&id);
         }
+        "generate" => {
+            let len = args
+                .get(2)
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(crate::generator::DEFAULT_LENGTH);
+            let pw = crate::generator::generate(len, crate::generator::Charset::default());
+            println!("{}", pw);
+            return Ok(());
+        }
+        "export" => {
+            // First positional that isn't a flag is the destination path.
+            let path = args
+                .iter()
+                .skip(2)
+                .find(|a| !a.starts_with("--"))
+                .cloned();
+            let with_config = args.iter().any(|a| a == "--with-config");
+            return cmd_export(path.as_deref(), with_config);
+        }
+        "import" => {
+            let path = args
+                .iter()
+                .skip(2)
+                .find(|a| !a.starts_with("--"))
+                .cloned()
+                .ok_or_else(|| usage_err("import <path> [--merge] [--apply-config] [--force]"))?;
+            let force = args.iter().any(|a| a == "--force");
+            let merge = args.iter().any(|a| a == "--merge");
+            let apply_config = args.iter().any(|a| a == "--apply-config");
+            return cmd_import(&path, ImportMode { merge, apply_config, force });
+        }
+        "fill" => {
+            crate::autotype::run_fill_flow();
+            return Ok(());
+        }
+        "quick-save" => {
+            crate::autotype::run_save_flow();
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -871,6 +1071,14 @@ pub fn run_ctl() -> std::io::Result<()> {
                 .ok_or_else(|| usage_err("delete <name>"))?;
             Request::Delete { name }
         }
+        "pwned" => {
+            let name = args
+                .get(2)
+                .cloned()
+                .ok_or_else(|| usage_err("pwned <name>"))?;
+            Request::PwnedOne { name }
+        }
+        "audit" => Request::PwnedAll,
         _ => {
             print_usage();
             std::process::exit(1);
@@ -949,6 +1157,46 @@ pub fn run_ctl() -> std::io::Result<()> {
         Response::AuthStatusResp { state } => {
             println!("{}", state);
         }
+        Response::PwnedReport { results } => {
+            if results.is_empty() {
+                eprintln!("(no entries to check)");
+            }
+            let mut bad = 0;
+            let mut errs = 0;
+            for r in &results {
+                let user = if r.username.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", r.username)
+                };
+                match (r.breach_count, &r.error) {
+                    (Some(0), _) => println!("OK    {}{}    not found in any breach", r.name, user),
+                    (Some(n), _) => {
+                        bad += 1;
+                        println!(
+                            "WARN  {}{}    password appears in {} breach{} — change it",
+                            r.name, user, n, if n == 1 { "" } else { "es" }
+                        );
+                    }
+                    (None, Some(e)) => {
+                        errs += 1;
+                        eprintln!("ERR   {}{}    check failed: {}", r.name, user, e);
+                    }
+                    (None, None) => {}
+                }
+            }
+            if results.len() > 1 {
+                eprintln!(
+                    "\nsummary: {} clean, {} compromised, {} errors",
+                    results.iter().filter(|r| r.breach_count == Some(0)).count(),
+                    bad,
+                    errs
+                );
+            }
+            if bad > 0 {
+                std::process::exit(4);
+            }
+        }
     }
 
     Ok(())
@@ -997,6 +1245,226 @@ fn cmd_revoke(id: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+struct ImportMode {
+    /// true = merge into current vault (requires daemon unlocked + master
+    /// password); false = replace the on-disk vault wholesale.
+    merge: bool,
+    /// If the source file is a bundle and contains a config, apply it.
+    /// Ignored if the file is a raw vault (no config to apply).
+    apply_config: bool,
+    /// Required for replace mode when a vault already exists.
+    force: bool,
+}
+
+/// Copy the encrypted vault to a backup path. With `--with-config`, wraps
+/// it in a bundle that also includes config.json (hotkeys + HIBP toggle).
+/// Without it, writes the raw vault file (same shape as your live
+/// vault.json) — older `passwortctl import` versions can read that too.
+///
+/// The master password is NEVER in the export. The vault is *what's
+/// encrypted with it*. To use the export on a new machine, type the same
+/// master password during unlock.
+fn cmd_export(dest: Option<&str>, with_config: bool) -> std::io::Result<()> {
+    let src = storage::vault_path();
+    if !src.exists() {
+        eprintln!("error: no vault to export at {}", src.display());
+        std::process::exit(2);
+    }
+    let dest_path: std::path::PathBuf = match dest {
+        Some(p) => std::path::PathBuf::from(p),
+        None => {
+            let stamp = {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                format!("{}", secs)
+            };
+            let home = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            home.join(format!("passwort-vault-{}.json", stamp))
+        }
+    };
+    if dest_path.exists() {
+        eprintln!(
+            "error: refusing to overwrite existing file {}",
+            dest_path.display()
+        );
+        std::process::exit(2);
+    }
+
+    if with_config {
+        let raw = std::fs::read_to_string(src)?;
+        let vault = storage::parse_encrypted(&raw).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "current vault file is not the expected EncryptedVault format",
+            )
+        })?;
+        let cfg = crate::config::load();
+        let json = crate::portable::serialize_bundle(&vault, Some(&cfg))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        std::fs::write(&dest_path, json)?;
+    } else {
+        std::fs::copy(src, &dest_path)?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dest_path, std::fs::Permissions::from_mode(0o600));
+    }
+    println!("exported {} to {}",
+        if with_config { "bundle (vault + config)" } else { "encrypted vault" },
+        dest_path.display());
+    println!(
+        "the vault inside is encrypted with your master password — safe to copy to a USB stick or cloud storage."
+    );
+    Ok(())
+}
+
+/// Import a vault from a backup file. Two modes:
+///   * Replace (default): the file's encrypted vault overwrites the
+///     current one on disk. The previous vault is saved to
+///     `<vault>.pre-import` first. The daemon is locked so its in-memory
+///     session can't end up out of sync.
+///   * Merge (`--merge`): the daemon must be unlocked. We decrypt the
+///     imported vault with the prompted master password (may differ from
+///     the current one — accommodates "imported from a friend"), then
+///     append every account whose (name, username) pair isn't already in
+///     the current vault.
+///
+/// If the file is a bundle (`format: passwort-bundle-v1`) and `--apply-config`
+/// is set, the imported config also overwrites the local config.json.
+fn cmd_import(src_path: &str, mode: ImportMode) -> std::io::Result<()> {
+    use std::path::PathBuf;
+    let src = PathBuf::from(src_path);
+    if !src.exists() {
+        eprintln!("error: source file not found: {}", src.display());
+        std::process::exit(2);
+    }
+    let data = std::fs::read_to_string(&src)?;
+    let parsed = match crate::portable::parse(&data) {
+        Some(p) => p,
+        None => {
+            eprintln!("error: source file is not a valid passwort backup");
+            eprintln!("(neither a passwort-bundle-v1 nor a raw EncryptedVault — refusing to import)");
+            std::process::exit(2);
+        }
+    };
+
+    let (vault, src_config) = match parsed {
+        crate::portable::Parsed::Bundle(b) => (b.vault, b.config),
+        crate::portable::Parsed::RawVault(v) => (v, None),
+    };
+
+    if mode.merge {
+        let pw = read_password(
+            "Master password for the IMPORTED file (may differ from your current one): ",
+        )?;
+        let imported_accounts = match crate::session::decrypt_accounts(&vault, pw.as_bytes()) {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!("error: wrong master password for the imported file");
+                std::process::exit(2);
+            }
+        };
+        // Send to the daemon as a sequence of Save requests under the
+        // current key. Anything the daemon already has by (name, username)
+        // is left alone — Save matches on (name, username).
+        let mut added = 0usize;
+        let mut skipped = 0usize;
+        for acc in imported_accounts {
+            // Quick existence check: ask the daemon for `get` on the name;
+            // if it returns a credential, only skip when the username also
+            // matches. This avoids a noisy duplicate insert.
+            // (We can't enumerate to filter pre-emptively because that's
+            // a separate round-trip per entry; a single Save attempt is
+            // simpler — daemon dedupes by (name, username) automatically.)
+            let resp = rpc_authed(
+                "passwortctl",
+                &Request::Save {
+                    name: acc.name.clone(),
+                    username: acc.username.clone(),
+                    password: acc.password.clone(),
+                },
+            )?;
+            match resp {
+                Response::Ok => added += 1,
+                Response::Error { code, message } => {
+                    if code == codes::LOCKED {
+                        eprintln!("error: vault is locked. Run `passwortctl unlock` first, then re-run the merge.");
+                        std::process::exit(2);
+                    }
+                    eprintln!(
+                        "warning: failed to import \"{}\": [{}] {}",
+                        acc.name, code, message
+                    );
+                    skipped += 1;
+                }
+                _ => skipped += 1,
+            }
+        }
+        // NOTE: daemon's Save *upserts* — same (name, username) pair gets
+        // its password overwritten. That's the right behavior for merge:
+        // the user explicitly asked to import this list of credentials,
+        // so newer (imported) wins on key collision. If you want strict
+        // additive merge, use the GUI which exposes that toggle.
+        println!(
+            "merged: {} entries upserted, {} errors. Existing entries with the same (name, username) had their password updated.",
+            added, skipped
+        );
+    } else {
+        // Replace mode — write the (just the vault, not the bundle) to disk.
+        let dest = storage::vault_path();
+        if dest.exists() && !mode.force {
+            eprintln!("warning: a vault already exists at {}", dest.display());
+            eprintln!("re-run with `--force` to replace it. The current vault will be backed up to:");
+            eprintln!("  {}.pre-import", dest.display());
+            std::process::exit(2);
+        }
+        if dest.exists() {
+            let mut backup = dest.as_os_str().to_owned();
+            backup.push(".pre-import");
+            let backup = PathBuf::from(backup);
+            let _ = std::fs::remove_file(&backup);
+            std::fs::copy(dest, &backup)?;
+            eprintln!("backed up existing vault to {}", backup.display());
+        } else if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Write just the vault (not the bundle wrapper) so the on-disk
+        // file stays in the daemon's expected format.
+        let vault_json = serde_json::to_string_pretty(&vault).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, e)
+        })?;
+        std::fs::write(dest, vault_json)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o600));
+        }
+        let _ = rpc(&Request::Lock);
+        println!("imported vault from {}", src.display());
+        println!("daemon was locked; unlock with the master password used at the time of export.");
+    }
+
+    if mode.apply_config {
+        match src_config {
+            Some(cfg) => {
+                crate::config::save(&cfg)?;
+                println!("applied imported settings (hotkeys + HIBP toggle).");
+            }
+            None => {
+                eprintln!("note: --apply-config was set but the source file has no config (it's a raw vault, not a bundle).");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn read_password(prompt: &str) -> std::io::Result<String> {
     use std::io::IsTerminal;
     if std::io::stdin().is_terminal() {
@@ -1031,9 +1499,35 @@ fn print_usage() {
     eprintln!("    save <name> [user]  Create or update an account (prompts for password)");
     eprintln!("    delete <name>       Delete the named account");
     eprintln!();
+    eprintln!("    pwned <name>        Check ONE entry's password against haveibeenpwned.com");
+    eprintln!("                        (k-anonymous, only a 5-char hash prefix is sent)");
+    eprintln!("    audit               Check ALL entries' passwords. Exit code 4 if any breached.");
+    eprintln!();
+    eprintln!("    fill                Open the picker, then type the chosen credential into");
+    eprintln!("                        the focused window (autotype). Bind your compositor");
+    eprintln!("                        hotkey to this on Wayland; on X11 the hotkey is built-in.");
+    eprintln!("    quick-save          Pop up the \"save credential for the active app\" dialog.");
+    eprintln!("                        Same trigger as the save hotkey on X11.");
+    eprintln!();
     eprintln!("    approvals           List pending and approved API clients");
     eprintln!("    approve <id>        Grant a pending client access to the vault");
     eprintln!("    revoke <id>         Remove a client (pending or approved)");
+    eprintln!();
+    eprintln!("    generate [length]   Print a random password (default {} chars)", crate::generator::DEFAULT_LENGTH);
+    eprintln!();
+    eprintln!("    export [path] [--with-config]");
+    eprintln!("                        Save the encrypted vault to a backup file.");
+    eprintln!("                        --with-config wraps it in a bundle that also");
+    eprintln!("                        includes config.json (hotkeys + HIBP toggle).");
+    eprintln!("                        Default path: $HOME/passwort-vault-<timestamp>.json");
+    eprintln!("    import <path> [--merge] [--apply-config] [--force]");
+    eprintln!("                        Default mode: replace the current vault. Refuses");
+    eprintln!("                        to overwrite without --force; existing vault is");
+    eprintln!("                        saved to <vault>.pre-import.");
+    eprintln!("                        --merge: keep current accounts, add the imported");
+    eprintln!("                        ones (newer overwrites on (name, username) match).");
+    eprintln!("                        Requires the daemon to be unlocked.");
+    eprintln!("                        --apply-config: also apply settings from the bundle.");
     eprintln!();
     eprintln!("ENVIRONMENT:");
     eprintln!("    PASSWORT_IDLE_TIMEOUT_SECS  daemon auto-lock idle timeout (default 600, 0 = off)");

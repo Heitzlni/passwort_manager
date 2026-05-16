@@ -2,11 +2,16 @@ pub mod auth;
 pub mod autotype;
 pub mod config;
 pub mod crypto;
+pub mod generator;
 pub mod gui;
+pub mod hibp;
 pub mod ipc;
 pub mod native_host;
+pub mod portable;
+pub mod qr;
 pub mod session;
 pub mod storage;
+pub mod typing;
 pub mod vault;
 
 #[cfg(unix)]

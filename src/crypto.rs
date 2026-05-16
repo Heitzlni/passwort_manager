@@ -131,3 +131,242 @@ pub fn totp_code(b32_secret: &str) -> Option<(String, u64)> {
     let remaining = 30 - (now % 30);
     Some((code, remaining))
 }
+
+/// Parsed fields from an `otpauth://totp/...` URI (the thing QR codes on
+/// 2FA setup pages encode). We only surface what the rest of the app uses;
+/// `algorithm`/`digits`/`period` are parsed so we can warn if a site uses
+/// non-default values (our `totp_code` is hardcoded to the SHA1/6/30
+/// Google-Authenticator defaults that ~all sites use).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OtpauthParams {
+    /// Base32 secret (whitespace already stripped).
+    pub secret: String,
+    /// Human label — issuer + account, best-effort from the URI path.
+    pub label: String,
+    /// Issuer, if present (from the `issuer=` query param or the label
+    /// prefix before the colon).
+    pub issuer: String,
+    /// Account name (the part after `issuer:` in the label), may be empty.
+    pub account: String,
+    /// True if algorithm/digits/period differ from SHA1/6/30 — caller
+    /// should warn the user the generated codes may not match.
+    pub nonstandard: bool,
+}
+
+/// Parse an `otpauth://totp/LABEL?secret=...&issuer=...` URI. Returns None
+/// for HOTP, missing secret, or anything not matching the scheme. Tolerant
+/// of URL-encoding in the label and of the common `issuer:account` form.
+pub fn parse_otpauth_uri(uri: &str) -> Option<OtpauthParams> {
+    let uri = uri.trim();
+    let rest = uri.strip_prefix("otpauth://")?;
+    // We only do TOTP. HOTP needs a counter we don't store.
+    let rest = rest.strip_prefix("totp/")?;
+
+    let (label_enc, query) = match rest.split_once('?') {
+        Some((l, q)) => (l, q),
+        None => (rest, ""),
+    };
+    let label = url_decode(label_enc);
+
+    let mut secret = String::new();
+    let mut issuer_q = String::new();
+    let mut algorithm = String::from("SHA1");
+    let mut digits = String::from("6");
+    let mut period = String::from("30");
+    for pair in query.split('&') {
+        let (k, v) = match pair.split_once('=') {
+            Some(kv) => kv,
+            None => continue,
+        };
+        let v = url_decode(v);
+        match k.to_ascii_lowercase().as_str() {
+            "secret" => secret = v,
+            "issuer" => issuer_q = v,
+            "algorithm" => algorithm = v.to_ascii_uppercase(),
+            "digits" => digits = v,
+            "period" => period = v,
+            _ => {}
+        }
+    }
+    let secret: String = secret.chars().filter(|c| !c.is_whitespace()).collect();
+    if secret.is_empty() {
+        return None;
+    }
+
+    // Label is typically "Issuer:account" or just "account".
+    let (issuer_label, account) = match label.split_once(':') {
+        Some((i, a)) => (i.trim().to_string(), a.trim().to_string()),
+        None => (String::new(), label.trim().to_string()),
+    };
+    let issuer = if !issuer_q.is_empty() {
+        issuer_q
+    } else {
+        issuer_label
+    };
+
+    let nonstandard = algorithm != "SHA1" || digits != "6" || period != "30";
+
+    Some(OtpauthParams {
+        secret,
+        label: label.clone(),
+        issuer,
+        account,
+        nonstandard,
+    })
+}
+
+/// Minimal percent-decoder (also turns '+' into space, like form-encoding,
+/// which some issuers use in the label). Enough for otpauth labels.
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                    continue;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_basic_otpauth() {
+        let p = parse_otpauth_uri(
+            "otpauth://totp/GitHub:alice?secret=JBSWY3DPEHPK3PXP&issuer=GitHub",
+        )
+        .unwrap();
+        assert_eq!(p.secret, "JBSWY3DPEHPK3PXP");
+        assert_eq!(p.issuer, "GitHub");
+        assert_eq!(p.account, "alice");
+        assert!(!p.nonstandard);
+    }
+
+    #[test]
+    fn parse_otpauth_url_encoded_label() {
+        let p = parse_otpauth_uri(
+            "otpauth://totp/Big%20Corp%3Abob%40example.com?secret=ABCDEFGH234567",
+        )
+        .unwrap();
+        assert_eq!(p.secret, "ABCDEFGH234567");
+        // "Big Corp:bob@example.com" → issuer "Big Corp", account "bob@…"
+        assert_eq!(p.issuer, "Big Corp");
+        assert_eq!(p.account, "bob@example.com");
+    }
+
+    #[test]
+    fn parse_otpauth_flags_nonstandard() {
+        let p = parse_otpauth_uri(
+            "otpauth://totp/X?secret=AAAA&digits=8&period=60",
+        )
+        .unwrap();
+        assert!(p.nonstandard);
+    }
+
+    #[test]
+    fn parse_otpauth_rejects_hotp_and_garbage() {
+        assert!(parse_otpauth_uri("otpauth://hotp/x?secret=AAAA&counter=1").is_none());
+        assert!(parse_otpauth_uri("https://example.com").is_none());
+        assert!(parse_otpauth_uri("otpauth://totp/x").is_none()); // no secret
+    }
+
+    #[test]
+    fn parse_otpauth_strips_secret_whitespace() {
+        let p = parse_otpauth_uri(
+            "otpauth://totp/x?secret=JBSW%20Y3DP%20EHPK%203PXP",
+        )
+        .unwrap();
+        assert_eq!(p.secret, "JBSWY3DPEHPK3PXP");
+    }
+
+    #[test]
+    fn encrypt_decrypt_roundtrip() {
+        let key = [7u8; KEY_LEN];
+        let plaintext = b"hello, vault";
+        let (nonce, ciphertext) = encrypt(plaintext, &key);
+        let recovered = decrypt(&ciphertext, &nonce, &key).expect("decrypt should succeed");
+        assert_eq!(&*recovered, plaintext);
+    }
+
+    #[test]
+    fn decrypt_with_wrong_key_fails() {
+        let key = [7u8; KEY_LEN];
+        let other = [8u8; KEY_LEN];
+        let (nonce, ciphertext) = encrypt(b"secret", &key);
+        assert!(decrypt(&ciphertext, &nonce, &other).is_err());
+    }
+
+    #[test]
+    fn decrypt_with_tampered_ciphertext_fails() {
+        let key = [7u8; KEY_LEN];
+        let (nonce, mut ciphertext) = encrypt(b"secret", &key);
+        ciphertext[0] ^= 0x01; // flip one bit
+        assert!(decrypt(&ciphertext, &nonce, &key).is_err());
+    }
+
+    #[test]
+    fn decrypt_with_wrong_nonce_length_fails() {
+        let key = [7u8; KEY_LEN];
+        let (_n, ciphertext) = encrypt(b"x", &key);
+        assert!(decrypt(&ciphertext, &[1u8; 5], &key).is_err());
+    }
+
+    #[test]
+    fn derive_key_is_deterministic() {
+        let salt = [42u8; SALT_LEN];
+        let pw = b"correct horse battery staple";
+        // Use very low Argon2 cost so the test runs in milliseconds, not
+        // hundreds. We're testing determinism, not the production params.
+        let k1 = derive_key(pw, &salt, 1024, 1, 1);
+        let k2 = derive_key(pw, &salt, 1024, 1, 1);
+        assert_eq!(*k1, *k2);
+    }
+
+    #[test]
+    fn derive_key_changes_with_salt() {
+        let pw = b"same password";
+        let k1 = derive_key(pw, &[1u8; SALT_LEN], 1024, 1, 1);
+        let k2 = derive_key(pw, &[2u8; SALT_LEN], 1024, 1, 1);
+        assert_ne!(*k1, *k2);
+    }
+
+    #[test]
+    fn nonces_are_unique() {
+        // 12 random bytes should not collide across a small batch — a
+        // collision here would be a catastrophic RNG failure.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let n = generate_nonce();
+            assert!(seen.insert(n));
+        }
+    }
+
+    #[test]
+    fn ct_eq_works() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"abcd"));
+        assert!(ct_eq(b"", b""));
+    }
+}

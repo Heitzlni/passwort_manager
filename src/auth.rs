@@ -214,3 +214,72 @@ fn ct_eq_str(a: &str, b: &str) -> bool {
     }
     diff == 0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh_token() -> String { random_token_b64() }
+
+    #[test]
+    fn token_is_32_bytes_b64() {
+        let t = random_token_b64();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&t)
+            .unwrap();
+        assert_eq!(bytes.len(), 32);
+    }
+
+    #[test]
+    fn unknown_token_is_not_approved() {
+        let list = Allowlist::default();
+        assert!(!is_approved(&list, &fresh_token()));
+    }
+
+    #[test]
+    fn record_pending_then_approve_then_is_approved() {
+        let mut list = Allowlist::default();
+        let token = fresh_token();
+        let id = record_pending(&mut list, &token, "test client").unwrap();
+        assert!(list.pending.contains_key(&id));
+        assert!(!is_approved(&list, &token));
+        assert!(approve(&mut list, &id));
+        assert!(!list.pending.contains_key(&id));
+        assert!(is_approved(&list, &token));
+    }
+
+    #[test]
+    fn record_pending_twice_returns_same_id() {
+        let mut list = Allowlist::default();
+        let token = fresh_token();
+        let id1 = record_pending(&mut list, &token, "a").unwrap();
+        let id2 = record_pending(&mut list, &token, "b").unwrap();
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn revoke_removes_approved_or_pending() {
+        let mut list = Allowlist::default();
+        let token = fresh_token();
+        let id = record_pending(&mut list, &token, "x").unwrap();
+        approve(&mut list, &id);
+        assert!(is_approved(&list, &token));
+        assert!(revoke(&mut list, &id));
+        assert!(!is_approved(&list, &token));
+    }
+
+    #[test]
+    fn malformed_token_rejected() {
+        let mut list = Allowlist::default();
+        // Not valid base64
+        assert!(record_pending(&mut list, "this is not base64!", "x").is_none());
+        assert!(!is_approved(&list, "this is not base64!"));
+    }
+
+    #[test]
+    fn ct_eq_str_works() {
+        assert!(ct_eq_str("abc", "abc"));
+        assert!(!ct_eq_str("abc", "abd"));
+        assert!(!ct_eq_str("abc", "abcd"));
+    }
+}

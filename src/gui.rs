@@ -599,6 +599,59 @@ enum Modal {
         capturing: Option<HotkeySlot>,
         message: Option<(String, bool)>, // (text, is_error)
     },
+    Audit {
+        /// Shared with the worker thread. Mutex guards a small struct of
+        /// progress + accumulated results. Each frame the modal grabs the
+        /// lock briefly, snapshots the state, and re-renders.
+        progress: std::sync::Arc<std::sync::Mutex<AuditProgress>>,
+        /// `None` until the user clicks Run. `Some(_)` once the worker is
+        /// alive — kept here so it doesn't get joined/dropped while we
+        /// still want results.
+        worker: Option<std::thread::JoinHandle<()>>,
+    },
+    Export {
+        /// User toggle: write a bundle (vault + config) instead of a raw vault.
+        with_config: bool,
+        /// Resulting backup path once the file's been written. None until
+        /// the user clicks Export.
+        result: Option<Result<std::path::PathBuf, String>>,
+    },
+    /// Live "authenticator" view: every account that has a TOTP secret,
+    /// with its current 6-digit code + countdown, refreshed each second.
+    /// No fields — reads from the live session every frame.
+    Tokens,
+    Import {
+        /// Path the user picked, or empty until they click Browse.
+        path: String,
+        /// merge=true → add to existing; merge=false → replace.
+        merge: bool,
+        /// Apply imported config (only meaningful for bundle files).
+        apply_config: bool,
+        /// Master password for the imported file (might differ from current).
+        password: String,
+        /// Hide/show the password field.
+        show_password: bool,
+        /// Result of the last attempt: Some(Ok(message)) or Some(Err(message)).
+        result: Option<Result<String, String>>,
+        /// Receiver for the file picker worker thread. `None` when no
+        /// picker is active. We poll this each frame; if the user picked
+        /// a file (or cancelled / hit an error), we drain it back into
+        /// `path`. Running the picker on a worker thread keeps any
+        /// rfd / xdg-desktop-portal panic from bringing down the app and
+        /// avoids fighting egui for the display-server event queue.
+        chooser_rx: Option<std::sync::mpsc::Receiver<Result<Option<std::path::PathBuf>, String>>>,
+    },
+}
+
+#[derive(Default)]
+pub struct AuditProgress {
+    pub total: usize,
+    pub done: usize,
+    pub results: Vec<crate::ipc::PwnedEntry>,
+    pub finished: bool,
+    /// Set by the worker if HIBP is disabled in config or another global
+    /// failure happened — short-circuits the progress display.
+    pub fatal_error: Option<String>,
 }
 
 impl Drop for Modal {
@@ -644,6 +697,20 @@ impl Drop for Modal {
             }
             Modal::HotkeySettings { .. } => {
                 // No sensitive fields.
+            }
+            Modal::Audit { .. } => {
+                // No sensitive fields stored on this side — passwords were
+                // sent to the worker thread by clone and are zeroed there.
+            }
+            Modal::Export { .. } => {
+                // No sensitive fields — result is just a path.
+            }
+            Modal::Tokens => {
+                // Reads live session; nothing owned here.
+            }
+            Modal::Import { password, path, .. } => {
+                password.zeroize();
+                path.zeroize();
             }
         }
     }
@@ -1015,19 +1082,18 @@ impl App {
                             .heading()
                             .color(egui::Color32::WHITE),
                     );
+                    // One tiny read per top-bar paint (config is ~250 B and
+                    // the main screen doesn't repaint when idle). Drives
+                    // which optional buttons are shown — toggled in Settings.
+                    let tb = app_config::load().toolbar;
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
                             ui.add_space(4.0);
+                            // Always-on: Lock (security-core) and Settings
+                            // (the only way back to re-enable hidden buttons).
                             if ui.button("Lock").clicked() {
                                 lock_request = true;
-                            }
-                            if ui.button("Change master").clicked() {
-                                *modal = Some(Modal::ChangeMaster {
-                                    current: String::new(),
-                                    new: String::new(),
-                                    confirm: String::new(),
-                                });
                             }
                             if ui.button("Settings").clicked() {
                                 let cfg = app_config::load();
@@ -1036,6 +1102,67 @@ impl App {
                                     save: cfg.save_hotkey,
                                     capturing: None,
                                     message: None,
+                                });
+                            }
+                            if tb.change_master && ui.button("Change master").clicked() {
+                                *modal = Some(Modal::ChangeMaster {
+                                    current: String::new(),
+                                    new: String::new(),
+                                    confirm: String::new(),
+                                });
+                            }
+                            if tb.tokens
+                                && ui
+                                    .button("Tokens")
+                                    .on_hover_text(
+                                        "Live 2FA codes for every account that has a TOTP secret",
+                                    )
+                                    .clicked()
+                            {
+                                *modal = Some(Modal::Tokens);
+                            }
+                            if tb.audit
+                                && ui
+                                    .button("Audit")
+                                    .on_hover_text(
+                                        "Check every saved password against haveibeenpwned.com",
+                                    )
+                                    .clicked()
+                            {
+                                *modal = Some(Modal::Audit {
+                                    progress: std::sync::Arc::new(
+                                        std::sync::Mutex::new(AuditProgress::default()),
+                                    ),
+                                    worker: None,
+                                });
+                            }
+                            if tb.export
+                                && ui
+                                    .button("Export")
+                                    .on_hover_text("Save an encrypted backup of the vault")
+                                    .clicked()
+                            {
+                                *modal = Some(Modal::Export {
+                                    with_config: false,
+                                    result: None,
+                                });
+                            }
+                            if tb.import
+                                && ui
+                                    .button("Import")
+                                    .on_hover_text(
+                                        "Restore from a backup file — replace or merge into the current vault",
+                                    )
+                                    .clicked()
+                            {
+                                *modal = Some(Modal::Import {
+                                    path: String::new(),
+                                    merge: false,
+                                    apply_config: false,
+                                    password: String::new(),
+                                    show_password: false,
+                                    result: None,
+                                    chooser_rx: None,
                                 });
                             }
                         },
@@ -1254,6 +1381,7 @@ impl App {
                         ui.add_space(28.0);
                         ui.separator();
                         ui.add_space(14.0);
+                        let mut pwned_check_request: Option<(String, String)> = None;
                         ui.horizontal(|ui| {
                             if ui
                                 .add_sized(egui::vec2(90.0, 30.0), egui::Button::new("Edit"))
@@ -1283,7 +1411,53 @@ impl App {
                                     name: account.name.clone(),
                                 });
                             }
+                            if ui
+                                .add_sized(
+                                    egui::vec2(140.0, 30.0),
+                                    egui::Button::new("Check pwned"),
+                                )
+                                .on_hover_text(
+                                    "Query haveibeenpwned.com (k-anonymous) for this password",
+                                )
+                                .clicked()
+                            {
+                                pwned_check_request = Some((
+                                    account.name.clone(),
+                                    account.password.clone(),
+                                ));
+                            }
                         });
+                        if let Some((name, password)) = pwned_check_request {
+                            if !app_config::load().hibp_enabled {
+                                *error = "HIBP check is disabled. Enable it in Settings first.".to_string();
+                            } else {
+                                // Synchronous: one HTTP request, ~200ms typical.
+                                // Acceptable to block the UI briefly; for
+                                // checking ALL entries use `passwortctl audit`.
+                                match crate::hibp::check_password(&password) {
+                                    Ok(r) if r.breach_count == 0 => {
+                                        *info = format!(
+                                            "\"{}\" — not found in any known breach.",
+                                            name
+                                        );
+                                        *error = String::new();
+                                    }
+                                    Ok(r) => {
+                                        *error = format!(
+                                            "\"{}\" — password appears in {} breach{}. Change it.",
+                                            name,
+                                            r.breach_count,
+                                            if r.breach_count == 1 { "" } else { "es" },
+                                        );
+                                        *info = String::new();
+                                    }
+                                    Err(e) => {
+                                        *error = format!("HIBP check failed: {}", e);
+                                        *info = String::new();
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             });
@@ -1373,14 +1547,34 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
         Modal::DeleteConfirm { .. } => "Delete account",
         Modal::ChangeMaster { .. } => "Change master password",
         Modal::HotkeySettings { .. } => "Settings",
+        Modal::Audit { .. } => "Audit (Have I Been Pwned)",
+        Modal::Export { .. } => "Export vault",
+        Modal::Import { .. } => "Import vault",
+        Modal::Tokens => "Authenticator — 2FA codes",
+    };
+
+    // Audit + Import + Tokens need more horizontal room.
+    let default_width = match modal {
+        Modal::Audit { .. } => 640.0,
+        Modal::Import { .. } => 520.0,
+        Modal::Tokens => 460.0,
+        _ => 360.0,
     };
 
     egui::Window::new(title)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .default_width(360.0)
-        .show(ctx, |ui| match modal {
+        .default_width(default_width)
+        .show(ctx, |ui| {
+            // Hard-bound the content width. Without this, any child that
+            // sizes itself off `ui.available_width()` (e.g. the TOTP
+            // quick-add row) creates a feedback loop in an auto-sized
+            // window: window grows → available_width grows → child grows →
+            // window grows, every frame. Bounding it here fixes every
+            // modal at once.
+            ui.set_max_width(default_width);
+            match modal {
             Modal::Add {
                 name,
                 username,
@@ -1410,7 +1604,20 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                         .margin(egui::vec2(8.0, 6.0)),
                 );
                 ui.add_space(4.0);
-                ui.checkbox(show_password, "Show password");
+                ui.horizontal(|ui| {
+                    ui.checkbox(show_password, "Show password");
+                    if ui.button("\u{2728} Generate").on_hover_text(
+                        "Replace with a random 20-char password (~131 bits of entropy)"
+                    ).clicked() {
+                        *password = crate::generator::generate(
+                            crate::generator::DEFAULT_LENGTH,
+                            crate::generator::Charset::default(),
+                        );
+                        *show_password = true;
+                    }
+                });
+                ui.add_space(8.0);
+                totp_quick_add_row(ui, "add", name, username, totp_secret);
                 ui.add_space(8.0);
                 ui.colored_label(COLOR_MUTED, "TOTP secret (optional, Base32)");
                 ui.add(
@@ -1495,7 +1702,20 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                         .margin(egui::vec2(8.0, 6.0)),
                 );
                 ui.add_space(4.0);
-                ui.checkbox(show_password, "Show password");
+                ui.horizontal(|ui| {
+                    ui.checkbox(show_password, "Show password");
+                    if ui.button("\u{2728} Generate").on_hover_text(
+                        "Replace with a random 20-char password (~131 bits of entropy)"
+                    ).clicked() {
+                        *password = crate::generator::generate(
+                            crate::generator::DEFAULT_LENGTH,
+                            crate::generator::Charset::default(),
+                        );
+                        *show_password = true;
+                    }
+                });
+                ui.add_space(8.0);
+                totp_quick_add_row(ui, "edit", name, username, totp_secret);
                 ui.add_space(8.0);
                 ui.colored_label(COLOR_MUTED, "TOTP secret (Base32)");
                 ui.add(
@@ -1726,10 +1946,9 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                                     HotkeySlot::Fill => *fill = new_hk.clone(),
                                     HotkeySlot::Save => *save = new_hk.clone(),
                                 }
-                                let cfg = app_config::Config {
-                                    hotkey: fill.clone(),
-                                    save_hotkey: save.clone(),
-                                };
+                                let mut cfg = app_config::load();
+                                cfg.hotkey = fill.clone();
+                                cfg.save_hotkey = save.clone();
                                 match app_config::save(&cfg) {
                                     Ok(_) => {
                                         *message = Some((
@@ -1801,10 +2020,9 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                             modifiers: vec!["ctrl".into(), "alt".into()],
                             key: "s".into(),
                         };
-                        let cfg = app_config::Config {
-                            hotkey: fill.clone(),
-                            save_hotkey: save.clone(),
-                        };
+                        let mut cfg = app_config::load();
+                        cfg.hotkey = fill.clone();
+                        cfg.save_hotkey = save.clone();
                         match app_config::save(&cfg) {
                             Ok(_) => {
                                 *message = Some((
@@ -1831,6 +2049,77 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                     ui.colored_label(color, msg.as_str());
                 }
 
+                // HIBP toggle — only shown when not capturing a hotkey.
+                if capturing.is_none() {
+                    ui.add_space(18.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("Have I Been Pwned breach check").strong(),
+                    );
+                    ui.colored_label(
+                        COLOR_MUTED,
+                        "Sends a 5-char SHA-1 prefix of each password to api.pwnedpasswords.com (k-anonymous — your passwords never leave the daemon).",
+                    );
+                    ui.add_space(6.0);
+                    let mut cfg = app_config::load();
+                    let was = cfg.hibp_enabled;
+                    if ui.checkbox(&mut cfg.hibp_enabled, "Enable HIBP check").changed() {
+                        match app_config::save(&cfg) {
+                            Ok(_) => {
+                                *message = Some((
+                                    if cfg.hibp_enabled {
+                                        "HIBP check enabled.".to_string()
+                                    } else {
+                                        "HIBP check disabled.".to_string()
+                                    },
+                                    false,
+                                ));
+                            }
+                            Err(e) => {
+                                cfg.hibp_enabled = was;
+                                *message = Some((format!("Save failed: {}", e), true));
+                            }
+                        }
+                    }
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        COLOR_MUTED,
+                        "To check every entry at once, run:  passwortctl audit",
+                    );
+
+                    // ---- Toolbar buttons ----
+                    ui.add_space(18.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("Toolbar buttons").strong());
+                    ui.colored_label(
+                        COLOR_MUTED,
+                        "Hide features you don't use for a cleaner top bar. \
+                         Lock and Settings always stay visible.",
+                    );
+                    ui.add_space(6.0);
+                    let mut cfg = app_config::load();
+                    let before = cfg.toolbar.clone();
+                    ui.checkbox(&mut cfg.toolbar.change_master, "Change master");
+                    ui.checkbox(&mut cfg.toolbar.tokens, "Tokens (2FA codes)");
+                    ui.checkbox(&mut cfg.toolbar.audit, "Audit (HIBP)");
+                    ui.checkbox(&mut cfg.toolbar.export, "Export");
+                    ui.checkbox(&mut cfg.toolbar.import, "Import");
+                    if cfg.toolbar != before {
+                        match app_config::save(&cfg) {
+                            Ok(_) => {
+                                *message =
+                                    Some(("Toolbar updated.".to_string(), false));
+                            }
+                            Err(e) => {
+                                *message =
+                                    Some((format!("Save failed: {}", e), true));
+                            }
+                        }
+                    }
+                }
+
                 ui.add_space(14.0);
                 if ui
                     .add_sized(egui::vec2(80.0, 28.0), egui::Button::new("Close"))
@@ -1839,9 +2128,833 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                     result = ModalResult::Close;
                 }
             }
+
+            Modal::Audit { progress, worker } => {
+                // Snapshot under brief lock, render from snapshot.
+                let snap = {
+                    let p = progress.lock().unwrap();
+                    (
+                        p.total,
+                        p.done,
+                        p.finished,
+                        p.fatal_error.clone(),
+                        p.results.clone(),
+                    )
+                };
+                let (total, done, finished, fatal, results) = snap;
+
+                if let Some(err) = fatal {
+                    ui.colored_label(COLOR_ERROR, err);
+                    ui.add_space(12.0);
+                    if ui
+                        .add_sized(egui::vec2(80.0, 28.0), egui::Button::new("Close"))
+                        .clicked()
+                    {
+                        result = ModalResult::Close;
+                    }
+                    return;
+                }
+
+                if worker.is_none() && !finished {
+                    // Idle state — pre-launch screen
+                    ui.colored_label(
+                        COLOR_MUTED,
+                        format!(
+                            "About to check {} saved password{} against \
+                             haveibeenpwned.com (k-anonymous). One HTTP \
+                             request per entry, takes ~{} second{} total.",
+                            session.accounts.len(),
+                            if session.accounts.len() == 1 { "" } else { "s" },
+                            session.accounts.len().max(1),
+                            if session.accounts.len() == 1 { "" } else { "s" },
+                        ),
+                    );
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_sized(
+                                egui::vec2(110.0, 28.0),
+                                egui::Button::new(
+                                    egui::RichText::new("Run audit").strong(),
+                                )
+                                .fill(COLOR_ACCENT),
+                            )
+                            .clicked()
+                        {
+                            if !app_config::load().hibp_enabled {
+                                let mut p = progress.lock().unwrap();
+                                p.fatal_error = Some(
+                                    "HIBP check is disabled in Settings. Enable it first."
+                                        .to_string(),
+                                );
+                            } else {
+                                // Snapshot (name, username, password) on the
+                                // GUI thread, hand to the worker. The vault
+                                // is already unlocked here so this is safe.
+                                let snapshot: Vec<(String, String, String)> = session
+                                    .accounts
+                                    .iter()
+                                    .map(|a| {
+                                        (
+                                            a.name.clone(),
+                                            a.username.clone(),
+                                            a.password.clone(),
+                                        )
+                                    })
+                                    .collect();
+                                {
+                                    let mut p = progress.lock().unwrap();
+                                    p.total = snapshot.len();
+                                    p.done = 0;
+                                    p.results.clear();
+                                    p.finished = false;
+                                }
+                                let progress_clone = progress.clone();
+                                let ctx_clone = ctx.clone();
+                                let handle = std::thread::spawn(move || {
+                                    for (name, username, password) in snapshot {
+                                        let entry = match crate::hibp::check_password(&password) {
+                                            Ok(r) => crate::ipc::PwnedEntry {
+                                                name,
+                                                username,
+                                                breach_count: Some(r.breach_count),
+                                                error: None,
+                                            },
+                                            Err(e) => crate::ipc::PwnedEntry {
+                                                name,
+                                                username,
+                                                breach_count: None,
+                                                error: Some(e.to_string()),
+                                            },
+                                        };
+                                        {
+                                            let mut p = progress_clone.lock().unwrap();
+                                            p.results.push(entry);
+                                            p.done = p.results.len();
+                                        }
+                                        ctx_clone.request_repaint();
+                                    }
+                                    {
+                                        let mut p = progress_clone.lock().unwrap();
+                                        p.finished = true;
+                                    }
+                                    ctx_clone.request_repaint();
+                                });
+                                *worker = Some(handle);
+                            }
+                        }
+                        if ui
+                            .add_sized(egui::vec2(80.0, 28.0), egui::Button::new("Cancel"))
+                            .clicked()
+                        {
+                            result = ModalResult::Close;
+                        }
+                    });
+                } else {
+                    // Running or finished — show progress + results.
+                    if !finished {
+                        ui.label(format!("Checked {} of {}…", done, total));
+                        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                    } else {
+                        let bad = results
+                            .iter()
+                            .filter(|r| r.breach_count.unwrap_or(0) > 0)
+                            .count();
+                        let clean = results
+                            .iter()
+                            .filter(|r| r.breach_count == Some(0))
+                            .count();
+                        let errs = results.iter().filter(|r| r.error.is_some()).count();
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Done. {} clean · {} compromised · {} error{}",
+                                clean,
+                                bad,
+                                errs,
+                                if errs == 1 { "" } else { "s" }
+                            ))
+                            .strong(),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    // 240 px keeps the whole modal under ~440 px tall — safe
+                    // for the smallest sensible window. Name+username gets
+                    // truncated at 32 visible chars so a long URL doesn't
+                    // push the right-aligned status off-screen.
+                    egui::ScrollArea::vertical()
+                        .max_height(240.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for r in &results {
+                                ui.horizontal(|ui| {
+                                    let user = if r.username.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" ({})", r.username)
+                                    };
+                                    let full = format!("{}{}", r.name, user);
+                                    let label = truncate_chars(&full, 64);
+                                    match (r.breach_count, &r.error) {
+                                        (Some(0), _) => {
+                                            ui.colored_label(COLOR_OK, "\u{2713}");
+                                            ui.label(&label).on_hover_text(&full);
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| ui.colored_label(COLOR_MUTED, "clean"),
+                                            );
+                                        }
+                                        (Some(n), _) => {
+                                            ui.colored_label(COLOR_ERROR, "\u{26a0}");
+                                            ui.label(&label).on_hover_text(&full);
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.colored_label(
+                                                        COLOR_ERROR,
+                                                        format!(
+                                                            "{} breach{}",
+                                                            n,
+                                                            if n == 1 { "" } else { "es" }
+                                                        ),
+                                                    )
+                                                },
+                                            );
+                                        }
+                                        (None, Some(e)) => {
+                                            ui.colored_label(COLOR_MUTED, "?");
+                                            ui.label(&label).on_hover_text(&full);
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| ui.colored_label(
+                                                    COLOR_MUTED,
+                                                    truncate_chars(e, 48),
+                                                ).on_hover_text(e.as_str()),
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                });
+                            }
+                        });
+                    ui.add_space(12.0);
+                    if ui
+                        .add_sized(egui::vec2(80.0, 28.0), egui::Button::new("Close"))
+                        .clicked()
+                    {
+                        result = ModalResult::Close;
+                    }
+                }
+            }
+
+            Modal::Export { with_config, result: out } => {
+                ui.colored_label(
+                    COLOR_MUTED,
+                    "Copies your encrypted vault file to a backup. The file is \
+                     already encrypted with your master password — safe to copy \
+                     to a USB stick or cloud storage.",
+                );
+                ui.add_space(10.0);
+                ui.checkbox(with_config, "Also include settings (hotkeys + HIBP toggle)")
+                    .on_hover_text(
+                        "Wraps the vault in a bundle that also carries config.json. \
+                         When importing, you can choose to apply those settings on \
+                         the new machine. Master password is NEVER in the export.",
+                    );
+                ui.add_space(10.0);
+                match out {
+                    None => {
+                        if ui
+                            .add_sized(
+                                egui::vec2(140.0, 28.0),
+                                egui::Button::new(
+                                    egui::RichText::new("Export now").strong(),
+                                )
+                                .fill(COLOR_ACCENT),
+                            )
+                            .clicked()
+                        {
+                            *out = Some(do_export(*with_config));
+                        }
+                    }
+                    Some(Ok(path)) => {
+                        ui.colored_label(COLOR_OK, "\u{2713} Exported.");
+                        ui.add_space(6.0);
+                        ui.colored_label(COLOR_MUTED, "Saved to:");
+                        let mut path_str = path.display().to_string();
+                        ui.add(
+                            egui::TextEdit::singleline(&mut path_str)
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace)
+                                .interactive(false)
+                                .margin(egui::vec2(8.0, 6.0)),
+                        );
+                        ui.add_space(6.0);
+                        if ui.button("Copy path").clicked() {
+                            ctx.output_mut(|o| o.copied_text = path.display().to_string());
+                        }
+                    }
+                    Some(Err(e)) => {
+                        ui.colored_label(COLOR_ERROR, format!("Export failed: {}", e));
+                    }
+                }
+                ui.add_space(12.0);
+                if ui
+                    .add_sized(egui::vec2(80.0, 28.0), egui::Button::new("Close"))
+                    .clicked()
+                {
+                    result = ModalResult::Close;
+                }
+            }
+
+            Modal::Tokens => {
+                let with_totp: Vec<&crate::storage::Account> = session
+                    .accounts
+                    .iter()
+                    .filter(|a| !a.totp_secret.is_empty())
+                    .collect();
+                if with_totp.is_empty() {
+                    ui.colored_label(
+                        COLOR_MUTED,
+                        "No accounts have a 2FA secret yet. Add one via \"+ New \
+                         account\" → Quick-add 2FA (paste an otpauth:// URI or \
+                         import its QR image).",
+                    );
+                } else {
+                    ui.colored_label(
+                        COLOR_MUTED,
+                        "Live codes — refresh every 30s. Click a code to copy it.",
+                    );
+                    ui.add_space(8.0);
+                    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                        for acc in with_totp {
+                            match crate::crypto::totp_code(&acc.totp_secret) {
+                                Some((code, remaining)) => {
+                                    ui.horizontal(|ui| {
+                                        let pretty = if code.len() == 6 {
+                                            format!("{} {}", &code[..3], &code[3..])
+                                        } else {
+                                            code.clone()
+                                        };
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    egui::RichText::new(&pretty)
+                                                        .monospace()
+                                                        .size(22.0)
+                                                        .color(egui::Color32::WHITE),
+                                                )
+                                                .frame(false),
+                                            )
+                                            .on_hover_text("Click to copy")
+                                            .clicked()
+                                        {
+                                            ctx.output_mut(|o| o.copied_text = code.clone());
+                                        }
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.colored_label(
+                                                    if remaining <= 5 {
+                                                        COLOR_ERROR
+                                                    } else {
+                                                        COLOR_MUTED
+                                                    },
+                                                    format!("{:>2}s", remaining),
+                                                );
+                                                ui.add_space(8.0);
+                                                let nm = truncate_chars(&acc.name, 28);
+                                                ui.label(nm).on_hover_text(&acc.name);
+                                            },
+                                        );
+                                    });
+                                    ui.separator();
+                                }
+                                None => {
+                                    ui.horizontal(|ui| {
+                                        ui.colored_label(COLOR_ERROR, "invalid secret");
+                                        ui.label(truncate_chars(&acc.name, 28));
+                                    });
+                                    ui.separator();
+                                }
+                            }
+                        }
+                    });
+                    // Keep the countdown live.
+                    ctx.request_repaint_after(std::time::Duration::from_secs(1));
+                }
+                ui.add_space(12.0);
+                if ui
+                    .add_sized(egui::vec2(80.0, 28.0), egui::Button::new("Close"))
+                    .clicked()
+                {
+                    result = ModalResult::Close;
+                }
+            }
+
+            Modal::Import {
+                path,
+                merge,
+                apply_config,
+                password,
+                show_password,
+                result: out,
+                chooser_rx,
+            } => {
+                ui.colored_label(
+                    COLOR_MUTED,
+                    "Restore from a backup file (raw vault or bundle).",
+                );
+                ui.add_space(10.0);
+
+                // Drain the picker thread if it has a result ready. Done
+                // before rendering so the path field reflects the latest.
+                if let Some(rx) = chooser_rx.as_ref() {
+                    if let Ok(res) = rx.try_recv() {
+                        match res {
+                            Ok(Some(p)) => *path = p.display().to_string(),
+                            Ok(None) => {} // user cancelled
+                            Err(e) => *out = Some(Err(format!(
+                                "File picker failed: {}. Paste the path manually instead.",
+                                e
+                            ))),
+                        }
+                        *chooser_rx = None;
+                    } else {
+                        // Picker still running — keep repainting so we
+                        // notice the moment it returns.
+                        ctx.request_repaint_after(std::time::Duration::from_millis(150));
+                    }
+                }
+                let picker_busy = chooser_rx.is_some();
+
+                // File picker row
+                ui.label("File:");
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        egui::vec2(ui.available_width() - 110.0, 26.0),
+                        egui::TextEdit::singleline(path)
+                            .hint_text("path/to/passwort-vault-….json")
+                            .margin(egui::vec2(6.0, 4.0)),
+                    );
+                    let browse_label = if picker_busy { "Opening…" } else { "Browse…" };
+                    let browse_btn = egui::Button::new(browse_label);
+                    let resp = ui.add_enabled_ui(!picker_busy, |ui| {
+                        ui.add_sized(egui::vec2(100.0, 26.0), browse_btn)
+                    });
+                    if resp.inner.clicked() {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        let start_dir = std::env::var_os("HOME")
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|| std::path::PathBuf::from("."));
+                        std::thread::spawn(move || {
+                            // Shell out to `zenity` — installed on every
+                            // GNOME / Cinnamon / MATE system as part of the
+                            // base. It's a tiny, sync, native GTK dialog
+                            // that doesn't need an async runtime, doesn't
+                            // depend on xdg-desktop-portal being healthy,
+                            // and plays nicely with egui's own X11
+                            // connection. We run it in a worker thread so
+                            // the GUI stays responsive while the user
+                            // browses.
+                            use std::process::Command;
+                            let result: Result<Option<std::path::PathBuf>, String> =
+                                match Command::new("zenity")
+                                    .arg("--file-selection")
+                                    .arg("--title=Pick a passwort backup file")
+                                    .arg(format!(
+                                        "--filename={}/",
+                                        start_dir.display()
+                                    ))
+                                    .arg("--file-filter=Passwort backup | *.json")
+                                    .arg("--file-filter=All files | *")
+                                    .output()
+                                {
+                                    Ok(out) if out.status.success() => {
+                                        let s = String::from_utf8_lossy(&out.stdout)
+                                            .trim_end_matches(['\n', '\r'])
+                                            .to_string();
+                                        if s.is_empty() {
+                                            Ok(None)
+                                        } else {
+                                            Ok(Some(std::path::PathBuf::from(s)))
+                                        }
+                                    }
+                                    // zenity exits non-zero on cancel — that's fine.
+                                    Ok(_) => Ok(None),
+                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(
+                                        "zenity not installed (sudo apt install zenity). \
+                                         Paste the path manually for now."
+                                            .into(),
+                                    ),
+                                    Err(e) => Err(e.to_string()),
+                                };
+                            let _ = tx.send(result);
+                        });
+                        *chooser_rx = Some(rx);
+                    }
+                });
+                ui.add_space(10.0);
+
+                // Mode selector
+                ui.label("Mode:");
+                ui.horizontal(|ui| {
+                    ui.radio_value(merge, false, "Replace");
+                    ui.radio_value(merge, true, "Merge");
+                });
+                ui.colored_label(
+                    COLOR_MUTED,
+                    if *merge {
+                        "Add imported accounts to your current vault. \
+                         Existing entries with the same (name, username) are \
+                         overwritten by the imported value. Requires the \
+                         vault to be unlocked already (it is)."
+                    } else {
+                        "Wipe the current vault and use only the imported one. \
+                         Your current vault is backed up to vault.json.pre-import \
+                         first. The daemon will be locked; re-unlock with the \
+                         master password used at the time of export."
+                    },
+                );
+                ui.add_space(10.0);
+
+                ui.checkbox(
+                    apply_config,
+                    "Apply settings from bundle (if file is a bundle, not a raw vault)",
+                );
+                ui.add_space(10.0);
+
+                if *merge {
+                    ui.label("Master password for the imported file:");
+                    ui.colored_label(
+                        COLOR_MUTED,
+                        "If the export came from this machine, it's the same as your current one.",
+                    );
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::TextEdit::singleline(password)
+                            .password(!*show_password)
+                            .desired_width(f32::INFINITY)
+                            .margin(egui::vec2(8.0, 6.0)),
+                    );
+                    ui.checkbox(show_password, "Show password");
+                    ui.add_space(8.0);
+                }
+
+                ui.horizontal(|ui| {
+                    let go = egui::Button::new(
+                        egui::RichText::new(if *merge { "Merge" } else { "Replace" })
+                            .strong(),
+                    )
+                    .fill(COLOR_ACCENT)
+                    .min_size(egui::vec2(100.0, 28.0));
+                    if ui.add(go).clicked() {
+                        if path.trim().is_empty() {
+                            *out = Some(Err("Pick a file first.".into()));
+                        } else if *merge && password.is_empty() {
+                            *out = Some(Err("Master password required for merge.".into()));
+                        } else {
+                            *out = Some(do_import(
+                                session,
+                                path.trim(),
+                                *merge,
+                                *apply_config,
+                                password,
+                            ));
+                            password.zeroize();
+                            *password = String::new();
+                        }
+                    }
+                    if ui
+                        .add_sized(egui::vec2(80.0, 28.0), egui::Button::new("Cancel"))
+                        .clicked()
+                    {
+                        result = ModalResult::Close;
+                    }
+                });
+
+                if let Some(out) = out {
+                    ui.add_space(10.0);
+                    match out {
+                        Ok(msg) => ui.colored_label(COLOR_OK, msg.as_str()),
+                        Err(msg) => ui.colored_label(COLOR_ERROR, msg.as_str()),
+                    };
+                }
+            }
+            }
         });
 
     result
+}
+
+/// "Quick add 2FA" row: paste an `otpauth://` URI or import its QR image,
+/// and we fill in name / username / TOTP secret automatically. Used by
+/// both the Add and Edit modals. `scope` disambiguates the transient
+/// egui-memory keys so the two modals don't share a buffer.
+fn totp_quick_add_row(
+    ui: &mut egui::Ui,
+    scope: &str,
+    name: &mut String,
+    username: &mut String,
+    totp_secret: &mut String,
+) {
+    let uri_id = egui::Id::new(("totp_uri_buf", scope));
+    let status_id = egui::Id::new(("totp_status", scope));
+    let mut uri: String =
+        ui.data_mut(|d| d.get_temp::<String>(uri_id).unwrap_or_default());
+    let mut status: Option<(String, bool)> =
+        ui.data_mut(|d| d.get_temp::<(String, bool)>(status_id));
+
+    let apply = |text: &str,
+                 name: &mut String,
+                 username: &mut String,
+                 totp_secret: &mut String|
+     -> (String, bool) {
+        match crate::crypto::parse_otpauth_uri(text) {
+            Some(p) => {
+                *totp_secret = p.secret;
+                if name.trim().is_empty() {
+                    *name = if !p.issuer.is_empty() {
+                        p.issuer.clone()
+                    } else {
+                        p.account.clone()
+                    };
+                }
+                if username.trim().is_empty() && !p.account.is_empty() {
+                    *username = p.account.clone();
+                }
+                let warn = if p.nonstandard {
+                    " (note: site uses non-default algorithm/digits/period — codes may not match)"
+                } else {
+                    ""
+                };
+                (format!("Loaded 2FA secret{}", warn), p.nonstandard)
+            }
+            None => (
+                "Not a valid otpauth:// URI (need an otpauth://totp/… string or its QR)"
+                    .to_string(),
+                true,
+            ),
+        }
+    };
+
+    ui.colored_label(
+        COLOR_MUTED,
+        "Quick-add 2FA — paste the otpauth:// URI or import its QR image:",
+    );
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut uri)
+                .hint_text("otpauth://totp/Issuer:account?secret=…")
+                .desired_width(ui.available_width() - 190.0)
+                .margin(egui::vec2(6.0, 4.0)),
+        );
+        if ui.add_sized(egui::vec2(70.0, 24.0), egui::Button::new("Apply")).clicked()
+            && !uri.trim().is_empty()
+        {
+            status = Some(apply(uri.trim(), name, username, totp_secret));
+        }
+        if ui
+            .add_sized(egui::vec2(110.0, 24.0), egui::Button::new("QR image…"))
+            .clicked()
+        {
+            // Synchronous zenity pick. The native dialog is itself modal,
+            // so a brief main-window freeze while it's open is expected
+            // and fine. zenity returns promptly on pick/cancel.
+            use std::process::Command;
+            let start = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            match Command::new("zenity")
+                .arg("--file-selection")
+                .arg("--title=Pick a 2FA QR-code image")
+                .arg(format!("--filename={}/", start.display()))
+                .arg("--file-filter=Images | *.png *.jpg *.jpeg *.gif *.bmp *.webp")
+                .arg("--file-filter=All files | *")
+                .output()
+            {
+                Ok(out) if out.status.success() => {
+                    let p = String::from_utf8_lossy(&out.stdout)
+                        .trim_end_matches(['\n', '\r'])
+                        .to_string();
+                    if !p.is_empty() {
+                        match crate::qr::decode_file(std::path::Path::new(&p)) {
+                            Ok(text) => {
+                                status = Some(apply(
+                                    text.trim(),
+                                    name,
+                                    username,
+                                    totp_secret,
+                                ))
+                            }
+                            Err(e) => status = Some((e, true)),
+                        }
+                    }
+                }
+                Ok(_) => {} // cancelled
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    status = Some((
+                        "zenity not installed (sudo apt install zenity)".to_string(),
+                        true,
+                    ))
+                }
+                Err(e) => status = Some((e.to_string(), true)),
+            }
+        }
+    });
+    if let Some((msg, is_err)) = &status {
+        let color = if *is_err { COLOR_ERROR } else { COLOR_OK };
+        ui.colored_label(color, msg.as_str());
+    }
+
+    ui.data_mut(|d| {
+        d.insert_temp(uri_id, uri);
+        match &status {
+            Some(s) => d.insert_temp(status_id, s.clone()),
+            None => {}
+        }
+    });
+}
+
+/// Truncate `s` to at most `max` characters; if it's longer, keep the
+/// first `max - 1` chars and append "…". Counts unicode characters, not
+/// bytes, so multi-byte names don't break.
+fn truncate_chars(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{}\u{2026}", head)
+}
+
+/// Synchronous helper used by the Export modal. Mirrors `cmd_export` in
+/// ipc.rs but returns a Result the GUI can render without doing process exit.
+/// `with_config=true` writes a bundle (vault + config); false writes the
+/// raw EncryptedVault.
+fn do_export(with_config: bool) -> Result<std::path::PathBuf, String> {
+    let src = crate::storage::vault_path();
+    if !src.exists() {
+        return Err(format!("no vault to export at {}", src.display()));
+    }
+    let stamp = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    };
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let dest = home.join(format!(
+        "passwort-vault-{}{}.json",
+        stamp,
+        if with_config { "-bundle" } else { "" }
+    ));
+    if dest.exists() {
+        return Err(format!(
+            "refusing to overwrite existing file {}",
+            dest.display()
+        ));
+    }
+    if with_config {
+        let raw = std::fs::read_to_string(&src).map_err(|e| e.to_string())?;
+        let vault = crate::storage::parse_encrypted(&raw)
+            .ok_or_else(|| "current vault is not the expected format".to_string())?;
+        let cfg = app_config::load();
+        let json = crate::portable::serialize_bundle(&vault, Some(&cfg))
+            .map_err(|e| e.to_string())?;
+        std::fs::write(&dest, json).map_err(|e| e.to_string())?;
+    } else {
+        std::fs::copy(src, &dest).map_err(|e| e.to_string())?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(dest)
+}
+
+/// Synchronous helper used by the Import modal. Returns a human-readable
+/// success or error message.
+///
+/// In MERGE mode the daemon's already-unlocked session is mutated: we
+/// decrypt the imported vault with `password` and append every account
+/// whose (name, username) pair isn't already present. The current key is
+/// kept (not the imported file's key).
+///
+/// In REPLACE mode we write the imported encrypted vault verbatim to
+/// disk (same shape the daemon expects), back up the previous vault to
+/// `vault.json.pre-import`, and instruct the user to re-unlock.
+fn do_import(
+    session: &mut crate::session::Session,
+    path: &str,
+    merge: bool,
+    apply_config: bool,
+    password: &str,
+) -> Result<String, String> {
+    let data = std::fs::read_to_string(path).map_err(|e| format!("read failed: {}", e))?;
+    let parsed = crate::portable::parse(&data).ok_or_else(|| {
+        "file is not a valid passwort backup (neither a bundle nor a raw vault)".to_string()
+    })?;
+    let (vault, src_config) = match parsed {
+        crate::portable::Parsed::Bundle(b) => (b.vault, b.config),
+        crate::portable::Parsed::RawVault(v) => (v, None),
+    };
+
+    let mut messages: Vec<String> = Vec::new();
+
+    if merge {
+        let imported = crate::session::decrypt_accounts(&vault, password.as_bytes())
+            .map_err(|_| "wrong master password for the imported file".to_string())?;
+        match session.merge_accounts(imported) {
+            Ok((added, skipped)) => messages.push(format!(
+                "Merged: {} added, {} skipped (duplicates by name + username).",
+                added, skipped
+            )),
+            Err(e) => return Err(format!("merge save failed: {}", e)),
+        }
+    } else {
+        let dest = crate::storage::vault_path();
+        if dest.exists() {
+            let mut backup_os = dest.as_os_str().to_owned();
+            backup_os.push(".pre-import");
+            let backup = std::path::PathBuf::from(backup_os);
+            let _ = std::fs::remove_file(&backup);
+            std::fs::copy(dest, &backup).map_err(|e| format!("backup failed: {}", e))?;
+        } else if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let vault_json = serde_json::to_string_pretty(&vault).map_err(|e| e.to_string())?;
+        std::fs::write(dest, vault_json).map_err(|e| format!("write failed: {}", e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                dest,
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
+        messages.push(
+            "Vault replaced. Close & reopen the app, then unlock with the imported file's master password."
+                .to_string(),
+        );
+    }
+
+    if apply_config {
+        match src_config {
+            Some(cfg) => {
+                app_config::save(&cfg).map_err(|e| format!("config write failed: {}", e))?;
+                messages.push("Settings applied (hotkeys + HIBP toggle).".to_string());
+            }
+            None => messages.push(
+                "(no config in the file — \"Apply settings\" was ignored.)".to_string(),
+            ),
+        }
+    }
+
+    Ok(messages.join(" "))
 }
 
 fn egui_key_to_config_key(k: egui::Key) -> Option<String> {

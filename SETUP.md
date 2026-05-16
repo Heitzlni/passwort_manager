@@ -129,7 +129,36 @@ The hotkey is configurable in `~/.config/passwort-manager/config.json`:
 
 Valid modifiers: `ctrl`, `alt`, `shift`, `super`. Valid keys: `a`–`z`, `0`–`9`, `f1`–`f12`, `space`, `enter`. The helper polls the file every 2 s, so changes apply without a restart.
 
-**Wayland note:** `passwort-autotype` uses X11 APIs for hotkey listening and `xdotool` for typing. On Wayland sessions neither works reliably. Use an X11 session if you need auto-type.
+### Wayland setup (auto-type)
+
+X11 sessions: nothing extra to do — `passwort-autotype` registers Ctrl+Alt+P (and Ctrl+Alt+S for "save credential from active app") as global hotkeys at login.
+
+Wayland sessions: there's no portable cross-compositor global-hotkey API yet, so `passwort-autotype` exits cleanly at login with a help message and you wire up the hotkey yourself in your compositor's settings. Both pieces still work — just split:
+
+1. **Install `ydotool`** (kernel-level synthetic typing — works on every Wayland compositor):
+   ```sh
+   sudo apt install ydotool
+   ```
+2. **Let your user use `/dev/uinput`.** ydotoold ships as a system service that already runs as root on most distros, so this is usually already done; if `passwortctl fill` reports `couldn't reach ydotoold daemon`, run:
+   ```sh
+   sudo systemctl enable --now ydotool
+   ```
+   On distros where ydotoold runs as your user (rather than root), add yourself to the `input` group: `sudo usermod -aG input $USER`, then log out + back in.
+3. **Bind a hotkey in your compositor** to the standalone CLI commands the password manager exposes:
+   - **GNOME**: Settings → Keyboard → "View and Customize Shortcuts" → Custom Shortcuts → "+":
+     - Name: `Password Manager fill`
+     - Command: `/home/<user>/.local/bin/passwortctl fill`
+     - Shortcut: whatever you like (Ctrl+Alt+P matches the X11 default)
+   - **KDE**: System Settings → Shortcuts → Custom Shortcuts → Edit → New → Global Shortcut → Command/URL → same command path
+   - **Sway / Hyprland / River** (config-file based):
+     ```
+     bindsym Ctrl+Alt+p exec passwortctl fill
+     bindsym Ctrl+Alt+s exec passwortctl quick-save
+     ```
+
+Pressing the bound hotkey opens the picker; pick an entry, hit Enter, and `ydotool` types `<username><Tab><password>` into whatever was focused before. Skip step 3 entirely if you only ever use the browser extension — that path doesn't need any of this.
+
+**Limitations on Wayland:** the compositor doesn't expose the active window's title to non-privileged apps, so the X11-only "fast path" (auto-pick by window title) is disabled. The picker always shows; pick an entry and continue.
 
 ## Building a release tarball yourself
 

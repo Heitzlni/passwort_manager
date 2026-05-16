@@ -90,7 +90,19 @@ async function refresh() {
 // like Google's two-step page). We fill password and/or username
 // independently — many real login flows show only one at a time. We never
 // overwrite typed input, and we never overwrite the same field twice.
+//
+// Hard rule: we only auto-fill on https://. On http:// (and anything else)
+// the page can be silently MITM'd and the filled password sniffed off the
+// wire. localhost is allowed for dev/intranet use. The user can still fill
+// manually by clicking the badge — that's an explicit consent.
+function isAutofillSafeOrigin() {
+    if (location.protocol === "https:") return true;
+    const h = location.hostname;
+    return h === "localhost" || h === "127.0.0.1" || h === "::1";
+}
+
 async function maybeAutofill() {
+    if (!isAutofillSafeOrigin()) return;
     if (STATE.matches.length !== 1) return;
     const match = STATE.matches[0];
 
