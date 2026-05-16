@@ -661,6 +661,14 @@ enum Modal {
         /// Set once the import is committed: Ok(count) or Err(message).
         done: Option<Result<usize, String>>,
     },
+    /// Shown right after unlock when the browser extension stashed
+    /// credentials while the vault was locked. The user must explicitly
+    /// keep or discard them — inbox writes are unauthenticated, so
+    /// nothing is merged without review.
+    ReviewCaptures {
+        captures: Vec<crate::inbox::Capture>,
+        done: Option<Result<usize, String>>,
+    },
 }
 
 #[derive(Default)]
@@ -752,6 +760,14 @@ impl Drop for Modal {
                         e.username.zeroize();
                         e.notes.zeroize();
                     }
+                }
+            }
+            Modal::ReviewCaptures { captures, .. } => {
+                for c in captures {
+                    c.password.zeroize();
+                    c.totp_secret.zeroize();
+                    c.username.zeroize();
+                    c.notes.zeroize();
                 }
             }
         }
@@ -1030,10 +1046,11 @@ fn render_setup(
                 Ok(s) => {
                     error.clear();
                     *info = "Vault created.".to_string();
+                    let cap_modal = post_unlock_modal(&s);
                     next = Some(Screen::Main {
                         session: s,
                         selected: None,
-                        modal: None,
+                        modal: cap_modal,
                         reveal_password: false,
                     });
                 }
@@ -1073,10 +1090,11 @@ fn render_login(
                 password.zeroize();
                 error.clear();
                 *info = "Unlocked.".to_string();
+                let cap_modal = post_unlock_modal(&s);
                 next = Some(Screen::Main {
                     session: s,
                     selected: None,
-                    modal: None,
+                    modal: cap_modal,
                     reveal_password: false,
                 });
             }
@@ -1124,10 +1142,11 @@ fn render_legacy_login(
                 password.zeroize();
                 error.clear();
                 *info = "Unlocked. Vault upgraded.".to_string();
+                let cap_modal = post_unlock_modal(&s);
                 next = Some(Screen::Main {
                     session: s,
                     selected: None,
-                    modal: None,
+                    modal: cap_modal,
                     reveal_password: false,
                 });
             }
@@ -1789,6 +1808,29 @@ enum ModalResult {
     Replace(Box<Modal>),
 }
 
+/// Run right after a successful unlock: ensure the locked-capture
+/// keypair exists (created on first unlock, refreshed if the master
+/// password changed), and if the browser extension stashed credentials
+/// while the vault was locked, surface them as a mandatory review
+/// modal. Returns `None` when there's nothing to review.
+fn post_unlock_modal(session: &Session) -> Option<Modal> {
+    let _ = crate::inbox::ensure_keypair(&*session.key);
+    if !crate::inbox::has_pending() {
+        return None;
+    }
+    match crate::inbox::open_all(&*session.key) {
+        Ok(caps) if !caps.is_empty() => Some(Modal::ReviewCaptures {
+            captures: caps,
+            done: None,
+        }),
+        // Empty or undecryptable — nothing to act on; tidy the file.
+        _ => {
+            let _ = crate::inbox::clear();
+            None
+        }
+    }
+}
+
 fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -> ModalResult {
     let mut result = ModalResult::Keep;
     let title = match modal {
@@ -1803,6 +1845,7 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
         Modal::Tokens => "Authenticator — 2FA codes",
         Modal::Health => "Vault health",
         Modal::ImportForeign { .. } => "Import from another manager",
+        Modal::ReviewCaptures { .. } => "Captured while locked — review",
     };
 
     // Audit + Import + Tokens want more horizontal room when there's room
@@ -1811,6 +1854,7 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
         Modal::Audit { .. } => 620.0,
         Modal::Health => 560.0,
         Modal::ImportForeign { .. } => 560.0,
+        Modal::ReviewCaptures { .. } => 560.0,
         Modal::Import { .. } => 500.0,
         Modal::Tokens => 440.0,
         _ => 360.0,
@@ -3249,6 +3293,114 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                         }
                     }
                 }
+            }
+
+            Modal::ReviewCaptures { captures, done } => {
+                if let Some(outcome) = done {
+                    match outcome {
+                        Ok(n) => ui.colored_label(
+                            COLOR_OK,
+                            format!("Added {} captured account(s) to the vault.", n),
+                        ),
+                        Err(e) => ui.colored_label(
+                            COLOR_ERROR,
+                            format!("Could not add: {}", e),
+                        ),
+                    };
+                    ui.add_space(12.0);
+                    if ui
+                        .add_sized(egui::vec2(80.0, 28.0), egui::Button::new("Close"))
+                        .clicked()
+                    {
+                        result = ModalResult::Close;
+                    }
+                    return;
+                }
+
+                ui.colored_label(
+                    COLOR_MUTED,
+                    "The browser extension stashed these while the vault was \
+                     locked. Anything that can reach the daemon can drop an \
+                     entry here, so review before keeping them.",
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} captured credential(s)",
+                        captures.len()
+                    ))
+                    .strong(),
+                );
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        for c in captures.iter() {
+                            ui.horizontal(|ui| {
+                                ui.label(truncate_chars(&c.name, 30));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(
+                                        egui::Align::Center,
+                                    ),
+                                    |ui| {
+                                        if !c.username.is_empty() {
+                                            ui.colored_label(
+                                                COLOR_MUTED,
+                                                truncate_chars(&c.username, 26),
+                                            );
+                                        }
+                                    },
+                                );
+                            });
+                            if !c.url.is_empty() {
+                                ui.colored_label(
+                                    COLOR_MUTED,
+                                    format!("    {}", truncate_chars(&c.url, 48)),
+                                );
+                            }
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.colored_label(
+                    COLOR_MUTED,
+                    "Passwords aren't shown. \"Keep\" merges them as new \
+                     entries; \"Discard\" deletes the inbox unread.",
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let n = captures.len();
+                    let keep = egui::Button::new(
+                        egui::RichText::new(format!("Keep all {}", n)).strong(),
+                    )
+                    .fill(COLOR_ACCENT)
+                    .min_size(egui::vec2(140.0, 28.0));
+                    if ui.add(keep).clicked() {
+                        let accounts = captures
+                            .iter()
+                            .cloned()
+                            .map(crate::storage::Account::from);
+                        match session.add_accounts(accounts) {
+                            Ok(added) => {
+                                let _ = crate::inbox::clear();
+                                *done = Some(Ok(added));
+                            }
+                            Err(e) => *done = Some(Err(e.to_string())),
+                        }
+                    }
+                    if ui
+                        .add_sized(
+                            egui::vec2(110.0, 28.0),
+                            egui::Button::new("Discard all"),
+                        )
+                        .on_hover_text("Delete the captured items without saving")
+                        .clicked()
+                    {
+                        let _ = crate::inbox::clear();
+                        result = ModalResult::CloseWithInfo(
+                            "Discarded captured credentials.".to_string(),
+                        );
+                    }
+                });
             }
 
             Modal::Import {

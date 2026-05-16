@@ -25,6 +25,32 @@ async function rpc(payload) {
     }
 }
 
+// Save a credential. If the vault is locked, fall back to the sealed
+// "save while locked" inbox instead of bouncing the user to the unlock
+// form. Returns { kind: "ok" } on a normal save, { kind: "stashed" }
+// when queued for review at next unlock, or the raw error response.
+async function persistCredential({ name, url, username, password, totp, notes }) {
+    const r = await rpc({
+        op: "save",
+        name,
+        username: username || "",
+        password,
+    });
+    if (r.kind === "error" && r.code === "locked") {
+        const r2 = await rpc({
+            op: "save_locked",
+            name,
+            url: url || "",
+            username: username || "",
+            password,
+            totp_secret: totp || "",
+            notes: notes || "",
+        });
+        return r2.kind === "ok" ? { kind: "stashed" } : r2;
+    }
+    return r;
+}
+
 async function listCaptured() {
     try {
         return await browser.runtime.sendMessage({ type: "list_captured" });
@@ -224,9 +250,9 @@ async function renderUnlocked() {
             "button",
             {
                 onclick: async () => {
-                    const r = await rpc({
-                        op: "save",
+                    const r = await persistCredential({
                         name: capturedForOrigin.origin,
+                        url: origin ? "https://" + origin : "",
                         username: capturedForOrigin.username || "",
                         password: capturedForOrigin.password,
                     });
@@ -234,8 +260,14 @@ async function renderUnlocked() {
                         await discardCaptured(capturedForOrigin.origin);
                         showInfo(`Saved "${capturedForOrigin.origin}".`);
                         refresh();
+                    } else if (r.kind === "stashed") {
+                        await discardCaptured(capturedForOrigin.origin);
+                        showInfo(
+                            `Vault locked — stashed "${capturedForOrigin.origin}". ` +
+                                `It'll appear for review next time you unlock the app.`
+                        );
+                        refresh();
                     } else {
-                        await maybeHandleLocked(r);
                         showError(r.message || "save failed");
                     }
                 },
@@ -354,9 +386,9 @@ async function renderUnlocked() {
             onclick: async () => {
                 if (!nameInput.value) return showError("name required");
                 if (!pwInput.value) return showError("password required");
-                const r = await rpc({
-                    op: "save",
+                const r = await persistCredential({
                     name: nameInput.value,
+                    url: origin ? "https://" + origin : "",
                     username: userInput.value || "",
                     password: pwInput.value,
                 });
@@ -364,8 +396,13 @@ async function renderUnlocked() {
                 if (r.kind === "ok") {
                     showInfo(`Saved "${nameInput.value}".`);
                     refresh();
+                } else if (r.kind === "stashed") {
+                    showInfo(
+                        `Vault locked — stashed "${nameInput.value}". ` +
+                            `It'll appear for review next time you unlock the app.`
+                    );
+                    refresh();
                 } else {
-                    await maybeHandleLocked(r);
                     showError(r.message || "save failed");
                 }
             },

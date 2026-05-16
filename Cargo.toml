@@ -26,3 +26,7 @@ sha1 = "0.10"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
 rqrr = "0.7"
 ureq = { version = "2", default-features = false, features = ["tls"] }
+# Asymmetric sealing for the "save while locked" inbox: a locked daemon
+# (no master key) can encrypt a capture to the public key; only an
+# unlocked session holds the secret. Symmetric layer reuses aes-gcm.
+x25519-dalek = { version = "2", features = ["static_secrets"] }

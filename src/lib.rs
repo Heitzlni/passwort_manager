@@ -7,6 +7,7 @@ pub mod gui;
 pub mod health;
 pub mod hibp;
 pub mod importers;
+pub mod inbox;
 pub mod ipc;
 pub mod native_host;
 pub mod portable;

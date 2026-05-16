@@ -91,6 +91,22 @@ pub enum Request {
         username: String,
         password: String,
     },
+    /// Save a captured credential while the vault is LOCKED. Sealed to
+    /// the inbox public key and queued; surfaced for review the next
+    /// time the vault is unlocked in the GUI. Requires an approved
+    /// client but no session. Fields mirror an account.
+    SaveLocked {
+        name: String,
+        #[serde(default)]
+        url: String,
+        #[serde(default)]
+        username: String,
+        password: String,
+        #[serde(default)]
+        totp_secret: String,
+        #[serde(default)]
+        notes: String,
+    },
     /// Deletes the account with the given name.
     Delete { name: String },
     /// Returns the current TOTP code for an account (computed daemon-side
@@ -657,6 +673,15 @@ fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
             }
             // Wipe the deserialized password regardless of which branch ran.
             password.zeroize();
+            // On a fresh unlock, make sure the locked-capture keypair
+            // exists (generates it on first ever unlock; regenerates +
+            // clears a stale inbox if the master password changed). Best
+            // effort — a failure here must not block unlocking.
+            if matches!(resp, Response::Ok) {
+                if let Some(se) = s.session.as_ref() {
+                    let _ = crate::inbox::ensure_keypair(&*se.key);
+                }
+            }
             resp
         }
 
@@ -810,6 +835,49 @@ fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
                             Response::Ok
                         }
                         Err(e) => error(codes::IO_ERROR, e.to_string()),
+                    }
+                }
+            }
+        }
+
+        Request::SaveLocked {
+            name,
+            url,
+            username,
+            password,
+            totp_secret,
+            notes,
+        } => {
+            // No session needed: this is the locked-vault drop box. The
+            // capture is sealed to the inbox public key on disk and
+            // queued for review at the next GUI unlock.
+            let captured_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs().to_string())
+                .unwrap_or_default();
+            let cap = crate::inbox::Capture {
+                name,
+                url,
+                username,
+                password,
+                totp_secret,
+                notes,
+                captured_at,
+            };
+            match crate::inbox::append_sealed(&cap) {
+                Ok(()) => Response::Ok,
+                Err(e) => {
+                    let kind = e.to_string();
+                    // Most likely cause: the vault has never been
+                    // unlocked, so no keypair exists yet.
+                    if kind.contains("inbox.pub") {
+                        error(
+                            codes::LOCKED,
+                            "Locked-capture isn't initialized yet — unlock the \
+                             vault once so the inbox key can be created.",
+                        )
+                    } else {
+                        error(codes::IO_ERROR, kind)
                     }
                 }
             }
