@@ -23,6 +23,11 @@ pub struct Account {
     /// Codes are derived on the fly via `crypto::totp_code`.
     #[serde(default)]
     pub totp_secret: String,
+    /// Free-text notes — recovery/backup codes, PINs, security-question
+    /// answers. Encrypted with everything else. `#[serde(default)]` keeps
+    /// pre-notes vault files readable.
+    #[serde(default)]
+    pub notes: String,
 }
 
 #[derive(Serialize, Deserialize)]

@@ -93,6 +93,10 @@ pub enum Request {
     },
     /// Deletes the account with the given name.
     Delete { name: String },
+    /// Returns the current TOTP code for an account (computed daemon-side
+    /// so the secret never leaves the daemon — the browser only ever sees
+    /// the 6 digits + seconds remaining).
+    Totp { name: String },
     /// Check a single saved entry against HIBP "Pwned Passwords"
     /// (k-anonymity API). Daemon-side, so the password never leaves the
     /// daemon — only the SHA-1 prefix is sent to the API.
@@ -129,6 +133,11 @@ pub enum Response {
     },
     Entries {
         entries: Vec<EntryRef>,
+    },
+    /// Current TOTP code + seconds left in its 30s window.
+    Totp {
+        code: String,
+        remaining: u64,
     },
     Credential {
         name: String,
@@ -185,6 +194,8 @@ pub mod codes {
     pub const CLIENT_PENDING: &str = "client_pending";
     pub const RATE_LIMITED: &str = "rate_limited";
     pub const HIBP_DISABLED: &str = "hibp_disabled";
+    pub const NO_TOTP: &str = "no_totp";
+    pub const BAD_TOTP: &str = "bad_totp";
 }
 
 fn error(code: &str, message: impl Into<String>) -> Response {
@@ -709,6 +720,32 @@ fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
             }
         }
 
+        Request::Totp { name } => {
+            let mut s = state.lock().unwrap();
+            match s.session.as_ref() {
+                None => locked_error(),
+                Some(sess) => match sess.accounts.iter().find(|a| a.name == name) {
+                    Some(acc) => {
+                        if acc.totp_secret.is_empty() {
+                            error(codes::NO_TOTP, "this account has no 2FA secret")
+                        } else {
+                            match crate::crypto::totp_code(&acc.totp_secret) {
+                                Some((code, remaining)) => {
+                                    s.last_activity = Instant::now();
+                                    Response::Totp { code, remaining }
+                                }
+                                None => error(
+                                    codes::BAD_TOTP,
+                                    "stored 2FA secret is not valid Base32",
+                                ),
+                            }
+                        }
+                    }
+                    None => error(codes::NOT_FOUND, "not found"),
+                },
+            }
+        }
+
         Request::Save {
             name,
             username,
@@ -751,9 +788,9 @@ fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
                     };
 
                     let result = if let Some(idx) = exact.or(fallback) {
-                        sess.edit_account(idx, None, None, Some(password), None)
+                        sess.edit_account(idx, None, None, Some(password), None, None)
                     } else {
-                        sess.add_account(name, username, password, String::new())
+                        sess.add_account(name, username, password, String::new(), String::new())
                     };
                     match result {
                         Ok(_) => {
@@ -1078,6 +1115,13 @@ pub fn run_ctl() -> std::io::Result<()> {
                 .ok_or_else(|| usage_err("pwned <name>"))?;
             Request::PwnedOne { name }
         }
+        "totp" => {
+            let name = args
+                .get(2)
+                .cloned()
+                .ok_or_else(|| usage_err("totp <name>"))?;
+            Request::Totp { name }
+        }
         "audit" => Request::PwnedAll,
         _ => {
             print_usage();
@@ -1134,6 +1178,9 @@ pub fn run_ctl() -> std::io::Result<()> {
                     }
                 }
             }
+        }
+        Response::Totp { code, remaining } => {
+            println!("{}\t{}s", code, remaining);
         }
         Response::Credential {
             name,
@@ -1502,6 +1549,7 @@ fn print_usage() {
     eprintln!("    pwned <name>        Check ONE entry's password against haveibeenpwned.com");
     eprintln!("                        (k-anonymous, only a 5-char hash prefix is sent)");
     eprintln!("    audit               Check ALL entries' passwords. Exit code 4 if any breached.");
+    eprintln!("    totp <name>         Print the current 2FA code + seconds remaining.");
     eprintln!();
     eprintln!("    fill                Open the picker, then type the chosen credential into");
     eprintln!("                        the focused window (autotype). Bind your compositor");

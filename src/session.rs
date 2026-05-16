@@ -167,6 +167,7 @@ pub fn login_legacy(legacy: &LegacyVerifierVault, password: &[u8]) -> Result<Ses
             username: old.username.clone(),
             password: (*plain).clone(),
             totp_secret: old.totp_secret.clone(),
+            notes: old.notes.clone(),
         });
     }
 
@@ -194,12 +195,14 @@ impl Session {
         username: String,
         password: String,
         totp_secret: String,
+        notes: String,
     ) -> std::io::Result<()> {
         self.accounts.push(Account {
             name,
             username,
             password,
             totp_secret,
+            notes,
         });
         if let Err(e) = persist(self) {
             self.accounts.pop();
@@ -215,6 +218,7 @@ impl Session {
         new_username: Option<String>,
         new_password: Option<String>,
         new_totp_secret: Option<String>,
+        new_notes: Option<String>,
     ) -> std::io::Result<()> {
         if idx >= self.accounts.len() {
             return Err(std::io::Error::new(
@@ -235,6 +239,10 @@ impl Session {
         if let Some(t) = new_totp_secret {
             self.accounts[idx].totp_secret.zeroize();
             self.accounts[idx].totp_secret = t;
+        }
+        if let Some(nt) = new_notes {
+            self.accounts[idx].notes.zeroize();
+            self.accounts[idx].notes = nt;
         }
         if let Some(p) = new_password {
             self.accounts[idx].password.zeroize();

@@ -147,7 +147,7 @@ fn add_account(session: &mut Session) {
     }
     let username = read_input("Enter username (leave empty for none): ");
     let password = read_password("Enter password: ");
-    match session.add_account(name, username, password.to_string(), String::new()) {
+    match session.add_account(name, username, password.to_string(), String::new(), String::new()) {
         Ok(_) => println!("\nAccount added successfully.\n"),
         Err(e) => eprintln!("Failed to save: {}", e),
     }
@@ -198,7 +198,7 @@ fn edit_account(session: &mut Session) {
         Some(new_password.to_string())
     };
 
-    match session.edit_account(idx, name_opt, user_opt, pw_opt, None) {
+    match session.edit_account(idx, name_opt, user_opt, pw_opt, None, None) {
         Ok(_) => println!("\nAccount updated.\n"),
         Err(e) => eprintln!("Failed to save: {}", e),
     }

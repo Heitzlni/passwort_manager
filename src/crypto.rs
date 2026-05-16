@@ -107,12 +107,22 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// We bypass `TOTP::new`'s 128-bit minimum-length validation because some
 /// short test/demo secrets that real users paste in are still useful;
 /// browsers / authenticator apps don't enforce it either.
+/// Normalize a Base32 TOTP secret for the strict decoder: uppercase,
+/// drop spaces / dashes (services often display `abcd efgh` or
+/// `ABCD-EFGH-…`), and strip `=` padding (RFC4648-no-padding decode
+/// rejects it). Base32 is case-insensitive, but the decoder is not — so
+/// a lowercase secret from a QR/issuer would otherwise fail with the
+/// misleading "Invalid TOTP secret" error.
+pub fn normalize_b32_secret(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace() && *c != '-' && *c != '=')
+        .flat_map(|c| c.to_uppercase())
+        .collect()
+}
+
 pub fn totp_code(b32_secret: &str) -> Option<(String, u64)> {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let cleaned: String = b32_secret
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
+    let cleaned = normalize_b32_secret(b32_secret);
     if cleaned.is_empty() {
         return None;
     }
@@ -188,7 +198,7 @@ pub fn parse_otpauth_uri(uri: &str) -> Option<OtpauthParams> {
             _ => {}
         }
     }
-    let secret: String = secret.chars().filter(|c| !c.is_whitespace()).collect();
+    let secret = normalize_b32_secret(&secret);
     if secret.is_empty() {
         return None;
     }
@@ -297,6 +307,31 @@ mod tests {
             "otpauth://totp/x?secret=JBSW%20Y3DP%20EHPK%203PXP",
         )
         .unwrap();
+        assert_eq!(p.secret, "JBSWY3DPEHPK3PXP");
+    }
+
+    #[test]
+    fn normalize_handles_lowercase_padding_dashes() {
+        assert_eq!(normalize_b32_secret("jbswy3dpehpk3pxp"), "JBSWY3DPEHPK3PXP");
+        assert_eq!(normalize_b32_secret("JBSW-Y3DP-EHPK-3PXP"), "JBSWY3DPEHPK3PXP");
+        assert_eq!(normalize_b32_secret("JBSWY3DP====="), "JBSWY3DP");
+        assert_eq!(normalize_b32_secret(" jb sw y3 dp "), "JBSWY3DP");
+    }
+
+    #[test]
+    fn totp_code_accepts_lowercase_secret() {
+        // Same secret, different case → must produce a code (not None).
+        let upper = totp_code("JBSWY3DPEHPK3PXP");
+        let lower = totp_code("jbswy3dpehpk3pxp");
+        assert!(upper.is_some());
+        assert!(lower.is_some());
+        // And the same code, since it's the same key.
+        assert_eq!(upper.unwrap().0, lower.unwrap().0);
+    }
+
+    #[test]
+    fn parse_otpauth_normalizes_lowercase_secret() {
+        let p = parse_otpauth_uri("otpauth://totp/x?secret=jbswy3dpehpk3pxp").unwrap();
         assert_eq!(p.secret, "JBSWY3DPEHPK3PXP");
     }
 

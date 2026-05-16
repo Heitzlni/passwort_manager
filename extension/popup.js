@@ -291,6 +291,15 @@ async function renderUnlocked() {
                 },
                 "Pwned?"
             );
+            const totpBtn = el(
+                "button",
+                {
+                    class: "ghost small",
+                    title: "Get the current 2FA code: copies it and fills it into the page's code field if there is one",
+                    onclick: () => useTotp(tab, entry.name),
+                },
+                "2FA"
+            );
             const label = entry.username
                 ? el(
                       "span",
@@ -301,7 +310,7 @@ async function renderUnlocked() {
                   )
                 : el("span", { class: "name" }, entry.name);
             root.appendChild(
-                el("div", { class: "account" }, label, fillBtn, copyBtn, pwnedBtn)
+                el("div", { class: "account" }, label, fillBtn, copyBtn, pwnedBtn, totpBtn)
             );
         }
     }
@@ -417,6 +426,45 @@ async function renderUnlocked() {
                 "Audit all"
             )
         )
+    );
+}
+
+// Fetch the current 2FA code (computed by the daemon — the secret never
+// reaches the browser), copy it to the clipboard, and try to fill it into
+// a one-time-code field on the page if there is one.
+async function useTotp(tab, name) {
+    const r = await rpc({ op: "totp", name });
+    if (r.kind === "error") {
+        if (r.code === "no_totp") {
+            return showError(`"${name}" has no 2FA secret saved.`);
+        }
+        if (await maybeHandleLocked(r)) return;
+        return showError(r.message || "could not get 2FA code");
+    }
+    if (r.kind !== "totp") return showError("unexpected response");
+    const pretty =
+        r.code.length === 6 ? `${r.code.slice(0, 3)} ${r.code.slice(3)}` : r.code;
+    try {
+        await navigator.clipboard.writeText(r.code);
+    } catch {
+        /* clipboard may be blocked; the fill path below still works */
+    }
+    let filled = false;
+    if (tab) {
+        try {
+            const resp = await browser.tabs.sendMessage(tab.id, {
+                type: "fill_totp",
+                code: r.code,
+            });
+            filled = !!(resp && resp.filled);
+        } catch {
+            /* no content script on this page (e.g. about:) — copy still done */
+        }
+    }
+    showInfo(
+        `2FA ${pretty} — ${r.remaining}s left. ${
+            filled ? "Filled on page and copied." : "Copied to clipboard."
+        }`
     );
 }
 

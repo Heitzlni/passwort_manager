@@ -572,6 +572,7 @@ enum Modal {
         username: String,
         password: String,
         totp_secret: String,
+        notes: String,
         show_password: bool,
     },
     Edit {
@@ -580,6 +581,7 @@ enum Modal {
         username: String,
         password: String,
         totp_secret: String,
+        notes: String,
         show_password: bool,
         original_name: String,
     },
@@ -662,18 +664,21 @@ impl Drop for Modal {
                 username,
                 password,
                 totp_secret,
+                notes,
                 ..
             } => {
                 name.zeroize();
                 username.zeroize();
                 password.zeroize();
                 totp_secret.zeroize();
+                notes.zeroize();
             }
             Modal::Edit {
                 name,
                 username,
                 password,
                 totp_secret,
+                notes,
                 original_name,
                 ..
             } => {
@@ -681,6 +686,7 @@ impl Drop for Modal {
                 username.zeroize();
                 password.zeroize();
                 totp_secret.zeroize();
+                notes.zeroize();
                 original_name.zeroize();
             }
             Modal::DeleteConfirm { name, .. } => {
@@ -1191,17 +1197,42 @@ impl App {
                         username: String::new(),
                         password: String::new(),
                         totp_secret: String::new(),
+                        notes: String::new(),
                         show_password: false,
                     });
                 }
 
                 ui.add_space(10.0);
+                // Search box. Filter string lives in egui temp memory so
+                // it survives frames without threading another field
+                // through Screen::Main and its constructors.
+                let filter_id = egui::Id::new("account_filter");
+                let mut filter: String =
+                    ui.data_mut(|d| d.get_temp(filter_id).unwrap_or_default());
+                let fr = ui.add(
+                    egui::TextEdit::singleline(&mut filter)
+                        .hint_text("Search…")
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::vec2(6.0, 4.0)),
+                );
+                if fr.changed() {
+                    ui.data_mut(|d| d.insert_temp(filter_id, filter.clone()));
+                }
+                let needle = filter.trim().to_lowercase();
+                let matches = |a: &crate::storage::Account| -> bool {
+                    needle.is_empty()
+                        || a.name.to_lowercase().contains(&needle)
+                        || a.username.to_lowercase().contains(&needle)
+                };
+                let shown = session.accounts.iter().filter(|a| matches(a)).count();
+                ui.add_space(6.0);
                 ui.colored_label(
                     COLOR_MUTED,
-                    egui::RichText::new(format!(
-                        "ACCOUNTS  ({})",
-                        session.accounts.len()
-                    ))
+                    egui::RichText::new(if needle.is_empty() {
+                        format!("ACCOUNTS  ({})", session.accounts.len())
+                    } else {
+                        format!("ACCOUNTS  ({}/{})", shown, session.accounts.len())
+                    })
                     .small(),
                 );
                 ui.add_space(4.0);
@@ -1209,10 +1240,16 @@ impl App {
                 if session.accounts.is_empty() {
                     ui.add_space(12.0);
                     ui.colored_label(COLOR_MUTED, "No accounts yet.");
+                } else if shown == 0 {
+                    ui.add_space(12.0);
+                    ui.colored_label(COLOR_MUTED, "No matches.");
                 } else {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         for (i, account) in session.accounts.iter().enumerate() {
+                            if !matches(account) {
+                                continue;
+                            }
                             let is_sel = *selected == Some(i);
                             let label = egui::RichText::new(&account.name)
                                 .color(if is_sel {
@@ -1378,6 +1415,66 @@ impl App {
                             }
                         }
 
+                        if !account.notes.is_empty() {
+                            ui.add_space(20.0);
+                            let reveal_id =
+                                egui::Id::new(("notes_reveal", idx));
+                            let mut show_notes: bool = ui
+                                .data_mut(|d| d.get_temp(reveal_id))
+                                .unwrap_or(false);
+                            ui.horizontal(|ui| {
+                                ui.colored_label(COLOR_MUTED, "NOTES / RECOVERY CODES");
+                                if ui
+                                    .add_sized(
+                                        egui::vec2(60.0, 20.0),
+                                        egui::Button::new(if show_notes {
+                                            "Hide"
+                                        } else {
+                                            "Show"
+                                        }),
+                                    )
+                                    .clicked()
+                                {
+                                    show_notes = !show_notes;
+                                }
+                                if ui
+                                    .add_sized(
+                                        egui::vec2(60.0, 20.0),
+                                        egui::Button::new("Copy"),
+                                    )
+                                    .clicked()
+                                {
+                                    let _ = copy_to_clipboard(&account.notes);
+                                    *clipboard_clear_at =
+                                        Some(Instant::now() + CLIPBOARD_CLEAR);
+                                    *info =
+                                        "Notes copied (clipboard clears in 30s)."
+                                            .to_string();
+                                }
+                            });
+                            ui.add_space(4.0);
+                            if show_notes {
+                                let mut shown = account.notes.clone();
+                                egui::ScrollArea::vertical()
+                                    .max_height(120.0)
+                                    .show(ui, |ui| {
+                                        ui.add(
+                                            egui::TextEdit::multiline(&mut shown)
+                                                .interactive(false)
+                                                .desired_width(f32::INFINITY)
+                                                .font(egui::TextStyle::Monospace)
+                                                .margin(egui::vec2(8.0, 6.0)),
+                                        );
+                                    });
+                            } else {
+                                ui.colored_label(
+                                    COLOR_MUTED,
+                                    "(hidden — click Show)",
+                                );
+                            }
+                            ui.data_mut(|d| d.insert_temp(reveal_id, show_notes));
+                        }
+
                         ui.add_space(28.0);
                         ui.separator();
                         ui.add_space(14.0);
@@ -1393,6 +1490,7 @@ impl App {
                                     username: account.username.clone(),
                                     password: account.password.clone(),
                                     totp_secret: account.totp_secret.clone(),
+                                    notes: account.notes.clone(),
                                     show_password: false,
                                     original_name: account.name.clone(),
                                 });
@@ -1580,6 +1678,7 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                 username,
                 password,
                 totp_secret,
+                notes,
                 show_password,
             } => {
                 ui.colored_label(COLOR_MUTED, "Name (e.g. site / app)");
@@ -1626,6 +1725,15 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                         .desired_width(f32::INFINITY)
                         .margin(egui::vec2(8.0, 6.0)),
                 );
+                ui.add_space(8.0);
+                ui.colored_label(COLOR_MUTED, "Notes / recovery codes (optional)");
+                ui.add(
+                    egui::TextEdit::multiline(notes)
+                        .hint_text("2FA backup codes, PINs, security answers…")
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(3)
+                        .margin(egui::vec2(8.0, 6.0)),
+                );
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     let create = egui::Button::new(
@@ -1644,7 +1752,8 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                         let u = std::mem::take(username);
                         let p = std::mem::take(password);
                         let t = std::mem::take(totp_secret);
-                        match session.add_account(n, u, p, t) {
+                        let nt = std::mem::take(notes);
+                        match session.add_account(n, u, p, t, nt) {
                             Ok(_) => {
                                 result =
                                     ModalResult::CloseWithInfo("Account added.".to_string())
@@ -1672,6 +1781,7 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                 username,
                 password,
                 totp_secret,
+                notes,
                 show_password,
                 original_name,
             } => {
@@ -1724,6 +1834,15 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                         .desired_width(f32::INFINITY)
                         .margin(egui::vec2(8.0, 6.0)),
                 );
+                ui.add_space(8.0);
+                ui.colored_label(COLOR_MUTED, "Notes / recovery codes");
+                ui.add(
+                    egui::TextEdit::multiline(notes)
+                        .hint_text("2FA backup codes, PINs, security answers…")
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(3)
+                        .margin(egui::vec2(8.0, 6.0)),
+                );
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     let save = egui::Button::new(
@@ -1742,12 +1861,14 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                         let u = std::mem::take(username);
                         let p = std::mem::take(password);
                         let t = std::mem::take(totp_secret);
+                        let nt = std::mem::take(notes);
                         match session.edit_account(
                             *idx,
                             Some(n),
                             Some(u),
                             Some(p),
                             Some(t),
+                            Some(nt),
                         ) {
                             Ok(_) => {
                                 result =

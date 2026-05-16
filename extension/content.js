@@ -727,11 +727,65 @@ function installRuntimeListener() {
             return Promise.resolve({ password: pwField ? pwField.value || null : null });
         }
 
+        if (msg.type === "fill_totp") {
+            const field = findOtpField();
+            if (!field) {
+                return Promise.resolve({ filled: false, reason: "no 2FA field" });
+            }
+            setFieldValue(field, msg.code);
+            return Promise.resolve({ filled: true });
+        }
+
         if (msg.type === "vault_state_changed") {
             refresh();
             return Promise.resolve();
         }
     });
+}
+
+// Heuristic for "the one-time-code input" on a 2FA challenge page. Tries
+// the strong signal (autocomplete=one-time-code) first, then name/id
+// hints, then a lone short numeric input. Only returns visible fields.
+function findOtpField() {
+    const strong = document.querySelector('input[autocomplete="one-time-code"]');
+    if (strong && isVisible(strong)) return strong;
+
+    const hintSelectors = [
+        'input[name*="otp" i]',
+        'input[name*="totp" i]',
+        'input[name*="2fa" i]',
+        'input[name*="mfa" i]',
+        'input[name*="token" i]',
+        'input[name*="code" i]',
+        'input[id*="otp" i]',
+        'input[id*="totp" i]',
+        'input[id*="2fa" i]',
+        'input[id*="mfa" i]',
+        'input[id*="token" i]',
+        'input[id*="code" i]',
+        'input[aria-label*="code" i]',
+        'input[placeholder*="code" i]',
+    ];
+    for (const sel of hintSelectors) {
+        for (const el of document.querySelectorAll(sel)) {
+            if (!isVisible(el)) continue;
+            const t = (el.type || "text").toLowerCase();
+            if (t === "text" || t === "tel" || t === "number" || t === "") {
+                return el;
+            }
+        }
+    }
+
+    // Fallback: a single visible numeric-ish input that isn't a password
+    // or username (covers minimalist "enter your code" pages).
+    const candidates = [...document.querySelectorAll("input")].filter((el) => {
+        if (!isVisible(el)) return false;
+        const t = (el.type || "text").toLowerCase();
+        if (t === "password" || t === "email" || t === "hidden") return false;
+        const im = (el.getAttribute("inputmode") || "").toLowerCase();
+        return t === "tel" || t === "number" || im === "numeric" || t === "text";
+    });
+    return candidates.length === 1 ? candidates[0] : null;
 }
 
 // =================== mutation observer (SPA-injected fields) ===================
