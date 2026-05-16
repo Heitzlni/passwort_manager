@@ -68,6 +68,28 @@ function matchesHost(saved, host) {
     return s === h || h.endsWith("." + s);
 }
 
+// Hostname of a stored entry URL (bare hosts assumed https).
+function hostOf(urlStr) {
+    if (!urlStr) return "";
+    let s = String(urlStr).trim();
+    if (!s) return "";
+    if (!s.includes("://")) s = "https://" + s;
+    try {
+        return new URL(s).hostname.toLowerCase();
+    } catch {
+        return "";
+    }
+}
+
+// Prefer the entry's explicit URL; fall back to its name for
+// pre-url entries. Same host rule (exact or subdomain) either way.
+function entryMatchesHost(entry, host) {
+    if (!host) return false;
+    const urlHost = hostOf(entry.url);
+    if (urlHost) return matchesHost(urlHost, host);
+    return matchesHost(entry.name, host);
+}
+
 async function refresh() {
     closeMenu();
     removeAllBadges();
@@ -79,7 +101,7 @@ async function refresh() {
     }
     const list = await rpc({ op: "list_entries" });
     STATE.matches =
-        list.kind === "entries" ? list.entries.filter((e) => matchesHost(e.name, ORIGIN)) : [];
+        list.kind === "entries" ? list.entries.filter((e) => entryMatchesHost(e, ORIGIN)) : [];
     if (STATE.matches.length > 0) {
         decoratePasswordFields();
         await maybeAutofill();

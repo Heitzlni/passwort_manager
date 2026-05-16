@@ -569,6 +569,7 @@ enum HotkeySlot {
 enum Modal {
     Add {
         name: String,
+        url: String,
         username: String,
         password: String,
         totp_secret: String,
@@ -578,6 +579,7 @@ enum Modal {
     Edit {
         idx: usize,
         name: String,
+        url: String,
         username: String,
         password: String,
         totp_secret: String,
@@ -661,6 +663,7 @@ impl Drop for Modal {
         match self {
             Modal::Add {
                 name,
+                url,
                 username,
                 password,
                 totp_secret,
@@ -668,6 +671,7 @@ impl Drop for Modal {
                 ..
             } => {
                 name.zeroize();
+                url.zeroize();
                 username.zeroize();
                 password.zeroize();
                 totp_secret.zeroize();
@@ -675,6 +679,7 @@ impl Drop for Modal {
             }
             Modal::Edit {
                 name,
+                url,
                 username,
                 password,
                 totp_secret,
@@ -683,6 +688,7 @@ impl Drop for Modal {
                 ..
             } => {
                 name.zeroize();
+                url.zeroize();
                 username.zeroize();
                 password.zeroize();
                 totp_secret.zeroize();
@@ -727,6 +733,9 @@ struct App {
     error: String,
     info: String,
     clipboard_clear_at: Option<Instant>,
+    /// Last time the user touched the keyboard/mouse while unlocked.
+    /// Drives the optional GUI idle auto-lock (see Settings).
+    last_activity: Instant,
 }
 
 impl App {
@@ -757,6 +766,7 @@ impl App {
             error: String::new(),
             info: String::new(),
             clipboard_clear_at: None,
+            last_activity: Instant::now(),
         }
     }
 }
@@ -774,6 +784,28 @@ fn clear_clipboard() {
     }
 }
 
+/// Open a stored account URL in the user's default browser via
+/// `xdg-open`. A bare host (no scheme) is treated as https. The URL is
+/// passed as a single argv entry (no shell), so it can't be used for
+/// command injection. Failures are silent — best-effort convenience.
+fn open_url(raw: &str) {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return;
+    }
+    let target = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("https://{}", raw)
+    };
+    let _ = std::process::Command::new("xdg-open")
+        .arg(&target)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 // =================== eframe::App ===================
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -784,6 +816,51 @@ impl eframe::App for App {
                 self.info = "Clipboard cleared.".to_string();
             } else {
                 ctx.request_repaint_after(Duration::from_millis(500));
+            }
+        }
+
+        // GUI idle auto-lock (opt-in, configured in Settings). Guards the
+        // always-open window: after N minutes with no keyboard/mouse
+        // input, drop the session and fall back to the password prompt —
+        // the same transition the Lock button performs. Independent of
+        // the daemon's own PASSWORT_IDLE_TIMEOUT_SECS.
+        if matches!(self.screen, Screen::Main { .. }) {
+            let cfg = app_config::load();
+            if cfg.gui_autolock_enabled && cfg.gui_autolock_minutes > 0 {
+                let active = ctx.input(|i| {
+                    i.pointer.is_moving() || i.pointer.any_down() || !i.events.is_empty()
+                });
+                let now = Instant::now();
+                if active {
+                    self.last_activity = now;
+                }
+                let limit =
+                    Duration::from_secs(cfg.gui_autolock_minutes as u64 * 60);
+                let idle = now.saturating_duration_since(self.last_activity);
+                if idle >= limit {
+                    if let InitialState::NeedsLogin(vault) = session::initial_state() {
+                        self.screen = Screen::Login {
+                            vault,
+                            password: String::new(),
+                            attempts_left: MAX_LOGIN_ATTEMPTS,
+                        };
+                        self.error.clear();
+                        self.info = "Locked after inactivity.".to_string();
+                        // The user walked away — don't leave a copied
+                        // password sitting on the clipboard until its
+                        // 30 s timer would have fired.
+                        if self.clipboard_clear_at.take().is_some() {
+                            clear_clipboard();
+                        }
+                    }
+                } else {
+                    // egui only repaints on input; without scheduling a
+                    // wake-up the idle clock would never advance while
+                    // the user is actually away from the machine.
+                    ctx.request_repaint_after(
+                        (limit - idle).min(Duration::from_secs(20)),
+                    );
+                }
             }
         }
 
@@ -1060,6 +1137,8 @@ impl App {
             error,
             info,
             clipboard_clear_at,
+            // Idle tracking is handled in `update()`, before this runs.
+            last_activity: _,
         } = self;
 
         let (session, selected, modal, reveal) = match screen {
@@ -1202,6 +1281,7 @@ impl App {
                 if ui.add(new_btn).clicked() {
                     *modal = Some(Modal::Add {
                         name: String::new(),
+                        url: String::new(),
                         username: String::new(),
                         password: String::new(),
                         totp_secret: String::new(),
@@ -1341,6 +1421,25 @@ impl App {
                                 COLOR_MUTED,
                                 format!("Username: {}", account.username),
                             );
+                        }
+                        if !account.url.is_empty() {
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.colored_label(COLOR_MUTED, "URL:");
+                                ui.colored_label(COLOR_MUTED, account.url.as_str());
+                                if ui
+                                    .add_sized(
+                                        egui::vec2(60.0, 22.0),
+                                        egui::Button::new("Open"),
+                                    )
+                                    .on_hover_text(
+                                        "Open in your default browser",
+                                    )
+                                    .clicked()
+                                {
+                                    open_url(&account.url);
+                                }
+                            });
                         }
                         ui.add_space(20.0);
 
@@ -1495,6 +1594,7 @@ impl App {
                                 *modal = Some(Modal::Edit {
                                     idx,
                                     name: account.name.clone(),
+                                    url: account.url.clone(),
                                     username: account.username.clone(),
                                     password: account.password.clone(),
                                     totp_secret: account.totp_secret.clone(),
@@ -1719,6 +1819,7 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
             match modal {
             Modal::Add {
                 name,
+                url,
                 username,
                 password,
                 totp_secret,
@@ -1728,6 +1829,14 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                 ui.colored_label(COLOR_MUTED, "Name (e.g. site / app)");
                 ui.add(
                     egui::TextEdit::singleline(name)
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::vec2(8.0, 6.0)),
+                );
+                ui.add_space(8.0);
+                ui.colored_label(COLOR_MUTED, "URL (optional — used by the browser extension to match the site)");
+                ui.add(
+                    egui::TextEdit::singleline(url)
+                        .hint_text("https://example.com")
                         .desired_width(f32::INFINITY)
                         .margin(egui::vec2(8.0, 6.0)),
                 );
@@ -1793,11 +1902,12 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                             return;
                         }
                         let n = std::mem::take(name);
+                        let ul = std::mem::take(url);
                         let u = std::mem::take(username);
                         let p = std::mem::take(password);
                         let t = std::mem::take(totp_secret);
                         let nt = std::mem::take(notes);
-                        match session.add_account(n, u, p, t, nt) {
+                        match session.add_account(n, ul, u, p, t, nt) {
                             Ok(_) => {
                                 result =
                                     ModalResult::CloseWithInfo("Account added.".to_string())
@@ -1822,6 +1932,7 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
             Modal::Edit {
                 idx,
                 name,
+                url,
                 username,
                 password,
                 totp_secret,
@@ -1837,6 +1948,14 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                 ui.colored_label(COLOR_MUTED, "Name");
                 ui.add(
                     egui::TextEdit::singleline(name)
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::vec2(8.0, 6.0)),
+                );
+                ui.add_space(8.0);
+                ui.colored_label(COLOR_MUTED, "URL (used by the browser extension to match the site)");
+                ui.add(
+                    egui::TextEdit::singleline(url)
+                        .hint_text("https://example.com")
                         .desired_width(f32::INFINITY)
                         .margin(egui::vec2(8.0, 6.0)),
                 );
@@ -1902,6 +2021,7 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                             return;
                         }
                         let n = std::mem::take(name);
+                        let ul = std::mem::take(url);
                         let u = std::mem::take(username);
                         let p = std::mem::take(password);
                         let t = std::mem::take(totp_secret);
@@ -1909,6 +2029,7 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                         match session.edit_account(
                             *idx,
                             Some(n),
+                            Some(ul),
                             Some(u),
                             Some(p),
                             Some(t),
@@ -2252,6 +2373,67 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                         COLOR_MUTED,
                         "To check every entry at once, run:  passwortctl audit",
                     );
+
+                    // ---- GUI auto-lock ----
+                    ui.add_space(18.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("Auto-lock the window").strong(),
+                    );
+                    ui.colored_label(
+                        COLOR_MUTED,
+                        "Return to the password prompt after a period with no \
+                         keyboard or mouse activity — protects the open \
+                         window if you step away. Separate from the daemon's \
+                         own idle lock.",
+                    );
+                    ui.add_space(6.0);
+                    let mut cfg = app_config::load();
+                    let mut changed = ui
+                        .checkbox(
+                            &mut cfg.gui_autolock_enabled,
+                            "Lock the window after inactivity",
+                        )
+                        .changed();
+                    ui.add_enabled_ui(cfg.gui_autolock_enabled, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("After");
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(
+                                        &mut cfg.gui_autolock_minutes,
+                                    )
+                                    .clamp_range(1..=240)
+                                    .speed(0.2),
+                                )
+                                .changed();
+                            ui.label("minute(s) idle");
+                        });
+                    });
+                    if changed {
+                        match app_config::save(&cfg) {
+                            Ok(_) => {
+                                *message = Some((
+                                    if cfg.gui_autolock_enabled {
+                                        format!(
+                                            "Auto-lock on — {} min idle.",
+                                            cfg.gui_autolock_minutes
+                                        )
+                                    } else {
+                                        "Auto-lock off.".to_string()
+                                    },
+                                    false,
+                                ));
+                            }
+                            Err(e) => {
+                                *message = Some((
+                                    format!("Save failed: {}", e),
+                                    true,
+                                ));
+                            }
+                        }
+                    }
 
                     // ---- Toolbar buttons ----
                     ui.add_space(18.0);

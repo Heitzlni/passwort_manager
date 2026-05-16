@@ -111,6 +111,10 @@ pub enum Request {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EntryRef {
     pub name: String,
+    /// Site/app URL, for host-based matching by the browser extension.
+    /// `#[serde(default)]` keeps older clients/daemons interoperable.
+    #[serde(default)]
+    pub url: String,
     #[serde(default)]
     pub username: String,
 }
@@ -692,6 +696,7 @@ fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
                         .iter()
                         .map(|a| EntryRef {
                             name: a.name.clone(),
+                            url: a.url.clone(),
                             username: a.username.clone(),
                         })
                         .collect();
@@ -788,9 +793,16 @@ fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
                     };
 
                     let result = if let Some(idx) = exact.or(fallback) {
-                        sess.edit_account(idx, None, None, Some(password), None, None)
+                        sess.edit_account(idx, None, None, None, Some(password), None, None)
                     } else {
-                        sess.add_account(name, username, password, String::new(), String::new())
+                        sess.add_account(
+                            name,
+                            String::new(),
+                            username,
+                            password,
+                            String::new(),
+                            String::new(),
+                        )
                     };
                     match result {
                         Ok(_) => {

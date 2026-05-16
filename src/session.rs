@@ -164,6 +164,7 @@ pub fn login_legacy(legacy: &LegacyVerifierVault, password: &[u8]) -> Result<Ses
         let plain = crypto::decrypt_combined(&old.password, &*old_key).map_err(|_| ())?;
         accounts.push(Account {
             name: old.name.clone(),
+            url: old.url.clone(),
             username: old.username.clone(),
             password: (*plain).clone(),
             totp_secret: old.totp_secret.clone(),
@@ -192,6 +193,7 @@ impl Session {
     pub fn add_account(
         &mut self,
         name: String,
+        url: String,
         username: String,
         password: String,
         totp_secret: String,
@@ -199,6 +201,7 @@ impl Session {
     ) -> std::io::Result<()> {
         self.accounts.push(Account {
             name,
+            url,
             username,
             password,
             totp_secret,
@@ -215,6 +218,7 @@ impl Session {
         &mut self,
         idx: usize,
         new_name: Option<String>,
+        new_url: Option<String>,
         new_username: Option<String>,
         new_password: Option<String>,
         new_totp_secret: Option<String>,
@@ -231,6 +235,10 @@ impl Session {
         if let Some(n) = new_name {
             self.accounts[idx].name.zeroize();
             self.accounts[idx].name = n;
+        }
+        if let Some(url) = new_url {
+            self.accounts[idx].url.zeroize();
+            self.accounts[idx].url = url;
         }
         if let Some(u) = new_username {
             self.accounts[idx].username.zeroize();

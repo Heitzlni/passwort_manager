@@ -14,6 +14,12 @@ pub const CURRENT_VERSION: u32 = 1;
 #[derive(Serialize, Deserialize, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct Account {
     pub name: String,
+    /// Site/app URL, e.g. `https://mail.google.com`. Used by the browser
+    /// extension to match the right credential to the active tab's host
+    /// (far more reliable than guessing from the entry name). May be
+    /// empty. `#[serde(default)]` keeps pre-url vault files readable.
+    #[serde(default)]
+    pub url: String,
     /// Username for the site. May be empty (older entries didn't have one).
     /// `#[serde(default)]` keeps existing vault files readable.
     #[serde(default)]

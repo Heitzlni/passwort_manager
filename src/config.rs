@@ -29,10 +29,19 @@ pub struct Config {
     /// window. Missing in old config files → all on (see Default).
     #[serde(default)]
     pub toolbar: ToolbarConfig,
+    /// Lock the GUI window back to the password prompt after this many
+    /// minutes with no keyboard/mouse activity. Independent of the
+    /// daemon's own idle lock (PASSWORT_IDLE_TIMEOUT_SECS) — this one
+    /// guards the always-open window. Missing in old configs → disabled.
+    #[serde(default)]
+    pub gui_autolock_enabled: bool,
+    #[serde(default = "default_gui_autolock_minutes")]
+    pub gui_autolock_minutes: u32,
 }
 
 fn default_hibp_enabled() -> bool { true }
 fn default_true() -> bool { true }
+fn default_gui_autolock_minutes() -> u32 { 5 }
 
 /// Visibility flags for the optional top-bar buttons. `Settings` and
 /// `Lock` are deliberately NOT here — they're always shown (hiding
@@ -87,6 +96,8 @@ impl Default for Config {
             save_hotkey: default_save_hotkey(),
             hibp_enabled: default_hibp_enabled(),
             toolbar: ToolbarConfig::default(),
+            gui_autolock_enabled: false,
+            gui_autolock_minutes: default_gui_autolock_minutes(),
         }
     }
 }

@@ -83,6 +83,31 @@ function originRelated(a, b) {
     return effectiveRoot(a) === effectiveRoot(b);
 }
 
+// Hostname of a stored entry URL. Accepts bare hosts (no scheme) by
+// assuming https. Empty string if there's no usable URL.
+function hostOf(urlStr) {
+    if (!urlStr) return "";
+    let s = String(urlStr).trim();
+    if (!s) return "";
+    if (!s.includes("://")) s = "https://" + s;
+    try {
+        return new URL(s).hostname.toLowerCase();
+    } catch {
+        return "";
+    }
+}
+
+// Match an entry to the active tab's host. Prefer the explicit URL
+// field (reliable); fall back to the entry name for pre-url entries,
+// which historically doubled as a pseudo-host. Either way the host
+// rule is the same: exact host or a subdomain of it.
+function entryMatchesHost(entry, host) {
+    if (!host) return false;
+    const urlHost = hostOf(entry.url);
+    if (urlHost) return nameMatchesHost(urlHost, host);
+    return nameMatchesHost(entry.name, host);
+}
+
 function showError(msg) {
     $("#banner").innerHTML = "";
     $("#banner").appendChild(el("div", { class: "error" }, msg));
@@ -259,7 +284,7 @@ async function renderUnlocked() {
     }
     const allEntries = list.kind === "entries" ? list.entries : [];
     const matches = origin
-        ? allEntries.filter((e) => nameMatchesHost(e.name, origin))
+        ? allEntries.filter((e) => entryMatchesHost(e, origin))
         : [];
 
     if (matches.length === 0) {
