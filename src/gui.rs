@@ -648,6 +648,19 @@ enum Modal {
         /// avoids fighting egui for the display-server event queue.
         chooser_rx: Option<std::sync::mpsc::Receiver<Result<Option<std::path::PathBuf>, String>>>,
     },
+    /// Import plaintext credential exports from other password managers
+    /// (Chrome/Firefox/Bitwarden/KeePassXC/1Password — CSV or Bitwarden
+    /// JSON). Always *merges* into the current unlocked vault.
+    ImportForeign {
+        path: String,
+        chooser_rx:
+            Option<std::sync::mpsc::Receiver<Result<Option<std::path::PathBuf>, String>>>,
+        /// Parse result once a file is loaded: Ok((format, entries)) or
+        /// Err(human message). `None` until the user loads a file.
+        parsed: Option<Result<(String, Vec<crate::importers::Imported>), String>>,
+        /// Set once the import is committed: Ok(count) or Err(message).
+        done: Option<Result<usize, String>>,
+    },
 }
 
 #[derive(Default)]
@@ -729,6 +742,17 @@ impl Drop for Modal {
             Modal::Import { password, path, .. } => {
                 password.zeroize();
                 path.zeroize();
+            }
+            Modal::ImportForeign { path, parsed, .. } => {
+                path.zeroize();
+                if let Some(Ok((_, entries))) = parsed {
+                    for e in entries {
+                        e.password.zeroize();
+                        e.totp_secret.zeroize();
+                        e.username.zeroize();
+                        e.notes.zeroize();
+                    }
+                }
             }
         }
     }
@@ -1703,6 +1727,7 @@ impl App {
                     *info = "Account deleted.".to_string();
                     error.clear();
                 }
+                ModalResult::Replace(m) => *modal = Some(*m),
             }
         }
 
@@ -1759,6 +1784,9 @@ enum ModalResult {
     CloseWithInfo(String),
     CloseWithError(String),
     DeleteSelected,
+    /// Swap the open modal for another one (e.g. Import → foreign
+    /// import). Boxed because `Modal` is large.
+    Replace(Box<Modal>),
 }
 
 fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -> ModalResult {
@@ -1774,6 +1802,7 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
         Modal::Import { .. } => "Import vault",
         Modal::Tokens => "Authenticator — 2FA codes",
         Modal::Health => "Vault health",
+        Modal::ImportForeign { .. } => "Import from another manager",
     };
 
     // Audit + Import + Tokens want more horizontal room when there's room
@@ -1781,6 +1810,7 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
     let preferred_width: f32 = match modal {
         Modal::Audit { .. } => 620.0,
         Modal::Health => 560.0,
+        Modal::ImportForeign { .. } => 560.0,
         Modal::Import { .. } => 500.0,
         Modal::Tokens => 440.0,
         _ => 360.0,
@@ -2987,6 +3017,240 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                 }
             }
 
+            Modal::ImportForeign {
+                path,
+                chooser_rx,
+                parsed,
+                done,
+            } => {
+                if let Some(outcome) = done {
+                    match outcome {
+                        Ok(n) => ui.colored_label(
+                            COLOR_OK,
+                            format!("Imported {} account(s) into the vault.", n),
+                        ),
+                        Err(e) => ui.colored_label(
+                            COLOR_ERROR,
+                            format!("Import failed: {}", e),
+                        ),
+                    };
+                    ui.add_space(12.0);
+                    if ui
+                        .add_sized(egui::vec2(80.0, 28.0), egui::Button::new("Close"))
+                        .clicked()
+                    {
+                        result = ModalResult::Close;
+                    }
+                    return;
+                }
+
+                ui.colored_label(
+                    COLOR_MUTED,
+                    "Import a plaintext export from another password manager \
+                     (Chrome/Edge, Firefox, Bitwarden, KeePassXC, 1Password — \
+                     CSV, or Bitwarden JSON). Entries are merged into your \
+                     current vault.",
+                );
+                ui.add_space(10.0);
+
+                // Drain the file-picker worker if it finished.
+                if let Some(rx) = chooser_rx.as_ref() {
+                    if let Ok(res) = rx.try_recv() {
+                        match res {
+                            Ok(Some(p)) => {
+                                *path = p.display().to_string();
+                                *parsed = None;
+                            }
+                            Ok(None) => {}
+                            Err(e) => *parsed = Some(Err(e)),
+                        }
+                        *chooser_rx = None;
+                    } else {
+                        ctx.request_repaint_after(
+                            std::time::Duration::from_millis(150),
+                        );
+                    }
+                }
+                let picker_busy = chooser_rx.is_some();
+
+                ui.label("File:");
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        egui::vec2(ui.available_width() - 110.0, 26.0),
+                        egui::TextEdit::singleline(path)
+                            .hint_text("path/to/passwords.csv")
+                            .margin(egui::vec2(6.0, 4.0)),
+                    );
+                    let label = if picker_busy { "Opening…" } else { "Browse…" };
+                    if ui
+                        .add_enabled_ui(!picker_busy, |ui| {
+                            ui.add_sized(
+                                egui::vec2(100.0, 26.0),
+                                egui::Button::new(label),
+                            )
+                        })
+                        .inner
+                        .clicked()
+                    {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        let start_dir = std::env::var_os("HOME")
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|| std::path::PathBuf::from("."));
+                        std::thread::spawn(move || {
+                            use std::process::Command;
+                            let result: Result<
+                                Option<std::path::PathBuf>,
+                                String,
+                            > = match Command::new("zenity")
+                                .arg("--file-selection")
+                                .arg("--title=Pick an exported password file")
+                                .arg(format!("--filename={}/", start_dir.display()))
+                                .arg("--file-filter=Exports | *.csv *.json")
+                                .arg("--file-filter=All files | *")
+                                .output()
+                            {
+                                Ok(out) if out.status.success() => {
+                                    let s = String::from_utf8_lossy(&out.stdout)
+                                        .trim_end_matches(['\n', '\r'])
+                                        .to_string();
+                                    if s.is_empty() {
+                                        Ok(None)
+                                    } else {
+                                        Ok(Some(std::path::PathBuf::from(s)))
+                                    }
+                                }
+                                Ok(_) => Ok(None),
+                                Err(e)
+                                    if e.kind()
+                                        == std::io::ErrorKind::NotFound =>
+                                {
+                                    Err("zenity not installed (sudo apt \
+                                         install zenity). Paste the path \
+                                         manually for now."
+                                        .into())
+                                }
+                                Err(e) => Err(e.to_string()),
+                            };
+                            let _ = tx.send(result);
+                        });
+                        *chooser_rx = Some(rx);
+                    }
+                });
+                ui.add_space(10.0);
+
+                if ui
+                    .add_enabled_ui(!path.trim().is_empty() && !picker_busy, |ui| {
+                        ui.add_sized(
+                            egui::vec2(140.0, 28.0),
+                            egui::Button::new("Load & preview"),
+                        )
+                    })
+                    .inner
+                    .clicked()
+                {
+                    *parsed = Some(match std::fs::read_to_string(path.trim()) {
+                        Ok(text) => crate::importers::parse(&text),
+                        Err(e) => Err(format!("Could not read file: {}", e)),
+                    });
+                }
+
+                match parsed {
+                    Some(Err(msg)) => {
+                        ui.add_space(8.0);
+                        ui.colored_label(COLOR_ERROR, msg.as_str());
+                    }
+                    Some(Ok((fmt, entries))) => {
+                        ui.add_space(8.0);
+                        ui.colored_label(
+                            COLOR_OK,
+                            format!(
+                                "Detected {} — {} entr{}.",
+                                fmt,
+                                entries.len(),
+                                if entries.len() == 1 { "y" } else { "ies" }
+                            ),
+                        );
+                        ui.add_space(6.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                for e in entries.iter() {
+                                    ui.horizontal(|ui| {
+                                        ui.label(truncate_chars(&e.name, 32));
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(
+                                                egui::Align::Center,
+                                            ),
+                                            |ui| {
+                                                if !e.username.is_empty() {
+                                                    ui.colored_label(
+                                                        COLOR_MUTED,
+                                                        truncate_chars(
+                                                            &e.username,
+                                                            28,
+                                                        ),
+                                                    );
+                                                }
+                                            },
+                                        );
+                                    });
+                                }
+                            });
+                        ui.add_space(6.0);
+                        ui.colored_label(
+                            COLOR_MUTED,
+                            "Passwords aren't shown. They're merged as-is — \
+                             duplicates aren't removed.",
+                        );
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            let n = entries.len();
+                            let imp = egui::Button::new(
+                                egui::RichText::new(format!(
+                                    "Import {} into vault",
+                                    n
+                                ))
+                                .strong(),
+                            )
+                            .fill(COLOR_ACCENT)
+                            .min_size(egui::vec2(180.0, 28.0));
+                            if ui.add(imp).clicked() {
+                                let accounts = entries
+                                    .iter()
+                                    .cloned()
+                                    .map(crate::storage::Account::from);
+                                *done = Some(
+                                    session
+                                        .add_accounts(accounts)
+                                        .map_err(|e| e.to_string()),
+                                );
+                            }
+                            if ui
+                                .add_sized(
+                                    egui::vec2(90.0, 28.0),
+                                    egui::Button::new("Cancel"),
+                                )
+                                .clicked()
+                            {
+                                result = ModalResult::Close;
+                            }
+                        });
+                    }
+                    None => {
+                        ui.add_space(12.0);
+                        if ui
+                            .add_sized(
+                                egui::vec2(80.0, 28.0),
+                                egui::Button::new("Cancel"),
+                            )
+                            .clicked()
+                        {
+                            result = ModalResult::Close;
+                        }
+                    }
+                }
+            }
+
             Modal::Import {
                 path,
                 merge,
@@ -3000,6 +3264,22 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                     COLOR_MUTED,
                     "Restore from a backup file (raw vault or bundle).",
                 );
+                ui.add_space(6.0);
+                if ui
+                    .button("Switching from another password manager? Import a CSV / JSON export →")
+                    .on_hover_text(
+                        "Chrome/Edge, Firefox, Bitwarden, KeePassXC, 1Password",
+                    )
+                    .clicked()
+                {
+                    result = ModalResult::Replace(Box::new(Modal::ImportForeign {
+                        path: String::new(),
+                        chooser_rx: None,
+                        parsed: None,
+                        done: None,
+                    }));
+                    return;
+                }
                 ui.add_space(10.0);
 
                 // Drain the picker thread if it has a result ready. Done

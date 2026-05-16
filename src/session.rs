@@ -214,6 +214,26 @@ impl Session {
         Ok(())
     }
 
+    /// Append many accounts and persist once. All-or-nothing: on a write
+    /// failure the vault is rolled back to its prior state. Returns the
+    /// number added. Used by the "import from another manager" flow.
+    pub fn add_accounts(
+        &mut self,
+        accounts: impl IntoIterator<Item = Account>,
+    ) -> std::io::Result<usize> {
+        let before = self.accounts.len();
+        self.accounts.extend(accounts);
+        let added = self.accounts.len() - before;
+        if added == 0 {
+            return Ok(0);
+        }
+        if let Err(e) = persist(self) {
+            self.accounts.truncate(before);
+            return Err(e);
+        }
+        Ok(added)
+    }
+
     pub fn edit_account(
         &mut self,
         idx: usize,
