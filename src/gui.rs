@@ -105,6 +105,10 @@ mod quick_save {
         show_password: bool,
         message: Option<(String, bool)>, // (text, is_error)
         saved: bool,
+        /// Daemon reported the vault locked → show the inline unlock UI
+        /// instead of dead-ending.
+        locked: bool,
+        master: String,
     }
 
     impl QuickSaveApp {
@@ -118,6 +122,158 @@ mod quick_save {
                 show_password: false,
                 message: None,
                 saved: false,
+                locked: false,
+                master: String::new(),
+            }
+        }
+
+        fn req(&self, r: &Request) -> Result<Response, String> {
+            ipc::rpc_authed("passwort-quick-save", r).map_err(|e| e.to_string())
+        }
+
+        /// Ok(true) = saved into the unlocked vault; Ok(false) = daemon
+        /// is locked; Err = anything else.
+        fn do_save(&self) -> Result<bool, String> {
+            match self.req(&Request::Save {
+                name: self.name.clone(),
+                username: self.username.clone(),
+                password: self.password.clone(),
+            })? {
+                Response::Ok => Ok(true),
+                Response::Error { code, .. } if code == "locked" => Ok(false),
+                Response::Error { message, .. } => Err(message),
+                _ => Err("Unexpected response from daemon.".into()),
+            }
+        }
+
+        fn do_stash(&self) -> Result<(), String> {
+            match self.req(&Request::SaveLocked {
+                name: self.name.clone(),
+                url: String::new(),
+                username: self.username.clone(),
+                password: self.password.clone(),
+                totp_secret: String::new(),
+                notes: String::new(),
+            })? {
+                Response::Ok => Ok(()),
+                Response::Error { message, .. } => Err(message),
+                _ => Err("Unexpected response from daemon.".into()),
+            }
+        }
+
+        fn do_unlock(&self) -> Result<(), String> {
+            match self.req(&Request::Unlock {
+                password: self.master.clone(),
+            })? {
+                Response::Ok => Ok(()),
+                Response::Error { code, message } => Err(if code == "wrong_password" {
+                    "Wrong master password.".into()
+                } else {
+                    message
+                }),
+                _ => Err("Unexpected response from daemon.".into()),
+            }
+        }
+
+        fn commit_saved(&mut self, msg: String) {
+            self.saved = true;
+            self.locked = false;
+            self.message = Some((msg, false));
+            self.password.zeroize();
+            self.username.zeroize();
+            self.master.zeroize();
+        }
+
+        fn locked_ui(&mut self, ui: &mut egui::Ui) {
+            ui.colored_label(COLOR_MUTED, "The vault is locked.");
+            ui.add_space(4.0);
+            ui.label(format!(
+                "Unlock to save \u{201c}{}\u{201d}",
+                self.name
+            ));
+            ui.add_space(8.0);
+            ui.label("Master password");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.master)
+                    .password(true)
+                    .desired_width(f32::INFINITY)
+                    .margin(egui::vec2(8.0, 6.0)),
+            );
+            if !resp.has_focus() {
+                resp.request_focus();
+            }
+            let mut do_unlock = resp.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("Unlock & Save").strong(),
+                        )
+                        .fill(COLOR_ACCENT)
+                        .min_size(egui::vec2(130.0, 28.0)),
+                    )
+                    .clicked()
+                {
+                    do_unlock = true;
+                }
+                if ui
+                    .add_sized(
+                        egui::vec2(160.0, 28.0),
+                        egui::Button::new("Save without unlocking"),
+                    )
+                    .on_hover_text(
+                        "Stash it sealed; review at the next GUI unlock",
+                    )
+                    .clicked()
+                {
+                    match self.do_stash() {
+                        Ok(()) => self.commit_saved(
+                            "Vault locked — stashed. It'll appear for \
+                             review when you next unlock the app."
+                                .into(),
+                        ),
+                        Err(m) => self.message = Some((m, true)),
+                    }
+                }
+                if ui
+                    .add_sized(
+                        egui::vec2(80.0, 28.0),
+                        egui::Button::new("Cancel"),
+                    )
+                    .clicked()
+                {
+                    std::process::exit(if self.saved { 0 } else { 1 });
+                }
+            });
+            if do_unlock {
+                if self.master.is_empty() {
+                    self.message =
+                        Some(("Master password required.".into(), true));
+                } else {
+                    match self.do_unlock() {
+                        Ok(()) => match self.do_save() {
+                            Ok(true) => self.commit_saved(format!(
+                                "Unlocked and saved \u{201c}{}\u{201d}.",
+                                self.name
+                            )),
+                            Ok(false) => {
+                                self.message = Some((
+                                    "Still locked — try again.".into(),
+                                    true,
+                                ))
+                            }
+                            Err(m) => self.message = Some((m, true)),
+                        },
+                        Err(m) => self.message = Some((m, true)),
+                    }
+                }
+            }
+            if let Some((msg, is_err)) = &self.message {
+                ui.add_space(8.0);
+                let color = if *is_err { COLOR_ERROR } else { COLOR_OK };
+                ui.colored_label(color, msg.as_str());
             }
         }
     }
@@ -126,6 +282,7 @@ mod quick_save {
         fn drop(&mut self) {
             self.username.zeroize();
             self.password.zeroize();
+            self.master.zeroize();
         }
     }
 
@@ -139,6 +296,10 @@ mod quick_save {
               egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                if self.locked {
+                    self.locked_ui(ui);
+                    return;
+                }
                 ui.colored_label(COLOR_MUTED, "Save credential for the active app");
                 ui.add_space(8.0);
 
@@ -184,76 +345,19 @@ mod quick_save {
                         } else if self.password.is_empty() {
                             self.message = Some(("Password is required.".into(), true));
                         } else {
-                            let req = Request::Save {
-                                name: self.name.clone(),
-                                username: self.username.clone(),
-                                password: self.password.clone(),
-                            };
-                            match ipc::rpc_authed("passwort-quick-save", &req) {
-                                Ok(Response::Ok) => {
-                                    self.saved = true;
-                                    self.message = Some((
-                                        format!("Saved \u{201c}{}\u{201d}.", self.name),
-                                        false,
-                                    ));
-                                    self.password.zeroize();
-                                    self.username.zeroize();
+                            match self.do_save() {
+                                Ok(true) => self.commit_saved(format!(
+                                    "Saved \u{201c}{}\u{201d}.",
+                                    self.name
+                                )),
+                                // Locked → switch to the inline unlock UI
+                                // (with a "save without unlocking" escape
+                                // hatch) instead of dead-ending.
+                                Ok(false) => {
+                                    self.locked = true;
+                                    self.message = None;
                                 }
-                                Ok(Response::Error { code, message })
-                                    if code == "locked" =>
-                                {
-                                    // Vault locked — don't dead-end. Stash
-                                    // the credential in the sealed inbox so
-                                    // it's reviewable at the next unlock,
-                                    // exactly like the browser extension.
-                                    let stash = Request::SaveLocked {
-                                        name: self.name.clone(),
-                                        url: String::new(),
-                                        username: self.username.clone(),
-                                        password: self.password.clone(),
-                                        totp_secret: String::new(),
-                                        notes: String::new(),
-                                    };
-                                    match ipc::rpc_authed(
-                                        "passwort-quick-save",
-                                        &stash,
-                                    ) {
-                                        Ok(Response::Ok) => {
-                                            self.saved = true;
-                                            self.message = Some((
-                                                "Vault locked — stashed. It'll \
-                                                 appear for review when you next \
-                                                 unlock the app."
-                                                    .into(),
-                                                false,
-                                            ));
-                                            self.password.zeroize();
-                                            self.username.zeroize();
-                                        }
-                                        Ok(Response::Error { message, .. }) => {
-                                            self.message = Some((message, true));
-                                        }
-                                        Ok(_) => {
-                                            self.message = Some((
-                                                "Unexpected response from daemon."
-                                                    .into(),
-                                                true,
-                                            ));
-                                        }
-                                        Err(e) => {
-                                            self.message =
-                                                Some((e.to_string(), true));
-                                        }
-                                    }
-                                }
-                                Ok(Response::Error { message, .. }) => {
-                                    self.message = Some((message, true));
-                                }
-                                Ok(_) => {
-                                    self.message =
-                                        Some(("Unexpected response from daemon.".into(), true))
-                                }
-                                Err(e) => self.message = Some((e.to_string(), true)),
+                                Err(m) => self.message = Some((m, true)),
                             }
                         }
                     }
@@ -320,6 +424,40 @@ mod picker {
     use super::{COLOR_ACCENT, COLOR_ERROR, COLOR_MUTED};
     use crate::ipc::{self, EntryRef, Request, Response};
     use eframe::egui;
+    use zeroize::Zeroize;
+
+    enum Load {
+        Entries(Vec<EntryRef>),
+        Locked,
+        Failed(String),
+    }
+
+    fn load_entries(target_title: &Option<String>) -> Load {
+        match ipc::rpc_authed("passwort-picker", &Request::ListEntries) {
+            Ok(Response::Entries { mut entries }) => {
+                // Entries whose name appears in the target window title
+                // sort first; the rest keep their original order.
+                if let Some(t) = target_title.as_deref() {
+                    let t_low = t.to_lowercase();
+                    entries.sort_by_key(|e| {
+                        let n = e.name.to_lowercase();
+                        !(t_low.contains(&n)
+                            || n.split('.').any(|p| t_low.contains(p)))
+                    });
+                }
+                Load::Entries(entries)
+            }
+            Ok(Response::Error { code, message }) => {
+                if code == "locked" {
+                    Load::Locked
+                } else {
+                    Load::Failed(message)
+                }
+            }
+            Ok(_) => Load::Failed("unexpected response".into()),
+            Err(e) => Load::Failed(e.to_string()),
+        }
+    }
 
     pub struct PickerApp {
         entries: Vec<EntryRef>,
@@ -328,46 +466,125 @@ mod picker {
         target_title: Option<String>,
         load_error: Option<String>,
         first_frame: bool,
+        /// Daemon reported the vault locked → show an inline master-
+        /// password prompt instead of a dead-end "unlock elsewhere".
+        locked: bool,
+        master: String,
+        unlock_msg: Option<String>,
     }
 
     impl PickerApp {
         pub fn new(target_title: Option<String>) -> Self {
-            let (entries, load_error) = match ipc::rpc_authed("passwort-picker", &Request::ListEntries) {
-                Ok(Response::Entries { mut entries }) => {
-                    // Sort: entries whose name appears in the target window
-                    // title come first; everything else stays in original order.
-                    if let Some(t) = target_title.as_deref() {
-                        let t_low = t.to_lowercase();
-                        entries.sort_by_key(|e| {
-                            let n = e.name.to_lowercase();
-                            !(t_low.contains(&n) || n.split('.').any(|p| t_low.contains(p)))
-                        });
-                    }
-                    (entries, None)
-                }
-                Ok(Response::Error { code, message }) => {
-                    let msg = if code == "locked" {
-                        "Vault is locked. Open the toolbar extension or the GUI to unlock.".to_string()
-                    } else {
-                        message
-                    };
-                    (Vec::new(), Some(msg))
-                }
-                Ok(_) => (Vec::new(), Some("unexpected response".into())),
-                Err(e) => (Vec::new(), Some(e.to_string())),
-            };
-            eprintln!(
-                "[picker] PickerApp built: {} entries, load_error={:?}",
-                entries.len(),
-                load_error
-            );
-            Self {
-                entries,
+            let mut s = Self {
+                entries: Vec::new(),
                 filter: String::new(),
                 selected: 0,
                 target_title,
-                load_error,
+                load_error: None,
                 first_frame: true,
+                locked: false,
+                master: String::new(),
+                unlock_msg: None,
+            };
+            match load_entries(&s.target_title) {
+                Load::Entries(e) => s.entries = e,
+                Load::Locked => s.locked = true,
+                Load::Failed(m) => s.load_error = Some(m),
+            }
+            eprintln!(
+                "[picker] PickerApp built: {} entries, locked={}, load_error={:?}",
+                s.entries.len(),
+                s.locked,
+                s.load_error
+            );
+            s
+        }
+
+        fn unlock_panel(&mut self, ui: &mut egui::Ui) {
+            ui.colored_label(COLOR_MUTED, "The vault is locked.");
+            ui.add_space(6.0);
+            ui.label("Master password");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.master)
+                    .password(true)
+                    .desired_width(f32::INFINITY)
+                    .margin(egui::vec2(8.0, 6.0)),
+            );
+            if !resp.has_focus() {
+                resp.request_focus();
+            }
+            let mut go = resp.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("Unlock").strong(),
+                        )
+                        .fill(COLOR_ACCENT)
+                        .min_size(egui::vec2(100.0, 28.0)),
+                    )
+                    .clicked()
+                {
+                    go = true;
+                }
+                if ui
+                    .add_sized(
+                        egui::vec2(80.0, 28.0),
+                        egui::Button::new("Cancel"),
+                    )
+                    .clicked()
+                {
+                    std::process::exit(1);
+                }
+            });
+            if go && !self.master.is_empty() {
+                match ipc::rpc_authed(
+                    "passwort-picker",
+                    &Request::Unlock {
+                        password: self.master.clone(),
+                    },
+                ) {
+                    Ok(Response::Ok) => {
+                        self.master.zeroize();
+                        self.unlock_msg = None;
+                        match load_entries(&self.target_title) {
+                            Load::Entries(e) => {
+                                self.entries = e;
+                                self.locked = false;
+                            }
+                            Load::Locked => {
+                                self.unlock_msg =
+                                    Some("Still locked — try again.".into());
+                            }
+                            Load::Failed(m) => {
+                                self.load_error = Some(m);
+                                self.locked = false;
+                            }
+                        }
+                    }
+                    Ok(Response::Error { code, message }) => {
+                        self.master.zeroize();
+                        self.unlock_msg = Some(if code == "wrong_password" {
+                            "Wrong master password.".into()
+                        } else {
+                            message
+                        });
+                    }
+                    Ok(_) => {
+                        self.unlock_msg = Some("unexpected response".into());
+                    }
+                    Err(e) => {
+                        self.unlock_msg = Some(e.to_string());
+                    }
+                }
+            } else if go {
+                self.unlock_msg = Some("Master password required.".into());
+            }
+            if let Some(m) = &self.unlock_msg {
+                ui.add_space(8.0);
+                ui.colored_label(COLOR_ERROR, m.as_str());
             }
         }
 
@@ -386,11 +603,32 @@ mod picker {
         }
     }
 
+    impl Drop for PickerApp {
+        fn drop(&mut self) {
+            self.master.zeroize();
+        }
+    }
+
     impl eframe::App for PickerApp {
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
             if self.first_frame {
                 self.first_frame = false;
                 eprintln!("[picker] first frame — window should now be visible");
+            }
+
+            if self.locked {
+                // Esc still cancels in the locked state.
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    std::process::exit(1);
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if let Some(t) = &self.target_title {
+                        ui.colored_label(COLOR_MUTED, format!("→ {}", t));
+                        ui.add_space(4.0);
+                    }
+                    self.unlock_panel(ui);
+                });
+                return;
             }
             // Compute filtered names + selection once per frame so the
             // borrow-checker doesn't complain when we mutate self.selected.
