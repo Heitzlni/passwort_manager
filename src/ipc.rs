@@ -457,69 +457,7 @@ fn verify_peer_uid(_stream: &UnixStream) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Is the connecting process one of our own installed helper binaries?
-///
-/// True only when the peer's executable lives in the *same directory*
-/// as the running daemon AND its name is one of our first-party tools.
-/// Such clients (the quick-save / picker GUI, the autotype daemon,
-/// passwortctl) are auto-approved so the user never has to `passwortctl
-/// approve` the app's own components. An attacker would already have to
-/// be executing our exact installed binary from our install directory —
-/// at which point the install itself is compromised and the allowlist
-/// is moot anyway. The browser extension reaches the daemon via
-/// `passwort-native-host`, which is deliberately *not* in this set, so
-/// the (third-party-surface) extension still needs explicit approval.
-#[cfg(target_os = "linux")]
-fn peer_is_first_party(stream: &UnixStream) -> bool {
-    use std::os::fd::AsRawFd;
-
-    let fd = stream.as_raw_fd();
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let ret = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut cred as *mut _ as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if ret != 0 || cred.pid <= 0 {
-        return false;
-    }
-    let peer_exe = match std::fs::canonicalize(format!("/proc/{}/exe", cred.pid)) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    let our_exe = match std::fs::canonicalize("/proc/self/exe") {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    if peer_exe.parent() != our_exe.parent() {
-        return false;
-    }
-    // Cargo bins use '_' (passwort_manager); installed bins use '-'
-    // (passwort-manager). Normalize so dev and installed both match.
-    let name = peer_exe
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .replace('_', "-");
-    matches!(
-        name.as_str(),
-        "passwort-manager" | "passwort-autotype" | "passwortctl"
-    )
-}
-
-#[cfg(not(target_os = "linux"))]
-fn peer_is_first_party(_stream: &UnixStream) -> bool {
-    false
-}
-
 fn handle_client(stream: UnixStream, state: SharedState) -> std::io::Result<()> {
-    // Resolved once from the socket's peer credentials at connect time.
-    let first_party = peer_is_first_party(&stream);
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
     let mut line = String::new();
@@ -530,7 +468,7 @@ fn handle_client(stream: UnixStream, state: SharedState) -> std::io::Result<()> 
             return Ok(());
         }
         let resp = match serde_json::from_str::<Envelope>(line.trim()) {
-            Ok(env) => process_envelope(env, &state, first_party),
+            Ok(env) => process_envelope(env, &state),
             Err(e) => error(codes::BAD_REQUEST, format!("bad request: {}", e)),
         };
         let mut payload = serde_json::to_string(&resp).map_err(|e| {
@@ -544,11 +482,7 @@ fn handle_client(stream: UnixStream, state: SharedState) -> std::io::Result<()> 
 
 /// Top-level dispatcher: enforces auth for protected ops, lets the auth
 /// bootstrap ops through unauthenticated.
-fn process_envelope(
-    env: Envelope,
-    state: &Mutex<DaemonState>,
-    first_party: bool,
-) -> Response {
+fn process_envelope(env: Envelope, state: &Mutex<DaemonState>) -> Response {
     match &env.op {
         // Always-allowed ops
         Request::Status => return process_request(env.op, state),
@@ -566,19 +500,6 @@ fn process_envelope(
             let mut list = auth::load();
             // Check if already approved → return Ok immediately.
             if auth::is_approved(&list, token) {
-                return Response::Ok;
-            }
-            // First-party local helper (same install dir as the daemon):
-            // auto-approve so the user never has to approve the app's own
-            // components. See `peer_is_first_party`.
-            if first_party {
-                auth::approve_now(&mut list, token, label);
-                if let Err(e) = auth::save(&list) {
-                    return error(
-                        codes::IO_ERROR,
-                        format!("failed to persist first-party approval: {}", e),
-                    );
-                }
                 return Response::Ok;
             }
             let id = match auth::record_pending(&mut list, token, label) {
