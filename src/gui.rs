@@ -716,6 +716,13 @@ enum Modal {
         captures: Vec<crate::inbox::Capture>,
         done: Option<Result<usize, String>>,
     },
+    /// Manage which local clients (browser extension, quick-save, picker,
+    /// …) may talk to the daemon. Replaces hunting for `passwortctl
+    /// approve` in a terminal: pending requests are approved/denied here,
+    /// approved ones can be revoked. Reads the allowlist live each frame.
+    Clients {
+        message: Option<(String, bool)>,
+    },
 }
 
 #[derive(Default)]
@@ -817,6 +824,9 @@ impl Drop for Modal {
                     c.notes.zeroize();
                 }
             }
+            Modal::Clients { .. } => {
+                // Only client labels / status text — nothing secret.
+            }
         }
     }
 }
@@ -829,6 +839,9 @@ struct App {
     /// Last time the user touched the keyboard/mouse while unlocked.
     /// Drives the optional GUI idle auto-lock (see Settings).
     last_activity: Instant,
+    /// Pending-client count last observed, so a *newly* arrived client
+    /// approval request auto-surfaces exactly once instead of nagging.
+    pending_seen: usize,
 }
 
 impl App {
@@ -860,6 +873,7 @@ impl App {
             info: String::new(),
             clipboard_clear_at: None,
             last_activity: Instant::now(),
+            pending_seen: 0,
         }
     }
 }
@@ -954,6 +968,20 @@ impl eframe::App for App {
                         (limit - idle).min(Duration::from_secs(20)),
                     );
                 }
+            }
+        }
+
+        // Surface the client-approval prompt when a *new* client asks
+        // for daemon access (edge-triggered: only when the pending count
+        // grows, and only if no other modal is open, so it informs
+        // rather than nags). Approval stays a deliberate human click.
+        if let Screen::Main { modal, .. } = &mut self.screen {
+            let pending = crate::auth::load().pending.len();
+            if modal.is_none() && pending > self.pending_seen {
+                *modal = Some(Modal::Clients { message: None });
+            }
+            if modal.is_none() || matches!(modal, Some(Modal::Clients { .. })) {
+                self.pending_seen = pending;
             }
         }
 
@@ -1233,8 +1261,10 @@ impl App {
             error,
             info,
             clipboard_clear_at,
-            // Idle tracking is handled in `update()`, before this runs.
+            // Idle tracking + the client-approval prompt are handled in
+            // `update()`, before this runs.
             last_activity: _,
+            pending_seen: _,
         } = self;
 
         let (session, selected, modal, reveal) = match screen {
@@ -1893,6 +1923,7 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
         Modal::Health => "Vault health",
         Modal::ImportForeign { .. } => "Import from another manager",
         Modal::ReviewCaptures { .. } => "Captured while locked — review",
+        Modal::Clients { .. } => "Connected apps",
     };
 
     // Audit + Import + Tokens want more horizontal room when there's room
@@ -1902,6 +1933,7 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
         Modal::Health => 560.0,
         Modal::ImportForeign { .. } => 560.0,
         Modal::ReviewCaptures { .. } => 560.0,
+        Modal::Clients { .. } => 560.0,
         Modal::Import { .. } => 500.0,
         Modal::Tokens => 440.0,
         _ => 360.0,
@@ -2572,6 +2604,38 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                                 ));
                             }
                         }
+                    }
+
+                    // ---- Connected apps ----
+                    ui.add_space(18.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("Connected apps").strong(),
+                    );
+                    ui.colored_label(
+                        COLOR_MUTED,
+                        "Approve or revoke the local apps (browser \
+                         extension, quick-save, picker…) allowed to talk \
+                         to the background service — no terminal needed.",
+                    );
+                    ui.add_space(6.0);
+                    let waiting = crate::auth::load().pending.len();
+                    let btn_label = if waiting > 0 {
+                        format!("Manage connected apps  ({} waiting)", waiting)
+                    } else {
+                        "Manage connected apps".to_string()
+                    };
+                    let btn = egui::Button::new(if waiting > 0 {
+                        egui::RichText::new(btn_label).strong()
+                    } else {
+                        egui::RichText::new(btn_label)
+                    });
+                    if ui.add_sized(egui::vec2(240.0, 28.0), btn).clicked() {
+                        result = ModalResult::Replace(Box::new(
+                            Modal::Clients { message: None },
+                        ));
+                        return;
                     }
 
                     // ---- Toolbar buttons ----
@@ -3448,6 +3512,166 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                         );
                     }
                 });
+            }
+
+            Modal::Clients { message } => {
+                let mut list = crate::auth::load();
+                let mut changed = false;
+
+                ui.colored_label(
+                    COLOR_MUTED,
+                    "Apps allowed to talk to the background service. \
+                     Approve only something you just intentionally \
+                     launched (e.g. you pressed the Save hotkey). Deny \
+                     anything you don't recognize.",
+                );
+                ui.add_space(10.0);
+
+                let mut pending: Vec<(String, crate::auth::PendingClient)> = list
+                    .pending
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                pending.sort_by(|a, b| a.1.label.cmp(&b.1.label));
+                ui.label(
+                    egui::RichText::new(format!("Waiting ({})", pending.len()))
+                        .strong(),
+                );
+                ui.add_space(2.0);
+                if pending.is_empty() {
+                    ui.colored_label(COLOR_MUTED, "Nothing waiting for approval.");
+                } else {
+                    for (id, p) in &pending {
+                        ui.horizontal(|ui| {
+                            ui.label(truncate_chars(&p.label, 30));
+                            ui.colored_label(
+                                COLOR_MUTED,
+                                format!(
+                                    "· {}",
+                                    &id[..id.len().min(12)]
+                                ),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(
+                                    egui::Align::Center,
+                                ),
+                                |ui| {
+                                    // Deny is the plain/easy action;
+                                    // Approve is the deliberate one.
+                                    if ui
+                                        .add_sized(
+                                            egui::vec2(64.0, 24.0),
+                                            egui::Button::new("Deny"),
+                                        )
+                                        .clicked()
+                                    {
+                                        crate::auth::revoke(&mut list, id);
+                                        *message = Some((
+                                            format!("Denied {}.", p.label),
+                                            false,
+                                        ));
+                                        changed = true;
+                                    }
+                                    if ui
+                                        .add_sized(
+                                            egui::vec2(80.0, 24.0),
+                                            egui::Button::new(
+                                                egui::RichText::new("Approve")
+                                                    .strong(),
+                                            )
+                                            .fill(COLOR_ACCENT),
+                                        )
+                                        .clicked()
+                                    {
+                                        crate::auth::approve(&mut list, id);
+                                        *message = Some((
+                                            format!("Approved {}.", p.label),
+                                            false,
+                                        ));
+                                        changed = true;
+                                    }
+                                },
+                            );
+                        });
+                    }
+                }
+
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                let mut approved: Vec<(String, crate::auth::ApprovedClient)> =
+                    list.approved
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                approved.sort_by(|a, b| a.1.label.cmp(&b.1.label));
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Approved ({})",
+                        approved.len()
+                    ))
+                    .strong(),
+                );
+                ui.add_space(2.0);
+                egui::ScrollArea::vertical().max_height(190.0).show(
+                    ui,
+                    |ui| {
+                        for (id, c) in &approved {
+                            ui.horizontal(|ui| {
+                                ui.label(truncate_chars(&c.label, 34));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(
+                                        egui::Align::Center,
+                                    ),
+                                    |ui| {
+                                        if ui
+                                            .add_sized(
+                                                egui::vec2(80.0, 22.0),
+                                                egui::Button::new("Revoke"),
+                                            )
+                                            .clicked()
+                                        {
+                                            crate::auth::revoke(
+                                                &mut list, id,
+                                            );
+                                            *message = Some((
+                                                format!(
+                                                    "Revoked {}.",
+                                                    c.label
+                                                ),
+                                                false,
+                                            ));
+                                            changed = true;
+                                        }
+                                    },
+                                );
+                            });
+                        }
+                    },
+                );
+
+                if changed {
+                    if let Err(e) = crate::auth::save(&list) {
+                        *message =
+                            Some((format!("Save failed: {}", e), true));
+                    }
+                }
+                if let Some((m, is_err)) = message {
+                    ui.add_space(8.0);
+                    ui.colored_label(
+                        if *is_err { COLOR_ERROR } else { COLOR_OK },
+                        m.as_str(),
+                    );
+                }
+
+                ui.add_space(12.0);
+                if ui
+                    .add_sized(egui::vec2(80.0, 28.0), egui::Button::new("Close"))
+                    .clicked()
+                {
+                    result = ModalResult::Close;
+                }
             }
 
             Modal::Import {
