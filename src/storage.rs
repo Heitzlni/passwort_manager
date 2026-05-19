@@ -181,10 +181,118 @@ pub fn save_encrypted_vault(vault: &EncryptedVault) -> std::io::Result<()> {
         let _ = dir.sync_all();
     }
 
+    // Best-effort rotating backup of the just-written (already
+    // encrypted) blob. A failure here must never fail the primary save
+    // — the vault is already safely on disk at this point.
+    let _ = rotate_backup(&json);
+
+    Ok(())
+}
+
+/// How many timestamped vault backups to keep.
+const BACKUP_KEEP: usize = 15;
+
+fn backups_dir() -> PathBuf {
+    let parent = vault_path()
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    parent.join("backups")
+}
+
+/// Given backup filenames sorted ascending (oldest first), return the
+/// ones to delete so only the newest `keep` remain. Pure for testing.
+fn backups_to_prune(sorted: &[String], keep: usize) -> &[String] {
+    if sorted.len() > keep {
+        &sorted[..sorted.len() - keep]
+    } else {
+        &[]
+    }
+}
+
+/// Write a timestamped copy of the encrypted vault into `backups/` and
+/// prune to the newest `BACKUP_KEEP`. The backup is the exact same
+/// ciphertext as the live vault (no plaintext, same crypto), so it can
+/// be restored later via the normal Import flow. Best-effort.
+fn rotate_backup(encrypted_json: &str) -> std::io::Result<()> {
+    let dir = backups_dir();
+    fs::create_dir_all(&dir)?;
+
+    // Seconds since epoch, fixed 10+ digits → lexicographic sort == time
+    // order. Same-second collisions just skip (one backup/sec is plenty).
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let file_path = dir.join(format!("vault-{:010}.json", ts));
+
+    if !file_path.exists() {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut f = opts.open(&file_path)?;
+        f.write_all(encrypted_json.as_bytes())?;
+        f.sync_all()?;
+    }
+
+    // Prune oldest beyond BACKUP_KEEP.
+    let mut names: Vec<String> = fs::read_dir(&dir)?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with("vault-") && n.ends_with(".json"))
+        .collect();
+    names.sort();
+    for old in backups_to_prune(&names, BACKUP_KEEP) {
+        let _ = fs::remove_file(dir.join(old));
+    }
     Ok(())
 }
 
 pub fn cleanup_stale_tmp() {
     let tmp_path = tmp_path_for(vault_path());
     let _ = fs::remove_file(&tmp_path);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn keeps_newest_n_prunes_the_rest() {
+        let names = v(&[
+            "vault-0000000001.json",
+            "vault-0000000002.json",
+            "vault-0000000003.json",
+            "vault-0000000004.json",
+            "vault-0000000005.json",
+        ]);
+        // keep 2 → prune the 3 oldest (sorted ascending = oldest first)
+        let pruned = backups_to_prune(&names, 2);
+        assert_eq!(
+            pruned,
+            &[
+                "vault-0000000001.json".to_string(),
+                "vault-0000000002.json".to_string(),
+                "vault-0000000003.json".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn nothing_pruned_when_at_or_under_limit() {
+        let names = v(&["vault-1.json", "vault-2.json"]);
+        assert!(backups_to_prune(&names, 2).is_empty());
+        assert!(backups_to_prune(&names, 5).is_empty());
+        assert!(backups_to_prune(&[], 15).is_empty());
+    }
 }
