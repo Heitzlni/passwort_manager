@@ -67,6 +67,7 @@ impl From<Capture> for crate::storage::Account {
             password: c.password,
             totp_secret: c.totp_secret,
             notes: c.notes,
+            history: Vec::new(),
         }
     }
 }

@@ -34,6 +34,21 @@ pub struct Account {
     /// pre-notes vault files readable.
     #[serde(default)]
     pub notes: String,
+    /// Previous passwords, oldest first, captured when the password is
+    /// changed — so a broken rotation is recoverable. Encrypted with
+    /// everything else; capped (see session). `#[serde(default)]` keeps
+    /// pre-history vault files readable.
+    #[serde(default)]
+    pub history: Vec<PasswordHistoryEntry>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Zeroize, ZeroizeOnDrop)]
+pub struct PasswordHistoryEntry {
+    pub password: String,
+    /// Unix epoch seconds (as a string, to avoid a date dependency)
+    /// when this password was replaced.
+    #[serde(default)]
+    pub changed_at: String,
 }
 
 #[derive(Serialize, Deserialize)]

@@ -2415,6 +2415,81 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                         .desired_rows(3)
                         .margin(egui::vec2(8.0, 6.0)),
                 );
+
+                // ---- Password history ----
+                let hist: Vec<(String, String)> = session
+                    .accounts
+                    .get(*idx)
+                    .map(|a| {
+                        a.history
+                            .iter()
+                            .rev() // newest first
+                            .map(|h| (h.password.clone(), h.changed_at.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !hist.is_empty() {
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    let sid = egui::Id::new(("pwhist_show", *idx));
+                    let mut show: bool =
+                        ui.data_mut(|d| d.get_temp(sid).unwrap_or(false));
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Password history ({})",
+                                hist.len()
+                            ))
+                            .strong(),
+                        );
+                        if ui.checkbox(&mut show, "Show").changed() {
+                            ui.data_mut(|d| d.insert_temp(sid, show));
+                        }
+                    });
+                    ui.colored_label(
+                        COLOR_MUTED,
+                        "Previous passwords. \"Restore\" puts one back in \
+                         the field above — then Save to keep it.",
+                    );
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical()
+                        .id_source(("pwhist", *idx))
+                        .max_height(140.0)
+                        .show(ui, |ui| {
+                            for (pw, when) in &hist {
+                                ui.horizontal(|ui| {
+                                    let mut shown = if show {
+                                        pw.clone()
+                                    } else {
+                                        "\u{2022}".repeat(
+                                            pw.chars().count().clamp(6, 18),
+                                        )
+                                    };
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut shown)
+                                            .interactive(false)
+                                            .font(egui::TextStyle::Monospace)
+                                            .desired_width(
+                                                ui.available_width() - 150.0,
+                                            ),
+                                    );
+                                    ui.colored_label(COLOR_MUTED, ago(when));
+                                    if ui
+                                        .add_sized(
+                                            egui::vec2(70.0, 22.0),
+                                            egui::Button::new("Restore"),
+                                        )
+                                        .clicked()
+                                    {
+                                        *password = pw.clone();
+                                        *show_password = true;
+                                    }
+                                });
+                            }
+                        });
+                }
+
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     let save = egui::Button::new(
@@ -4263,6 +4338,29 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
     let head: String = s.chars().take(max.saturating_sub(1)).collect();
     format!("{}\u{2026}", head)
+}
+
+/// Humanize a unix-epoch-seconds string (as stored in password history)
+/// into a coarse "… ago", with no date dependency.
+fn ago(epoch: &str) -> String {
+    let then: u64 = match epoch.parse() {
+        Ok(v) => v,
+        Err(_) => return "unknown".to_string(),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let s = now.saturating_sub(then);
+    if s < 60 {
+        "just now".to_string()
+    } else if s < 3600 {
+        format!("{}m ago", s / 60)
+    } else if s < 86_400 {
+        format!("{}h ago", s / 3600)
+    } else {
+        format!("{}d ago", s / 86_400)
+    }
 }
 
 /// Synchronous helper used by the Export modal. Mirrors `cmd_export` in

@@ -154,6 +154,7 @@ mod tests {
             password: pw.into(),
             totp_secret: String::new(),
             notes: String::new(),
+            history: Vec::new(),
         }
     }
 

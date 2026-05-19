@@ -31,6 +31,7 @@ impl From<Imported> for Account {
             password: i.password,
             totp_secret: i.totp_secret,
             notes: i.notes,
+            history: Vec::new(),
         }
     }
 }

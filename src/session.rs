@@ -3,13 +3,22 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{self, KDF_M_COST, KDF_P_COST, KDF_T_COST, KEY_LEN, SALT_LEN};
 use crate::storage::{
-    Account, CURRENT_VERSION, EncryptedVault, LegacyVerifierVault,
+    Account, PasswordHistoryEntry, CURRENT_VERSION, EncryptedVault, LegacyVerifierVault,
     parse_encrypted, parse_legacy_plaintext, parse_legacy_verifier,
     read_vault_file, save_encrypted_vault, vault_file_exists,
 };
 
 const LEGACY_VERIFIER_PLAINTEXT: &str = "VERIFY";
 pub const MIN_MASTER_PASSWORD_LEN: usize = 12;
+/// Newest prior passwords retained per entry on rotation.
+const PW_HISTORY_KEEP: usize = 10;
+
+fn now_secs() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default()
+}
 
 pub struct Session {
     pub key: Zeroizing<[u8; KEY_LEN]>,
@@ -169,6 +178,7 @@ pub fn login_legacy(legacy: &LegacyVerifierVault, password: &[u8]) -> Result<Ses
             password: (*plain).clone(),
             totp_secret: old.totp_secret.clone(),
             notes: old.notes.clone(),
+            history: old.history.clone(),
         });
     }
 
@@ -206,6 +216,7 @@ impl Session {
             password,
             totp_secret,
             notes,
+            history: Vec::new(),
         });
         if let Err(e) = persist(self) {
             self.accounts.pop();
@@ -273,7 +284,24 @@ impl Session {
             self.accounts[idx].notes = nt;
         }
         if let Some(p) = new_password {
-            self.accounts[idx].password.zeroize();
+            let mut old = std::mem::take(&mut self.accounts[idx].password);
+            if !old.is_empty() && old != p {
+                // Real rotation — keep the old password so a broken
+                // change is recoverable, capped to the newest N (drained
+                // entries zeroize on drop via ZeroizeOnDrop).
+                let acc = &mut self.accounts[idx];
+                acc.history.push(PasswordHistoryEntry {
+                    password: std::mem::take(&mut old),
+                    changed_at: now_secs(),
+                });
+                let n = acc.history.len();
+                if n > PW_HISTORY_KEEP {
+                    acc.history.drain(0..n - PW_HISTORY_KEEP);
+                }
+            } else {
+                // Unchanged or was empty — don't record, just wipe.
+                old.zeroize();
+            }
             self.accounts[idx].password = p;
         }
 
