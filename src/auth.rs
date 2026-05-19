@@ -174,6 +174,20 @@ pub fn approve(list: &mut Allowlist, short_id: &str) -> bool {
     }
 }
 
+/// Approve a token immediately, no user prompt. Used only for trusted
+/// first-party local helpers (a binary living in the daemon's own
+/// install directory — see `peer_is_first_party` in ipc.rs), so the
+/// user isn't asked to approve the app's own components. Idempotent.
+pub fn approve_now(list: &mut Allowlist, token_b64: &str, label: &str) -> bool {
+    if is_approved(list, token_b64) {
+        return true;
+    }
+    match record_pending(list, token_b64, label) {
+        Some(id) => approve(list, &id),
+        None => false,
+    }
+}
+
 pub fn revoke(list: &mut Allowlist, short_id: &str) -> bool {
     list.approved.remove(short_id).is_some() || list.pending.remove(short_id).is_some()
 }
