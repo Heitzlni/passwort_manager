@@ -36,7 +36,12 @@ pub fn run() -> Result<(), eframe::Error> {
 /// (sorted by relevance to the active window's title), lets the user
 /// type to filter / arrow keys to move / Enter to pick / Esc to cancel.
 /// Prints the chosen entry name to stdout and exits.
-pub fn run_picker(target_title: Option<String>) -> Result<(), eframe::Error> {
+pub fn run_picker(
+    target_title: Option<String>,
+    entries: Vec<crate::ipc::EntryRef>,
+    unlock_mode: bool,
+    note: Option<String>,
+) -> Result<(), eframe::Error> {
     eprintln!("[picker] starting, target={:?}", target_title);
     eprintln!(
         "[picker] DISPLAY={:?} XDG_SESSION_TYPE={:?}",
@@ -56,10 +61,15 @@ pub fn run_picker(target_title: Option<String>) -> Result<(), eframe::Error> {
     let result = eframe::run_native(
         "Password Manager — Pick",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             setup_style(&cc.egui_ctx);
             eprintln!("[picker] creator callback invoked, building PickerApp");
-            Box::new(picker::PickerApp::new(target_title))
+            Box::new(picker::PickerApp::new(
+                target_title,
+                entries,
+                unlock_mode,
+                note,
+            ))
         }),
     );
     eprintln!("[picker] eframe::run_native returned: {:?}", result.as_ref().err());
@@ -422,86 +432,61 @@ mod quick_save {
 
 mod picker {
     use super::{COLOR_ACCENT, COLOR_ERROR, COLOR_MUTED};
-    use crate::ipc::{self, EntryRef, Request, Response};
+    use crate::ipc::EntryRef;
     use eframe::egui;
     use zeroize::Zeroize;
 
-    enum Load {
-        Entries(Vec<EntryRef>),
-        Locked,
-        Failed(String),
-    }
-
-    fn load_entries(target_title: &Option<String>) -> Load {
-        match ipc::rpc_authed("passwort-picker", &Request::ListEntries) {
-            Ok(Response::Entries { mut entries }) => {
-                // Entries whose name appears in the target window title
-                // sort first; the rest keep their original order.
-                if let Some(t) = target_title.as_deref() {
-                    let t_low = t.to_lowercase();
-                    entries.sort_by_key(|e| {
-                        let n = e.name.to_lowercase();
-                        !(t_low.contains(&n)
-                            || n.split('.').any(|p| t_low.contains(p)))
-                    });
-                }
-                Load::Entries(entries)
-            }
-            Ok(Response::Error { code, message }) => {
-                if code == "locked" {
-                    Load::Locked
-                } else {
-                    Load::Failed(message)
-                }
-            }
-            Ok(_) => Load::Failed("unexpected response".into()),
-            Err(e) => Load::Failed(e.to_string()),
-        }
-    }
-
+    /// The picker no longer talks to the daemon. `passwort-autotype`
+    /// (the single approved client) fetches the entries and, when the
+    /// vault is locked, drives the unlock — handing this window only
+    /// what it needs (entries via stdin, or unlock mode) and reading
+    /// back the user's choice / typed master password on stdout. So the
+    /// picker has no client identity and needs no approval.
     pub struct PickerApp {
         entries: Vec<EntryRef>,
         filter: String,
         selected: usize,
         target_title: Option<String>,
-        load_error: Option<String>,
         first_frame: bool,
-        /// Daemon reported the vault locked → show an inline master-
-        /// password prompt instead of a dead-end "unlock elsewhere".
-        locked: bool,
+        /// Unlock mode: show only a master-password prompt and print
+        /// the entered password to stdout for autotype to act on.
+        unlock_mode: bool,
         master: String,
-        unlock_msg: Option<String>,
+        /// Optional message (e.g. "Wrong master password.") autotype
+        /// passes in to show above the prompt on a retry.
+        note: Option<String>,
     }
 
     impl PickerApp {
-        pub fn new(target_title: Option<String>) -> Self {
-            let mut s = Self {
-                entries: Vec::new(),
+        pub fn new(
+            target_title: Option<String>,
+            entries: Vec<EntryRef>,
+            unlock_mode: bool,
+            note: Option<String>,
+        ) -> Self {
+            eprintln!(
+                "[picker] built: {} entries, unlock_mode={}",
+                entries.len(),
+                unlock_mode
+            );
+            Self {
+                entries,
                 filter: String::new(),
                 selected: 0,
                 target_title,
-                load_error: None,
                 first_frame: true,
-                locked: false,
+                unlock_mode,
                 master: String::new(),
-                unlock_msg: None,
-            };
-            match load_entries(&s.target_title) {
-                Load::Entries(e) => s.entries = e,
-                Load::Locked => s.locked = true,
-                Load::Failed(m) => s.load_error = Some(m),
+                note,
             }
-            eprintln!(
-                "[picker] PickerApp built: {} entries, locked={}, load_error={:?}",
-                s.entries.len(),
-                s.locked,
-                s.load_error
-            );
-            s
         }
 
         fn unlock_panel(&mut self, ui: &mut egui::Ui) {
             ui.colored_label(COLOR_MUTED, "The vault is locked.");
+            if let Some(n) = &self.note {
+                ui.add_space(4.0);
+                ui.colored_label(COLOR_ERROR, n.as_str());
+            }
             ui.add_space(6.0);
             ui.label("Master password");
             let resp = ui.add(
@@ -540,51 +525,11 @@ mod picker {
                 }
             });
             if go && !self.master.is_empty() {
-                match ipc::rpc_authed(
-                    "passwort-picker",
-                    &Request::Unlock {
-                        password: self.master.clone(),
-                    },
-                ) {
-                    Ok(Response::Ok) => {
-                        self.master.zeroize();
-                        self.unlock_msg = None;
-                        match load_entries(&self.target_title) {
-                            Load::Entries(e) => {
-                                self.entries = e;
-                                self.locked = false;
-                            }
-                            Load::Locked => {
-                                self.unlock_msg =
-                                    Some("Still locked — try again.".into());
-                            }
-                            Load::Failed(m) => {
-                                self.load_error = Some(m);
-                                self.locked = false;
-                            }
-                        }
-                    }
-                    Ok(Response::Error { code, message }) => {
-                        self.master.zeroize();
-                        self.unlock_msg = Some(if code == "wrong_password" {
-                            "Wrong master password.".into()
-                        } else {
-                            message
-                        });
-                    }
-                    Ok(_) => {
-                        self.unlock_msg = Some("unexpected response".into());
-                    }
-                    Err(e) => {
-                        self.unlock_msg = Some(e.to_string());
-                    }
-                }
-            } else if go {
-                self.unlock_msg = Some("Master password required.".into());
-            }
-            if let Some(m) = &self.unlock_msg {
-                ui.add_space(8.0);
-                ui.colored_label(COLOR_ERROR, m.as_str());
+                // Hand the master password back to autotype (the only
+                // approved client); it performs the actual Unlock.
+                println!("{}", self.master);
+                self.master.zeroize();
+                std::process::exit(0);
             }
         }
 
@@ -616,8 +561,8 @@ mod picker {
                 eprintln!("[picker] first frame — window should now be visible");
             }
 
-            if self.locked {
-                // Esc still cancels in the locked state.
+            if self.unlock_mode {
+                // Esc cancels.
                 if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                     std::process::exit(1);
                 }
@@ -668,18 +613,6 @@ mod picker {
                 if let Some(t) = &self.target_title {
                     ui.colored_label(COLOR_MUTED, format!("→ {}", t));
                     ui.add_space(4.0);
-                }
-
-                if let Some(err) = &self.load_error {
-                    ui.colored_label(COLOR_ERROR, err);
-                    ui.add_space(8.0);
-                    if ui
-                        .add_sized([100.0, 28.0], egui::Button::new("Close"))
-                        .clicked()
-                    {
-                        std::process::exit(1);
-                    }
-                    return;
                 }
 
                 // Filter input — auto-focused

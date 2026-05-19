@@ -20,7 +20,7 @@
 //! register and the keystrokes will go nowhere; we fall back to writing
 //! the password to the clipboard so the user can paste it (TODO).
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -276,47 +276,192 @@ pub fn run_fill_flow() {
         target_window_id, target_window_title, crate::typing::detect()
     );
 
-    // Fast path (X11 only): if exactly one saved entry matches the active
-    // window's title, skip the picker entirely and type immediately.
-    // KeePassXC does the same — picker only shows when title is ambiguous.
+    // autotype is the single approved daemon client. It fetches the
+    // entries itself (and, if the vault is locked, drives an unlock
+    // through the picker). The picker is now a dumb UI fed via stdin.
+    let mut note: Option<String> = None;
+    let entries = loop {
+        match fetch_entries() {
+            Fetch::Entries(e) => break e,
+            Fetch::Failed(m) => {
+                eprintln!("[fill] list failed: {}", m);
+                return;
+            }
+            Fetch::Locked => {
+                let master = match spawn_picker_unlock(
+                    target_window_title.as_deref(),
+                    note.as_deref(),
+                ) {
+                    Some(m) => m,
+                    None => return, // cancelled
+                };
+                match rpc_authed(
+                    "passwort-autotype",
+                    &Request::Unlock { password: master },
+                ) {
+                    Ok(Response::Ok) => {
+                        note = None;
+                        continue;
+                    }
+                    Ok(Response::Error { code, .. })
+                        if code == "wrong_password" =>
+                    {
+                        note = Some("Wrong master password.".into());
+                        continue;
+                    }
+                    Ok(Response::Error { message, .. }) => {
+                        eprintln!("[fill] unlock failed: {}", message);
+                        return;
+                    }
+                    Ok(_) => {
+                        eprintln!("[fill] unlock: unexpected response");
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("[fill] unlock rpc failed: {}", e);
+                        return;
+                    }
+                }
+            }
+        }
+    };
+
+    let entries = sorted_by_title(entries, target_window_title.as_deref());
+
+    // Fast path (X11 only): exactly one entry matching the window title
+    // → skip the picker and type immediately (KeePassXC does the same).
     if on_x11 {
-        if let Some(name) = unique_match_for_title(target_window_title.as_deref()) {
-            eprintln!("[fill] auto-pick → '{}' (unique match for title)", name);
+        if let Some(name) = unique_match(&entries, target_window_title.as_deref())
+        {
+            eprintln!("[fill] auto-pick → '{}' (unique title match)", name);
             type_for_entry(&name, target_window_id.as_deref());
             return;
         }
     }
 
-    eprintln!("[fill] no unique match → opening picker");
-    let picker_bin = picker_binary_path();
-    let mut cmd = Command::new(&picker_bin);
+    eprintln!("[fill] opening picker");
+    if let Some(name) =
+        spawn_picker_pick(&entries, target_window_title.as_deref())
+    {
+        type_for_entry(&name, target_window_id.as_deref());
+    }
+}
+
+enum Fetch {
+    Entries(Vec<EntryRef>),
+    Locked,
+    Failed(String),
+}
+
+fn fetch_entries() -> Fetch {
+    match rpc_authed("passwort-autotype", &Request::ListEntries) {
+        Ok(Response::Entries { entries }) => Fetch::Entries(entries),
+        Ok(Response::Error { code, message }) => {
+            if code == "locked" {
+                Fetch::Locked
+            } else {
+                Fetch::Failed(message)
+            }
+        }
+        Ok(_) => Fetch::Failed("unexpected response".into()),
+        Err(e) => Fetch::Failed(e.to_string()),
+    }
+}
+
+/// Entries whose name appears in the active window title sort first;
+/// the rest keep their original order. (Was inside the picker; moved
+/// here now that autotype owns the fetch.)
+fn sorted_by_title(mut entries: Vec<EntryRef>, title: Option<&str>) -> Vec<EntryRef> {
+    if let Some(t) = title {
+        let t_low = t.to_lowercase();
+        entries.sort_by_key(|e| {
+            let n = e.name.to_lowercase();
+            !(t_low.contains(&n) || n.split('.').any(|p| t_low.contains(p)))
+        });
+    }
+    entries
+}
+
+/// Spawn the picker in list mode, feed it the entries on stdin (on a
+/// thread so a big vault can't deadlock the pipe), and return the
+/// chosen entry name (None = cancelled).
+fn spawn_picker_pick(
+    entries: &[EntryRef],
+    target_title: Option<&str>,
+) -> Option<String> {
+    let mut cmd = Command::new(picker_binary_path());
     cmd.arg("--picker");
-    if let Some(t) = &target_window_title {
+    if let Some(t) = target_title {
         cmd.arg("--target-title").arg(t);
     }
+    cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::inherit());
-
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("passwort-autotype: failed to launch picker: {}", e);
-            return;
+            return None;
         }
     };
-
+    if let Some(mut sin) = child.stdin.take() {
+        let json = serde_json::to_string(entries).unwrap_or_else(|_| "[]".into());
+        thread::spawn(move || {
+            let _ = sin.write_all(json.as_bytes());
+            // drop closes stdin → picker sees EOF
+        });
+    }
     let mut chosen = String::new();
-    if let Some(stdout) = child.stdout.take() {
-        let mut r = BufReader::new(stdout);
-        let _ = r.read_line(&mut chosen);
+    if let Some(out) = child.stdout.take() {
+        let _ = BufReader::new(out).read_line(&mut chosen);
     }
-    let exit = child.wait().ok();
+    let ok = child.wait().map(|s| s.success()).unwrap_or(false);
     let chosen = chosen.trim().to_string();
-    if chosen.is_empty() || exit.map(|s| !s.success()).unwrap_or(true) {
-        return; // cancelled or no selection
+    if ok && !chosen.is_empty() {
+        Some(chosen)
+    } else {
+        None
     }
+}
 
-    type_for_entry(&chosen, target_window_id.as_deref());
+/// Spawn the picker in unlock mode; return the typed master password
+/// (None = cancelled). `note` is shown above the prompt on a retry.
+fn spawn_picker_unlock(
+    target_title: Option<&str>,
+    note: Option<&str>,
+) -> Option<String> {
+    let mut cmd = Command::new(picker_binary_path());
+    cmd.arg("--picker").arg("--unlock");
+    if let Some(t) = target_title {
+        cmd.arg("--target-title").arg(t);
+    }
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::inherit());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("passwort-autotype: failed to launch unlock prompt: {}", e);
+            return None;
+        }
+    };
+    if let Some(mut sin) = child.stdin.take() {
+        let n = note.unwrap_or("").to_string();
+        thread::spawn(move || {
+            let _ = sin.write_all(n.as_bytes());
+        });
+    }
+    let mut master = String::new();
+    if let Some(out) = child.stdout.take() {
+        let _ = BufReader::new(out).read_line(&mut master);
+    }
+    let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+    let master = master.trim_end_matches(['\n', '\r']).to_string();
+    if ok && !master.is_empty() {
+        Some(master)
+    } else {
+        None
+    }
 }
 
 /// Standalone "save the credential for the active app" flow. Wayland
@@ -343,16 +488,11 @@ pub fn run_save_flow() {
 /// active window title (or vice-versa). Returns Some(name) only when
 /// EXACTLY one entry matches — picker is shown otherwise so the user
 /// disambiguates.
-fn unique_match_for_title(title: Option<&str>) -> Option<String> {
+fn unique_match(entries: &[EntryRef], title: Option<&str>) -> Option<String> {
     let title = title?.to_lowercase();
     if title.trim().is_empty() {
         return None;
     }
-    let resp = rpc_authed("passwort-autotype", &Request::ListEntries).ok()?;
-    let entries: Vec<EntryRef> = match resp {
-        Response::Entries { entries } => entries,
-        _ => return None,
-    };
     let matches: Vec<&EntryRef> = entries
         .iter()
         .filter(|e| {

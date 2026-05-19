@@ -10,9 +10,25 @@ fn main() {
     };
 
     // Quick-pick mode (launched by passwort-autotype's fill hotkey).
+    // The picker no longer talks to the daemon: autotype passes the
+    // entries as a JSON array on stdin (normal mode), or runs us with
+    // `--unlock` (stdin carries an optional error note to show) and
+    // reads the typed master password back on stdout.
     if args.iter().any(|a| a == "--picker") {
+        use std::io::Read;
         let target = arg_after("--target-title");
-        if let Err(e) = gui::run_picker(target) {
+        let unlock_mode = args.iter().any(|a| a == "--unlock");
+        let mut stdin_buf = String::new();
+        let _ = std::io::stdin().read_to_string(&mut stdin_buf);
+        let (entries, note) = if unlock_mode {
+            let t = stdin_buf.trim();
+            (Vec::new(), if t.is_empty() { None } else { Some(t.to_string()) })
+        } else {
+            let entries: Vec<passwort_manager::ipc::EntryRef> =
+                serde_json::from_str(stdin_buf.trim()).unwrap_or_default();
+            (entries, None)
+        };
+        if let Err(e) = gui::run_picker(target, entries, unlock_mode, note) {
             eprintln!("picker failed: {}", e);
             std::process::exit(1);
         }
