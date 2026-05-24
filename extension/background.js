@@ -114,11 +114,37 @@ browser.tabs.onRemoved.addListener((tabId) => {
     tabCaptures.delete(tabId);
 });
 
+// Pull the host out of a tab url, but only for http(s). Other schemes
+// (about:, moz-extension:, file:) shouldn't bind to a vault entry.
+function tabOrigin(tabUrl) {
+    if (!tabUrl) return null;
+    try {
+        const u = new URL(tabUrl);
+        if (u.protocol === "https:" || u.protocol === "http:") {
+            return u.hostname.toLowerCase();
+        }
+    } catch {}
+    return null;
+}
+
 browser.runtime.onMessage.addListener((msg, sender) => {
     if (!msg) return;
 
     if (msg.type === "rpc") {
-        return send(msg.payload);
+        // Bind every content-script RPC to the tab's true origin so the
+        // daemon refuses cross-host reads — a compromised script on
+        // evil.com can't ask for paypal.com credentials even though we
+        // share one native-host connection. We *overwrite* any origin
+        // field the caller set (don't trust untrusted input). The popup
+        // has no sender.tab and stays unrestricted.
+        const payload = { ...msg.payload };
+        const origin = sender && sender.tab ? tabOrigin(sender.tab.url) : null;
+        if (origin) {
+            payload.origin = origin;
+        } else {
+            delete payload.origin;
+        }
+        return send(payload);
     }
 
     if (msg.type === "captured_submit") {

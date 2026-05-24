@@ -51,6 +51,16 @@ pub struct Envelope {
     /// what they're approving.
     #[serde(default)]
     pub client_label: Option<String>,
+    /// Optional hostname the caller is operating in (e.g. `github.com` when
+    /// the browser extension fires an RPC from a tab loaded at that host).
+    /// When set, the daemon restricts host-scoped reads (`ListEntries`,
+    /// `Get`, `Totp`) to entries whose `url` (or `name`, for older entries)
+    /// matches that host — so a compromised content script on `evil.com`
+    /// can't ask for `paypal.com` credentials. The browser extension's
+    /// background script attaches this from `sender.tab.url`, which a
+    /// page-controlled script cannot spoof.
+    #[serde(default)]
+    pub origin: Option<String>,
     #[serde(flatten)]
     pub op: Request,
 }
@@ -483,9 +493,10 @@ fn handle_client(stream: UnixStream, state: SharedState) -> std::io::Result<()> 
 /// Top-level dispatcher: enforces auth for protected ops, lets the auth
 /// bootstrap ops through unauthenticated.
 fn process_envelope(env: Envelope, state: &Mutex<DaemonState>) -> Response {
+    let origin = env.origin.as_deref().map(str::to_string);
     match &env.op {
         // Always-allowed ops
-        Request::Status => return process_request(env.op, state),
+        Request::Status => return process_request(env.op, state, origin.as_deref()),
         Request::Register => {
             let token = match env.auth_token.as_deref() {
                 Some(t) if !t.is_empty() => t,
@@ -580,12 +591,12 @@ fn process_envelope(env: Envelope, state: &Mutex<DaemonState>) -> Response {
                 };
                 return error(code, msg);
             }
-            process_request(env.op, state)
+            process_request(env.op, state, origin.as_deref())
         }
     }
 }
 
-fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
+fn process_request(req: Request, state: &Mutex<DaemonState>, origin: Option<&str>) -> Response {
     match req {
         Request::Register | Request::AuthStatus => unreachable!("handled in process_envelope"),
         Request::Status => {
@@ -719,6 +730,10 @@ fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
                     let entries: Vec<EntryRef> = sess
                         .accounts
                         .iter()
+                        .filter(|a| match origin {
+                            Some(host) => entry_matches_host(a, host),
+                            None => true,
+                        })
                         .map(|a| EntryRef {
                             name: a.name.clone(),
                             url: a.url.clone(),
@@ -737,6 +752,16 @@ fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
                 None => locked_error(),
                 Some(sess) => match sess.accounts.iter().find(|a| a.name == name) {
                     Some(acc) => {
+                        // Origin-bound caller (the browser extension) may
+                        // only fetch entries that belong to the host it's
+                        // running in. Respond as if the entry doesn't
+                        // exist — leaking "exists but off-origin" would
+                        // tell a compromised script which sites you save.
+                        if let Some(host) = origin {
+                            if !entry_matches_host(acc, host) {
+                                return error(codes::NOT_FOUND, "not found");
+                            }
+                        }
                         let cred = Response::Credential {
                             name: acc.name.clone(),
                             username: acc.username.clone(),
@@ -756,6 +781,11 @@ fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
                 None => locked_error(),
                 Some(sess) => match sess.accounts.iter().find(|a| a.name == name) {
                     Some(acc) => {
+                        if let Some(host) = origin {
+                            if !entry_matches_host(acc, host) {
+                                return error(codes::NOT_FOUND, "not found");
+                            }
+                        }
                         if acc.totp_secret.is_empty() {
                             error(codes::NO_TOTP, "this account has no 2FA secret")
                         } else {
@@ -990,6 +1020,116 @@ fn process_request(req: Request, state: &Mutex<DaemonState>) -> Response {
 
 fn locked_error() -> Response {
     error(codes::LOCKED, "vault is locked; run `passwortctl unlock` first")
+}
+
+// =================== origin matching ===================
+//
+// Same rules as `extension/content.js`'s `entryMatchesHost` so the daemon
+// and the page-side filter agree on what "belongs to this host" means.
+// Match is host-or-subdomain; e.g. saved `google.com` matches the page
+// `accounts.google.com`.
+
+fn host_from_url(url: &str) -> String {
+    let s = url.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    let after_scheme = match s.split_once("://") {
+        Some((_, rest)) => rest,
+        None => s,
+    };
+    let host_part = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let host_part = match host_part.rsplit_once('@') {
+        Some((_, h)) => h,
+        None => host_part,
+    };
+    // Strip :port only if the trailing component is all digits — leaves
+    // IPv6-bracketed and otherwise-malformed hosts alone.
+    let host = match host_part.rsplit_once(':') {
+        Some((h, port))
+            if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            h
+        }
+        _ => host_part,
+    };
+    host.to_lowercase()
+}
+
+fn matches_host(saved: &str, host: &str) -> bool {
+    let s = saved.trim().to_lowercase();
+    let h = host.trim().to_lowercase();
+    if s.is_empty() || h.is_empty() {
+        return false;
+    }
+    s == h || h.ends_with(&format!(".{}", s))
+}
+
+fn entry_matches_host(account: &storage::Account, host: &str) -> bool {
+    if host.trim().is_empty() {
+        return false;
+    }
+    let url_host = host_from_url(&account.url);
+    if !url_host.is_empty() {
+        return matches_host(&url_host, host);
+    }
+    matches_host(&account.name, host)
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+    use crate::storage::Account;
+
+    fn acc(name: &str, url: &str) -> Account {
+        Account {
+            name: name.into(),
+            url: url.into(),
+            username: String::new(),
+            password: String::new(),
+            totp_secret: String::new(),
+            notes: String::new(),
+            history: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn host_extraction() {
+        assert_eq!(host_from_url("https://github.com/login"), "github.com");
+        assert_eq!(host_from_url("github.com"), "github.com");
+        assert_eq!(host_from_url("http://user:pw@example.com:8080/x"), "example.com");
+        assert_eq!(host_from_url(""), "");
+        assert_eq!(host_from_url("https://Foo.COM"), "foo.com");
+    }
+
+    #[test]
+    fn exact_and_subdomain_match() {
+        assert!(matches_host("github.com", "github.com"));
+        assert!(matches_host("google.com", "accounts.google.com"));
+        assert!(!matches_host("github.com", "evil.com"));
+        // Make sure "evilgithub.com" doesn't squeeze through as a subdomain.
+        assert!(!matches_host("github.com", "evilgithub.com"));
+        // Empty saved/host never matches — important so an entry with no
+        // url and no name doesn't grant access to every page.
+        assert!(!matches_host("", "github.com"));
+        assert!(!matches_host("github.com", ""));
+    }
+
+    #[test]
+    fn entry_falls_back_to_name_when_url_empty() {
+        let e = acc("github.com", "");
+        assert!(entry_matches_host(&e, "github.com"));
+        assert!(entry_matches_host(&e, "api.github.com"));
+        assert!(!entry_matches_host(&e, "evil.com"));
+    }
+
+    #[test]
+    fn entry_prefers_url_over_name() {
+        // url present → name is ignored entirely
+        let e = acc("My Banking Login", "https://chase.com");
+        assert!(entry_matches_host(&e, "chase.com"));
+        assert!(!entry_matches_host(&e, "my-banking-login"));
+    }
 }
 
 // =================== Generic client helper ===================
