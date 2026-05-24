@@ -7,7 +7,7 @@ use base64::{engine::general_purpose, Engine};
 use rand::RngCore;
 use zeroize::Zeroizing;
 
-pub const KDF_M_COST: u32 = 65536; // 64 MiB
+pub const KDF_M_COST: u32 = 131072; // 128 MiB
 pub const KDF_T_COST: u32 = 3;
 pub const KDF_P_COST: u32 = 4;
 pub const SALT_LEN: usize = 16;
