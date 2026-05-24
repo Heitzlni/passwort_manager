@@ -169,23 +169,56 @@ mod quick_save {
         }
 
         fn locked_ui(&mut self, ui: &mut egui::Ui) {
-            ui.colored_label(COLOR_MUTED, "The vault is locked.");
-            ui.add_space(4.0);
-            ui.label(format!(
-                "Unlock to save \u{201c}{}\u{201d}",
-                self.name
-            ));
+            ui.colored_label(
+                COLOR_MUTED,
+                "Save credential for the active app (vault is locked).",
+            );
             ui.add_space(8.0);
-            ui.label("Master password");
+
+            // Full credential form, same as the unlocked dialog. Without
+            // this the user has nowhere to type the account password
+            // they're saving — only the master would be entered.
+            ui.label("Name");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.name)
+                    .desired_width(f32::INFINITY)
+                    .margin(egui::vec2(8.0, 6.0)),
+            );
+            ui.add_space(6.0);
+
+            ui.label("Username");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.username)
+                    .desired_width(f32::INFINITY)
+                    .margin(egui::vec2(8.0, 6.0)),
+            );
+            ui.add_space(6.0);
+
+            ui.label("Password");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.password)
+                        .password(!self.show_password)
+                        .desired_width(ui.available_width() - 70.0)
+                        .margin(egui::vec2(8.0, 6.0)),
+                );
+                ui.checkbox(&mut self.show_password, "show");
+            });
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(8.0);
+
+            ui.label("Master password (to unlock the vault)");
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.master)
                     .password(true)
                     .desired_width(f32::INFINITY)
                     .margin(egui::vec2(8.0, 6.0)),
             );
-            if !resp.has_focus() {
-                resp.request_focus();
-            }
+            // No auto-focus on master: the user usually needs to fill
+            // the credential password (above) first; Tab moves between
+            // fields. Pressing Enter inside master still triggers
+            // "Unlock & Save".
             let mut do_unlock = resp.lost_focus()
                 && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.add_space(10.0);
