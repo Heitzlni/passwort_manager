@@ -237,20 +237,7 @@ fn parse_key_code(key: &str) -> Result<Code, String> {
 
 fn handle_save_hotkey() {
     eprintln!("[save-hotkey] pressed");
-    let target_window_title = active_window_title();
-    eprintln!("[save-hotkey] target window title: {:?}", target_window_title);
-
-    let bin = picker_binary_path();
-    let mut cmd = Command::new(&bin);
-    cmd.arg("--quick-save");
-    if let Some(t) = &target_window_title {
-        cmd.arg("--target-title").arg(t);
-    }
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::inherit());
-    if let Err(e) = cmd.spawn() {
-        eprintln!("passwort-autotype: failed to launch quick-save dialog: {}", e);
-    }
+    run_save_flow();
 }
 
 fn handle_fill_hotkey() {
@@ -471,16 +458,199 @@ fn spawn_picker_unlock(
 pub fn run_save_flow() {
     let on_x11 = crate::typing::detect() == crate::typing::Backend::Xdotool;
     let target_window_title = if on_x11 { active_window_title() } else { None };
-    let bin = picker_binary_path();
-    let mut cmd = Command::new(&bin);
+    // Tell the dialog up front whether the vault is locked so it can
+    // show the right UI without doing its own IPC.
+    let locked = daemon_locked();
+    let out = match spawn_quick_save(target_window_title.as_deref(), locked) {
+        Some(v) => v,
+        None => return, // cancelled / failed to launch
+    };
+    dispatch_save(out);
+}
+
+fn daemon_locked() -> bool {
+    match rpc_authed("passwort-autotype", &Request::Status) {
+        Ok(Response::Status { unlocked, .. }) => !unlocked,
+        // If we can't tell, assume unlocked: the worst case is that the
+        // dialog shows the normal Save UI and the daemon returns
+        // "locked"; `dispatch_save` then transparently falls back to a
+        // sealed stash so the credential isn't lost.
+        _ => false,
+    }
+}
+
+/// Spawn the quick-save dialog and read its JSON result line. None =
+/// cancelled, launch failed, or the dialog exited without printing.
+fn spawn_quick_save(
+    target_title: Option<&str>,
+    locked: bool,
+) -> Option<serde_json::Value> {
+    let mut cmd = Command::new(picker_binary_path());
     cmd.arg("--quick-save");
-    if let Some(t) = &target_window_title {
+    if locked {
+        cmd.arg("--locked");
+    }
+    if let Some(t) = target_title {
         cmd.arg("--target-title").arg(t);
     }
-    cmd.stdout(Stdio::null());
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::inherit());
-    if let Err(e) = cmd.spawn() {
-        eprintln!("passwort-autotype: failed to launch quick-save dialog: {}", e);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "passwort-autotype: failed to launch quick-save dialog: {}",
+                e
+            );
+            return None;
+        }
+    };
+    let mut line = String::new();
+    if let Some(out) = child.stdout.take() {
+        let _ = BufReader::new(out).read_line(&mut line);
+    }
+    let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+    let line = line.trim();
+    if !ok || line.is_empty() {
+        return None; // cancelled (exit 1) or no payload
+    }
+    serde_json::from_str(line).ok()
+}
+
+/// Execute the user's intent (from the dialog's JSON) using autotype's
+/// own approved token and notify the outcome.
+fn dispatch_save(out: serde_json::Value) {
+    let action = out.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    let s = |k: &str| -> String {
+        out.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let name = s("name");
+    let username = s("username");
+    let password = s("password");
+    let master = s("master");
+
+    match action {
+        "save" => match try_save(&name, &username, &password) {
+            SaveResult::Ok => notify("Saved", &format!("Saved \"{}\".", name)),
+            SaveResult::Locked => {
+                // Race: vault locked between Status and Save → don't
+                // lose the credential; transparently stash it.
+                match try_stash(&name, &username, &password) {
+                    Ok(()) => notify(
+                        "Stashed",
+                        &format!(
+                            "Vault locked — \"{}\" stashed for review at next unlock.",
+                            name
+                        ),
+                    ),
+                    Err(m) => notify("Save failed", &m),
+                }
+            }
+            SaveResult::Err(m) => notify("Save failed", &m),
+        },
+        "unlock_save" => match try_unlock(&master) {
+            Ok(()) => match try_save(&name, &username, &password) {
+                SaveResult::Ok => {
+                    notify("Saved", &format!("Unlocked and saved \"{}\".", name))
+                }
+                SaveResult::Locked => notify(
+                    "Save failed",
+                    "Vault locked again before save could complete.",
+                ),
+                SaveResult::Err(m) => notify("Save failed", &m),
+            },
+            Err(m) => notify("Unlock failed", &m),
+        },
+        "stash" => match try_stash(&name, &username, &password) {
+            Ok(()) => notify(
+                "Stashed",
+                &format!(
+                    "\"{}\" stashed for review at next vault unlock.",
+                    name
+                ),
+            ),
+            Err(m) => notify("Stash failed", &m),
+        },
+        "cancel" | _ => {} // silent
+    }
+}
+
+enum SaveResult {
+    Ok,
+    Locked,
+    Err(String),
+}
+
+fn try_save(name: &str, username: &str, password: &str) -> SaveResult {
+    match rpc_authed(
+        "passwort-autotype",
+        &Request::Save {
+            name: name.to_string(),
+            username: username.to_string(),
+            password: password.to_string(),
+        },
+    ) {
+        Ok(Response::Ok) => SaveResult::Ok,
+        Ok(Response::Error { code, .. }) if code == "locked" => SaveResult::Locked,
+        Ok(Response::Error { message, .. }) => SaveResult::Err(message),
+        Ok(_) => SaveResult::Err("unexpected response".into()),
+        Err(e) => SaveResult::Err(e.to_string()),
+    }
+}
+
+fn try_stash(name: &str, username: &str, password: &str) -> Result<(), String> {
+    match rpc_authed(
+        "passwort-autotype",
+        &Request::SaveLocked {
+            name: name.to_string(),
+            url: String::new(),
+            username: username.to_string(),
+            password: password.to_string(),
+            totp_secret: String::new(),
+            notes: String::new(),
+        },
+    ) {
+        Ok(Response::Ok) => Ok(()),
+        Ok(Response::Error { message, .. }) => Err(message),
+        Ok(_) => Err("unexpected response".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn try_unlock(master: &str) -> Result<(), String> {
+    match rpc_authed(
+        "passwort-autotype",
+        &Request::Unlock {
+            password: master.to_string(),
+        },
+    ) {
+        Ok(Response::Ok) => Ok(()),
+        Ok(Response::Error { code, message }) => Err(if code == "wrong_password" {
+            "Wrong master password.".into()
+        } else {
+            message
+        }),
+        Ok(_) => Err("unexpected response".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Surface a result as a desktop notification (libnotify / notify-send).
+/// Best-effort: silently falls back to stderr if `notify-send` isn't
+/// installed, so the user still sees something in the journal.
+fn notify(title: &str, body: &str) {
+    let r = Command::new("notify-send")
+        .args(["-a", "Password Manager", title, body])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if r.map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("[autotype] {}: {}", title, body);
     }
 }
 

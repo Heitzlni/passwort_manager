@@ -80,7 +80,10 @@ pub fn run_picker(
 /// auto-type daemon's save hotkey fires. Small dialog with name (pre-filled
 /// from the active window's title), username, and password fields.
 /// Calls the daemon's Save RPC and exits.
-pub fn run_quick_save(target_title: Option<String>) -> Result<(), eframe::Error> {
+pub fn run_quick_save(
+    target_title: Option<String>,
+    locked: bool,
+) -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([440.0, 360.0])
@@ -95,34 +98,40 @@ pub fn run_quick_save(target_title: Option<String>) -> Result<(), eframe::Error>
     eframe::run_native(
         "Save credential",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             setup_style(&cc.egui_ctx);
-            Box::new(quick_save::QuickSaveApp::new(target_title))
+            Box::new(quick_save::QuickSaveApp::new(target_title, locked))
         }),
     )
 }
 
 mod quick_save {
-    use super::{COLOR_ACCENT, COLOR_ERROR, COLOR_MUTED, COLOR_OK};
-    use crate::ipc::{self, Request, Response};
+    use super::{COLOR_ACCENT, COLOR_ERROR, COLOR_MUTED};
     use eframe::egui;
     use zeroize::Zeroize;
 
+    /// The quick-save dialog no longer talks to the daemon. It collects
+    /// the form (name/username/password, plus a master password in
+    /// `--locked` mode) and emits the user's intent as a single line of
+    /// JSON on stdout for `passwort-autotype` (the single approved
+    /// client) to act on. So quick-save has no client identity and
+    /// needs no approval.
     pub struct QuickSaveApp {
         name: String,
         username: String,
         password: String,
         show_password: bool,
-        message: Option<(String, bool)>, // (text, is_error)
-        saved: bool,
-        /// Daemon reported the vault locked → show the inline unlock UI
-        /// instead of dead-ending.
+        /// Validation messages only (e.g. "Name required"). Daemon
+        /// outcomes are reported by autotype after this process exits.
+        message: Option<String>,
+        /// Determined at launch by autotype checking the daemon's
+        /// Status — show the inline unlock UI when true.
         locked: bool,
         master: String,
     }
 
     impl QuickSaveApp {
-        pub fn new(target_title: Option<String>) -> Self {
+        pub fn new(target_title: Option<String>, locked: bool) -> Self {
             Self {
                 name: target_title
                     .map(|t| sanitize_title(&t))
@@ -131,67 +140,32 @@ mod quick_save {
                 password: String::new(),
                 show_password: false,
                 message: None,
-                saved: false,
-                locked: false,
+                locked,
                 master: String::new(),
             }
         }
 
-        fn req(&self, r: &Request) -> Result<Response, String> {
-            ipc::rpc_authed("passwort-quick-save", r).map_err(|e| e.to_string())
-        }
-
-        /// Ok(true) = saved into the unlocked vault; Ok(false) = daemon
-        /// is locked; Err = anything else.
-        fn do_save(&self) -> Result<bool, String> {
-            match self.req(&Request::Save {
-                name: self.name.clone(),
-                username: self.username.clone(),
-                password: self.password.clone(),
-            })? {
-                Response::Ok => Ok(true),
-                Response::Error { code, .. } if code == "locked" => Ok(false),
-                Response::Error { message, .. } => Err(message),
-                _ => Err("Unexpected response from daemon.".into()),
+        /// Print the user's intent as one JSON line on stdout and exit.
+        /// autotype reads it and performs the actual daemon op with its
+        /// own approved token. Caller has already validated the inputs.
+        fn emit_and_exit(&mut self, action: &str, include_master: bool) -> ! {
+            let mut obj = serde_json::Map::new();
+            obj.insert("action".into(), action.into());
+            obj.insert("name".into(), self.name.clone().into());
+            obj.insert("username".into(), self.username.clone().into());
+            obj.insert("password".into(), self.password.clone().into());
+            if include_master {
+                obj.insert("master".into(), self.master.clone().into());
             }
-        }
-
-        fn do_stash(&self) -> Result<(), String> {
-            match self.req(&Request::SaveLocked {
-                name: self.name.clone(),
-                url: String::new(),
-                username: self.username.clone(),
-                password: self.password.clone(),
-                totp_secret: String::new(),
-                notes: String::new(),
-            })? {
-                Response::Ok => Ok(()),
-                Response::Error { message, .. } => Err(message),
-                _ => Err("Unexpected response from daemon.".into()),
-            }
-        }
-
-        fn do_unlock(&self) -> Result<(), String> {
-            match self.req(&Request::Unlock {
-                password: self.master.clone(),
-            })? {
-                Response::Ok => Ok(()),
-                Response::Error { code, message } => Err(if code == "wrong_password" {
-                    "Wrong master password.".into()
-                } else {
-                    message
-                }),
-                _ => Err("Unexpected response from daemon.".into()),
-            }
-        }
-
-        fn commit_saved(&mut self, msg: String) {
-            self.saved = true;
-            self.locked = false;
-            self.message = Some((msg, false));
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::Value::Object(obj))
+                    .unwrap_or_else(|_| "{\"action\":\"cancel\"}".into())
+            );
             self.password.zeroize();
             self.username.zeroize();
             self.master.zeroize();
+            std::process::exit(0);
         }
 
         fn locked_ui(&mut self, ui: &mut egui::Ui) {
@@ -230,21 +204,20 @@ mod quick_save {
                 }
                 if ui
                     .add_sized(
-                        egui::vec2(160.0, 28.0),
+                        egui::vec2(170.0, 28.0),
                         egui::Button::new("Save without unlocking"),
                     )
                     .on_hover_text(
-                        "Stash it sealed; review at the next GUI unlock",
+                        "Stash sealed; review at the next GUI unlock",
                     )
                     .clicked()
                 {
-                    match self.do_stash() {
-                        Ok(()) => self.commit_saved(
-                            "Vault locked — stashed. It'll appear for \
-                             review when you next unlock the app."
-                                .into(),
-                        ),
-                        Err(m) => self.message = Some((m, true)),
+                    if self.name.trim().is_empty() {
+                        self.message = Some("Name required.".into());
+                    } else if self.password.is_empty() {
+                        self.message = Some("Password required.".into());
+                    } else {
+                        self.emit_and_exit("stash", false);
                     }
                 }
                 if ui
@@ -254,36 +227,23 @@ mod quick_save {
                     )
                     .clicked()
                 {
-                    std::process::exit(if self.saved { 0 } else { 1 });
+                    std::process::exit(1);
                 }
             });
             if do_unlock {
                 if self.master.is_empty() {
-                    self.message =
-                        Some(("Master password required.".into(), true));
+                    self.message = Some("Master password required.".into());
+                } else if self.name.trim().is_empty() {
+                    self.message = Some("Name required.".into());
+                } else if self.password.is_empty() {
+                    self.message = Some("Password required.".into());
                 } else {
-                    match self.do_unlock() {
-                        Ok(()) => match self.do_save() {
-                            Ok(true) => self.commit_saved(format!(
-                                "Unlocked and saved \u{201c}{}\u{201d}.",
-                                self.name
-                            )),
-                            Ok(false) => {
-                                self.message = Some((
-                                    "Still locked — try again.".into(),
-                                    true,
-                                ))
-                            }
-                            Err(m) => self.message = Some((m, true)),
-                        },
-                        Err(m) => self.message = Some((m, true)),
-                    }
+                    self.emit_and_exit("unlock_save", true);
                 }
             }
-            if let Some((msg, is_err)) = &self.message {
+            if let Some(msg) = &self.message {
                 ui.add_space(8.0);
-                let color = if *is_err { COLOR_ERROR } else { COLOR_OK };
-                ui.colored_label(color, msg.as_str());
+                ui.colored_label(COLOR_ERROR, msg.as_str());
             }
         }
     }
@@ -299,7 +259,7 @@ mod quick_save {
     impl eframe::App for QuickSaveApp {
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                std::process::exit(if self.saved { 0 } else { 1 });
+                std::process::exit(1);
             }
 
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -351,38 +311,24 @@ mod quick_save {
                         || ctx.input(|i| i.key_pressed(egui::Key::Enter));
                     if save_clicked {
                         if self.name.trim().is_empty() {
-                            self.message = Some(("Name is required.".into(), true));
+                            self.message = Some("Name required.".into());
                         } else if self.password.is_empty() {
-                            self.message = Some(("Password is required.".into(), true));
+                            self.message = Some("Password required.".into());
                         } else {
-                            match self.do_save() {
-                                Ok(true) => self.commit_saved(format!(
-                                    "Saved \u{201c}{}\u{201d}.",
-                                    self.name
-                                )),
-                                // Locked → switch to the inline unlock UI
-                                // (with a "save without unlocking" escape
-                                // hatch) instead of dead-ending.
-                                Ok(false) => {
-                                    self.locked = true;
-                                    self.message = None;
-                                }
-                                Err(m) => self.message = Some((m, true)),
-                            }
+                            self.emit_and_exit("save", false);
                         }
                     }
                     if ui
                         .add_sized(egui::vec2(80.0, 28.0), egui::Button::new("Cancel"))
                         .clicked()
                     {
-                        std::process::exit(if self.saved { 0 } else { 1 });
+                        std::process::exit(1);
                     }
                 });
 
-                if let Some((msg, is_err)) = &self.message {
+                if let Some(msg) = &self.message {
                     ui.add_space(8.0);
-                    let color = if *is_err { COLOR_ERROR } else { COLOR_OK };
-                    ui.colored_label(color, msg.as_str());
+                    ui.colored_label(COLOR_ERROR, msg.as_str());
                 }
               });
             });

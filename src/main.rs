@@ -36,9 +36,14 @@ fn main() {
     }
 
     // Quick-save mode (launched by passwort-autotype's save hotkey).
+    // The dialog no longer talks to the daemon: autotype passes the
+    // daemon's lock state via `--locked` and reads the user's intent as
+    // a single JSON line on stdout, then performs the actual Save /
+    // Unlock+Save / SaveLocked itself.
     if args.iter().any(|a| a == "--quick-save") {
         let target = arg_after("--target-title");
-        if let Err(e) = gui::run_quick_save(target) {
+        let locked = args.iter().any(|a| a == "--locked");
+        if let Err(e) = gui::run_quick_save(target, locked) {
             eprintln!("quick-save failed: {}", e);
             std::process::exit(1);
         }
