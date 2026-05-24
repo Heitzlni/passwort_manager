@@ -133,17 +133,18 @@ impl HotkeyConfig {
 }
 
 fn xdg_config_home() -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
     if let Some(p) = std::env::var_os("XDG_CONFIG_HOME") {
         let p = PathBuf::from(p);
-        let is_snap_redirect = p.to_string_lossy().contains("/snap/");
+        let is_snap_redirect = home
+            .as_ref()
+            .map(|h| p.starts_with(h.join("snap")))
+            .unwrap_or(false);
         if p.is_absolute() && !is_snap_redirect {
             return p;
         }
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".config")
+    home.unwrap_or_else(|| PathBuf::from(".")).join(".config")
 }
 
 pub fn config_dir() -> PathBuf {

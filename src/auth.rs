@@ -61,17 +61,20 @@ pub struct PendingClient {
 }
 
 fn xdg_data_home() -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
     if let Some(p) = std::env::var_os("XDG_DATA_HOME") {
         let pp = PathBuf::from(p);
-        let is_snap = pp.to_string_lossy().contains("/snap/");
+        let is_snap = home
+            .as_ref()
+            .map(|h| pp.starts_with(h.join("snap")))
+            .unwrap_or(false);
         if pp.is_absolute() && !is_snap {
             return pp;
         }
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".local").join("share")
+    home.unwrap_or_else(|| PathBuf::from("."))
+        .join(".local")
+        .join("share")
 }
 
 pub fn data_dir() -> PathBuf {
