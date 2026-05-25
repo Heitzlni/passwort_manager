@@ -178,10 +178,44 @@ private fun AppRoot() {
         )
     }
 
+    // Live-refresh ticker — every few seconds, look at vault.json's
+    // mtime; if it advanced (sync push, file-picker replace, etc.),
+    // re-decrypt with the cached key and update the visible list.
+    // Only runs while the vault is unlocked; the lock path clears
+    // the cached key so subsequent ticks no-op.
+    LaunchedEffect(Unit) {
+        while (true) {
+            kotlinx.coroutines.delay(3000)
+            when (VaultState.refreshIfChanged(vaultFile)) {
+                VaultState.RefreshResult.Refreshed -> {
+                    // accounts.value already updated; just nudge state
+                    // so an Unlocked(selectedIndex=N) screen recomposes
+                    // and we re-check that N is still in range.
+                    val s = screen
+                    if (s is Screen.Unlocked) {
+                        screen = s.copy()
+                    }
+                }
+                VaultState.RefreshResult.NeedsUnlock -> {
+                    // VaultState already locked; LaunchedEffect on
+                    // accounts.value below will route to Locked.
+                }
+                VaultState.RefreshResult.NoChange -> {
+                    // common path, nothing to do
+                }
+            }
+        }
+    }
+
     // Settings has its own Scaffold/topbar — bypass the outer one.
     if (screen is Screen.Settings) {
+        val s = screen as Screen.Settings
+        // System back / swipe-from-edge pops Settings back to whatever
+        // we came from (list, lock screen, …), instead of leaving the
+        // app the way it would without BackHandler.
+        androidx.activity.compose.BackHandler { screen = s.previous }
         SettingsScreen(
-            onBack = { screen = (screen as Screen.Settings).previous },
+            onBack = { screen = s.previous },
             onPickVaultFile = launchImport,
             onToggleBiometric = { /* Real unlock-flow wiring in phase 2.5 step 3 */ },
         )
@@ -238,7 +272,7 @@ private fun AppRoot() {
                             }
                             screen = when (result) {
                                 is UnlockResult.Success -> {
-                                    VaultState.unlock(result.accounts)
+                                    VaultState.unlock(result.accounts, result.derivedKey, vaultFile)
                                     // Offer biometric enrollment if the
                                     // user has the pref on but hasn't
                                     // wrapped a master yet.
@@ -273,7 +307,18 @@ private fun AppRoot() {
                                 screen = Screen.Locked()
                             },
                         )
+                    } else if (s.selectedIndex >= accounts.size) {
+                        // Live refresh just dropped this index — entry
+                        // was deleted on PC and synced over. Pop back
+                        // to the list rather than crashing.
+                        screen = s.copy(selectedIndex = null)
                     } else {
+                        // System back / swipe-from-edge pops detail
+                        // back to the list, instead of leaving the app.
+                        androidx.activity.compose.BackHandler {
+                            VaultState.touch()
+                            screen = s.copy(selectedIndex = null)
+                        }
                         EntryDetailScreen(
                             account = accounts[s.selectedIndex],
                             onBack = {
@@ -345,7 +390,7 @@ private fun runBiometricUnlock(
                 }
                 when (result) {
                     is UnlockResult.Success -> {
-                        VaultState.unlock(result.accounts)
+                        VaultState.unlock(result.accounts, result.derivedKey, vaultFile)
                         onResult(Screen.Unlocked())
                     }
                     is UnlockResult.Failure -> {

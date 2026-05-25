@@ -1,5 +1,6 @@
 package com.example.passwort_manager
 
+import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -25,7 +26,14 @@ object VaultBridge {
     @JvmStatic
     external fun unlockVault(vaultJson: ByteArray, password: ByteArray): String
 
-    /** Decrypt a vault file and return the accounts list, or an error. */
+    /** Silent re-decrypt with a previously-derived key (no password). */
+    @JvmStatic
+    external fun refreshVault(vaultJson: ByteArray, key: ByteArray): String
+
+    /** Decrypt a vault file and return the accounts list + derived
+     *  key, or an error. The key is cached by VaultState so we can
+     *  silently re-decrypt the file when sync writes a new copy
+     *  underneath us. */
     fun unlock(vaultJsonBytes: ByteArray, masterPassword: String): UnlockResult {
         val passwordBytes = masterPassword.toByteArray(Charsets.UTF_8)
         val envelope = try {
@@ -33,7 +41,6 @@ object VaultBridge {
         } catch (t: Throwable) {
             return UnlockResult.Failure("native crash: ${t.message}")
         } finally {
-            // Best-effort wipe of the password bytes we just sent over.
             passwordBytes.fill(0)
         }
 
@@ -46,7 +53,36 @@ object VaultBridge {
             return UnlockResult.Failure(obj.optString("err", "unknown error"))
         }
         val arr = obj.optJSONArray("ok") ?: return UnlockResult.Failure("malformed response")
-        return UnlockResult.Success(parseAccounts(arr))
+        val keyB64 = obj.optString("key", "")
+        val key = if (keyB64.isNotEmpty()) {
+            try {
+                Base64.decode(keyB64, Base64.NO_WRAP)
+            } catch (_: IllegalArgumentException) {
+                null
+            }
+        } else null
+        return UnlockResult.Success(parseAccounts(arr), derivedKey = key)
+    }
+
+    /** Re-decrypt the vault file with the cached key (no biometric,
+     *  no password prompt). Used by the live-refresh ticker when the
+     *  underlying file changes (e.g. PC sync just pushed a new copy).
+     *  Returns null if the cached key no longer matches the file —
+     *  caller should lock and force a master re-entry. */
+    fun refresh(vaultJsonBytes: ByteArray, key: ByteArray): List<Account>? {
+        val envelope = try {
+            refreshVault(vaultJsonBytes, key)
+        } catch (_: Throwable) {
+            return null
+        }
+        val obj = try {
+            JSONObject(envelope)
+        } catch (_: Exception) {
+            return null
+        }
+        if (obj.has("err")) return null
+        val arr = obj.optJSONArray("ok") ?: return null
+        return parseAccounts(arr)
     }
 
     private fun parseAccounts(arr: JSONArray): List<Account> {
@@ -79,6 +115,6 @@ data class Account(
 )
 
 sealed class UnlockResult {
-    data class Success(val accounts: List<Account>) : UnlockResult()
+    data class Success(val accounts: List<Account>, val derivedKey: ByteArray?) : UnlockResult()
     data class Failure(val message: String) : UnlockResult()
 }

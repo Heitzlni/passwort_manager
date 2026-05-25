@@ -3,6 +3,7 @@ package com.example.passwort_manager
 import android.os.Handler
 import android.os.Looper
 import androidx.compose.runtime.mutableStateOf
+import java.io.File
 
 /**
  * Process-scoped store for the unlocked vault.
@@ -29,10 +30,20 @@ object VaultState {
     /** Observable so Compose recomposes when the lock state flips. */
     val accounts = mutableStateOf<List<Account>?>(null)
 
+    /** Derived AES key from the most recent unlock, used for silent
+     *  file re-reads when sync rewrites vault.json underneath us.
+     *  Lives only as long as `accounts.value != null`; wiped on lock. */
+    private var derivedKey: ByteArray? = null
+
+    /** Last vault.json mtime we successfully read, for change detection. */
+    private var lastVaultMtime: Long = 0L
+
     val isUnlocked: Boolean get() = accounts.value != null
 
-    fun unlock(list: List<Account>) {
+    fun unlock(list: List<Account>, derivedKey: ByteArray?, vaultFile: File?) {
         accounts.value = list
+        this.derivedKey = derivedKey?.copyOf()
+        this.lastVaultMtime = vaultFile?.lastModified() ?: 0L
         rearmAutoLock()
     }
 
@@ -43,6 +54,14 @@ object VaultState {
         // OS still gets to keep copies in clipboard etc. — wiping
         // those is on the caller.
         accounts.value = null
+        // Zero the cached key bytes before dropping the reference so a
+        // memory dump after lock has nothing left to find. (The
+        // accounts list itself contains the actual secrets — those
+        // can't be wiped this aggressively because Compose held a
+        // reference, but at least the key is cleaned.)
+        derivedKey?.fill(0)
+        derivedKey = null
+        lastVaultMtime = 0L
         cancelAutoLock()
     }
 
@@ -68,6 +87,49 @@ object VaultState {
         lockRunnable = null
     }
 
+    /**
+     * Silent live-refresh: if the on-disk vault.json's mtime has
+     * advanced since the last unlock/refresh, re-decrypt with the
+     * cached AES key and update the visible accounts list. Used by
+     * a periodic ticker on the main screen so a PC-initiated sync
+     * appears without the user having to lock + unlock manually.
+     *
+     * Returns one of:
+     *   - [RefreshResult.NoChange]  — file hasn't moved, nothing done
+     *   - [RefreshResult.Refreshed] — accounts updated in place
+     *   - [RefreshResult.NeedsUnlock] — cached key no longer decrypts
+     *     the file (typically because the PC rotated the master),
+     *     vault was force-locked so the UI can prompt for master
+     */
+    fun refreshIfChanged(vaultFile: File): RefreshResult {
+        if (!isUnlocked) return RefreshResult.NoChange
+        val key = derivedKey ?: return RefreshResult.NoChange
+        if (!vaultFile.exists()) return RefreshResult.NoChange
+
+        val mtime = vaultFile.lastModified()
+        if (mtime == 0L || mtime <= lastVaultMtime) return RefreshResult.NoChange
+
+        val bytes = try {
+            vaultFile.readBytes()
+        } catch (_: Exception) {
+            return RefreshResult.NoChange
+        }
+
+        val refreshed = VaultBridge.refresh(bytes, key)
+        return if (refreshed == null) {
+            // Cached key no longer matches — typically because the
+            // PC changed master / rotated the salt. The user needs
+            // to re-enter master to derive a new key.
+            lock()
+            RefreshResult.NeedsUnlock
+        } else {
+            accounts.value = refreshed
+            lastVaultMtime = mtime
+            rearmAutoLock()
+            RefreshResult.Refreshed
+        }
+    }
+
     /** Lookup helper used by the autofill service. */
     fun findByHost(host: String): List<Account> {
         if (host.isBlank()) return emptyList()
@@ -88,6 +150,10 @@ object VaultState {
         if (s.isEmpty() || h.isEmpty()) return false
         return s == h || h.endsWith(".$s")
     }
+
+    /** Outcome of a silent refresh attempt — drives the UI when a
+     *  sync-pushed vault file appears underneath us. */
+    enum class RefreshResult { NoChange, Refreshed, NeedsUnlock }
 
     private fun hostFromUrl(url: String): String {
         val s = url.trim()

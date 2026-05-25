@@ -220,7 +220,7 @@ private fun UnlockForAutofill(
                         }
                         when (r) {
                             is UnlockResult.Success -> {
-                                VaultState.unlock(r.accounts)
+                                VaultState.unlock(r.accounts, r.derivedKey, vaultFile)
                                 onUnlocked(r.accounts)
                             }
                             is UnlockResult.Failure -> {

@@ -103,7 +103,12 @@ fn decrypt(ciphertext: &[u8], nonce: &[u8], key: &[u8]) -> Result<Zeroizing<Vec<
         .map_err(|_| ())
 }
 
-fn unlock(vault_bytes: &[u8], password: &[u8]) -> Result<String, String> {
+struct UnlockResult {
+    accounts_json: String,
+    key_b64: String,
+}
+
+fn unlock(vault_bytes: &[u8], password: &[u8]) -> Result<UnlockResult, String> {
     let vault: EncryptedVault =
         serde_json::from_slice(vault_bytes).map_err(|e| format!("parse vault file: {}", e))?;
 
@@ -129,7 +134,42 @@ fn unlock(vault_bytes: &[u8], password: &[u8]) -> Result<String, String> {
     );
     let plaintext = decrypt(&ciphertext, &nonce, &*key)
         .map_err(|_| "wrong password or corrupt vault".to_string())?;
+    let accounts_json = decrypted_accounts_json(&plaintext)?;
+    // Encode the derived key so the Kotlin caller can stash it for
+    // silent file re-reads (e.g. after a PC-initiated sync replaced
+    // the vault.json on disk). The key bytes never leave this process
+    // (Kotlin holds them just as long as the unlocked accounts).
+    let key_b64 = general_purpose::STANDARD.encode(&*key);
+    Ok(UnlockResult {
+        accounts_json,
+        key_b64,
+    })
+}
 
+/// Silent re-decrypt path used by the live-refresh ticker. Given the
+/// raw vault file and a previously-derived key (from a successful
+/// `unlock` in the same session), decrypt and return the same
+/// accounts JSON. Returns an Err if the key no longer matches —
+/// typically because the PC changed master / salt — so the caller
+/// can lock the vault and prompt the user.
+fn decrypt_with_key(vault_bytes: &[u8], key: &[u8]) -> Result<String, String> {
+    if key.len() != KEY_LEN {
+        return Err(format!("key must be {} bytes", KEY_LEN));
+    }
+    let vault: EncryptedVault =
+        serde_json::from_slice(vault_bytes).map_err(|e| format!("parse vault file: {}", e))?;
+    let nonce = general_purpose::STANDARD
+        .decode(&vault.nonce)
+        .map_err(|_| "nonce is not valid base64".to_string())?;
+    let ciphertext = general_purpose::STANDARD
+        .decode(&vault.ciphertext)
+        .map_err(|_| "ciphertext is not valid base64".to_string())?;
+    let plaintext =
+        decrypt(&ciphertext, &nonce, key).map_err(|_| "cached key no longer decrypts this vault".to_string())?;
+    decrypted_accounts_json(&plaintext)
+}
+
+fn decrypted_accounts_json(plaintext: &[u8]) -> Result<String, String> {
     // v2: JSON object `{accounts: [...], tombstones: [...]}`.
     // v1: bare JSON array of accounts. Sniff the first non-ws byte.
     let first = plaintext
@@ -137,10 +177,10 @@ fn unlock(vault_bytes: &[u8], password: &[u8]) -> Result<String, String> {
         .find(|&&b| !b.is_ascii_whitespace())
         .copied();
     let accounts: Vec<Account> = match first {
-        Some(b'{') => serde_json::from_slice::<VaultPayload>(&plaintext)
+        Some(b'{') => serde_json::from_slice::<VaultPayload>(plaintext)
             .map_err(|e| format!("parse decrypted payload: {}", e))?
             .accounts,
-        _ => serde_json::from_slice::<Vec<Account>>(&plaintext)
+        _ => serde_json::from_slice::<Vec<Account>>(plaintext)
             .map_err(|e| format!("parse decrypted accounts (legacy): {}", e))?,
     };
     serde_json::to_string(&accounts).map_err(|e| format!("serialize accounts: {}", e))
@@ -172,11 +212,47 @@ pub extern "system" fn Java_com_example_passwort_1manager_VaultBridge_unlockVaul
     };
 
     let envelope = match unlock(&vault_bytes, &pw_bytes) {
-        Ok(json) => {
+        Ok(r) => {
             // Embed already-serialized JSON via a raw value field so we
             // don't re-encode the (potentially large) accounts array.
-            format!(r#"{{"ok":{}}}"#, json)
+            format!(
+                r#"{{"ok":{},"key":"{}"}}"#,
+                r.accounts_json, r.key_b64,
+            )
         }
+        Err(msg) => {
+            let msg_json = serde_json::to_string(&msg).unwrap_or_else(|_| "\"\"".to_string());
+            format!(r#"{{"err":{}}}"#, msg_json)
+        }
+    };
+
+    env.new_string(envelope)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Silent re-decrypt entry point — pairs with the `key` returned by
+/// the original unlock. Kotlin side:
+///   external fun refreshVault(vaultJson: ByteArray, keyBytes: ByteArray): String
+/// Same envelope shape: `{"ok": [accounts]}` or `{"err": "..."}`.
+#[no_mangle]
+pub extern "system" fn Java_com_example_passwort_1manager_VaultBridge_refreshVault<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    vault_json: JByteArray<'a>,
+    key_bytes: JByteArray<'a>,
+) -> jstring {
+    let vault_bytes = match env.convert_byte_array(&vault_json) {
+        Ok(b) => b,
+        Err(_) => return make_err(&mut env, "could not read vault bytes"),
+    };
+    let key = match env.convert_byte_array(&key_bytes) {
+        Ok(b) => Zeroizing::new(b),
+        Err(_) => return make_err(&mut env, "could not read cached key"),
+    };
+
+    let envelope = match decrypt_with_key(&vault_bytes, &key) {
+        Ok(json) => format!(r#"{{"ok":{}}}"#, json),
         Err(msg) => {
             let msg_json = serde_json::to_string(&msg).unwrap_or_else(|_| "\"\"".to_string());
             format!(r#"{{"err":{}}}"#, msg_json)
