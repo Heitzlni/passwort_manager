@@ -1,14 +1,24 @@
 //! JNI bridge for the Android client. Reuses the same Argon2id +
 //! AES-256-GCM scheme as the desktop crate so a `vault.json` written
-//! on Linux opens here byte-for-byte. Phase 1 only exposes
-//! `unlockVault` (read path) — encrypt / save lives on desktop.
+//! on Linux opens here byte-for-byte.
+//!
+//! Exposed entry points:
+//!   * `unlockVault(vault, password)` — derive key, decrypt, return
+//!     accounts + the derived key (used for silent live-refresh).
+//!   * `refreshVault(vault, key)` — decrypt with a cached key,
+//!     skipping Argon2id.
+//!   * `saveVault(currentFile, key, payloadJson)` — re-encrypt a
+//!     fresh payload using the existing vault's salt + kdf params,
+//!     return the new file bytes for the caller to write atomically.
 
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose, Engine};
-use jni::objects::{JByteArray, JClass};
+use jni::objects::{JByteArray, JClass, JString};
 use jni::sys::jstring;
 use jni::JNIEnv;
+use rand::rngs::OsRng;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -16,17 +26,29 @@ const KEY_LEN: usize = 32;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 
-// Minimum on-disk schema we need to read. Encryption-side fields
-// (kdf_algo, version) we tolerate but ignore; the algorithm is
-// implied by aes-gcm + argon2id.
-#[derive(Deserialize)]
+// On-disk schema. Now Serialize too: phase-3 write support
+// re-emits a fresh EncryptedVault with the same salt + kdf params
+// (so the file is still openable by the desktop side with the
+// shared master password) and a fresh nonce + ciphertext.
+#[derive(Deserialize, Serialize)]
 struct EncryptedVault {
+    #[serde(default = "default_version")]
+    version: u32,
+    #[serde(default = "default_kdf_algo")]
+    kdf_algo: String,
     kdf_m_cost: u32,
     kdf_t_cost: u32,
     kdf_p_cost: u32,
     salt: String,
     nonce: String,
     ciphertext: String,
+}
+
+fn default_version() -> u32 {
+    2
+}
+fn default_kdf_algo() -> String {
+    "argon2id".to_string()
 }
 
 // Same shape as the desktop `Account`. Kept here for self-contained
@@ -103,6 +125,15 @@ fn decrypt(ciphertext: &[u8], nonce: &[u8], key: &[u8]) -> Result<Zeroizing<Vec<
         .map_err(|_| ())
 }
 
+fn encrypt(plaintext: &[u8], key: &[u8]) -> Result<([u8; NONCE_LEN], Vec<u8>), ()> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| ())?;
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher.encrypt(nonce, plaintext).map_err(|_| ())?;
+    Ok((nonce_bytes, ciphertext))
+}
+
 struct UnlockResult {
     accounts_json: String,
     key_b64: String,
@@ -167,6 +198,33 @@ fn decrypt_with_key(vault_bytes: &[u8], key: &[u8]) -> Result<String, String> {
     let plaintext =
         decrypt(&ciphertext, &nonce, key).map_err(|_| "cached key no longer decrypts this vault".to_string())?;
     decrypted_accounts_json(&plaintext)
+}
+
+/// Re-encrypt a freshly-serialised vault payload using the same key
+/// and same salt/kdf params as the existing file. Returns the new
+/// on-disk-format JSON bytes — the Kotlin caller writes them
+/// atomically. The salt stays put so the desktop side can still
+/// decrypt with the shared master password.
+fn save_vault(current_bytes: &[u8], key: &[u8], payload_json: &str) -> Result<String, String> {
+    if key.len() != KEY_LEN {
+        return Err(format!("key must be {} bytes", KEY_LEN));
+    }
+    let existing: EncryptedVault = serde_json::from_slice(current_bytes)
+        .map_err(|e| format!("parse current vault file: {}", e))?;
+    let (nonce, ciphertext) =
+        encrypt(payload_json.as_bytes(), key).map_err(|_| "encrypt failed".to_string())?;
+    let new_vault = EncryptedVault {
+        version: 2,
+        kdf_algo: existing.kdf_algo,
+        kdf_m_cost: existing.kdf_m_cost,
+        kdf_t_cost: existing.kdf_t_cost,
+        kdf_p_cost: existing.kdf_p_cost,
+        salt: existing.salt,
+        nonce: general_purpose::STANDARD.encode(nonce),
+        ciphertext: general_purpose::STANDARD.encode(ciphertext),
+    };
+    serde_json::to_string_pretty(&new_vault)
+        .map_err(|e| format!("serialise new vault: {}", e))
 }
 
 fn decrypted_accounts_json(plaintext: &[u8]) -> Result<String, String> {
@@ -259,6 +317,57 @@ pub extern "system" fn Java_com_example_passwort_1manager_VaultBridge_refreshVau
         }
     };
 
+    env.new_string(envelope)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Re-encrypt a fresh VaultPayload as the new on-disk vault.json
+/// bytes, using the same key the Kotlin side cached from
+/// [unlockVault]. The salt + kdf params from the existing file are
+/// reused so the desktop side keeps decrypting with the shared master.
+///
+/// Kotlin signature:
+///   external fun saveVault(currentFileBytes: ByteArray,
+///                          keyBytes: ByteArray,
+///                          payloadJson: String): String
+///
+/// Returns the same envelope as the other entry points:
+///   {"ok": "<new vault file content as a JSON string>"} on success
+///   {"err": "<message>"}                                on failure
+#[no_mangle]
+pub extern "system" fn Java_com_example_passwort_1manager_VaultBridge_saveVault<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    current_file: JByteArray<'a>,
+    key_bytes: JByteArray<'a>,
+    payload_json: JString<'a>,
+) -> jstring {
+    let current_bytes = match env.convert_byte_array(&current_file) {
+        Ok(b) => b,
+        Err(_) => return make_err(&mut env, "could not read current file bytes"),
+    };
+    let key = match env.convert_byte_array(&key_bytes) {
+        Ok(b) => Zeroizing::new(b),
+        Err(_) => return make_err(&mut env, "could not read cached key"),
+    };
+    let payload_str: String = match env.get_string(&payload_json) {
+        Ok(s) => s.into(),
+        Err(_) => return make_err(&mut env, "could not read payload JSON"),
+    };
+
+    let envelope = match save_vault(&current_bytes, &key, &payload_str) {
+        Ok(file_json) => {
+            // Serialise the inner JSON as a JSON-string value so the
+            // envelope is itself valid JSON.
+            let escaped = serde_json::to_string(&file_json).unwrap_or_else(|_| "\"\"".to_string());
+            format!(r#"{{"ok":{}}}"#, escaped)
+        }
+        Err(msg) => {
+            let msg_json = serde_json::to_string(&msg).unwrap_or_else(|_| "\"\"".to_string());
+            format!(r#"{{"err":{}}}"#, msg_json)
+        }
+    };
     env.new_string(envelope)
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())

@@ -14,8 +14,11 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Visibility
@@ -63,9 +66,13 @@ class MainActivity : FragmentActivity() {
 private sealed class Screen {
     object NoVault : Screen()
     data class Locked(val errorMsg: String? = null) : Screen()
-    data class Unlocked(val selectedIndex: Int? = null) : Screen()
+    data class Unlocked(val selectedIndex: Int? = null, val search: String = "") : Screen()
     /** Pushed on top of [previous] — closing it returns to that screen. */
     data class Settings(val previous: Screen) : Screen()
+    /** New-entry form — opens from the list's FAB. */
+    data class AddEntry(val previous: Screen) : Screen()
+    /** Edit-entry form — opens from the detail screen's edit button. */
+    data class EditEntry(val previous: Screen, val index: Int) : Screen()
 }
 
 @Composable
@@ -222,6 +229,58 @@ private fun AppRoot() {
         return
     }
 
+    // Add-entry / edit-entry — both use AddEditScreen, also own
+    // their own topbar.
+    if (screen is Screen.AddEntry) {
+        val s = screen as Screen.AddEntry
+        AddEditScreen(
+            initial = null,
+            onCancel = { screen = s.previous },
+            onSave = { acc ->
+                when (val r = VaultState.addAccount(acc, vaultFile)) {
+                    VaultState.WriteResult.Ok -> screen = s.previous
+                    is VaultState.WriteResult.Failed ->
+                        importResult = "Save failed: ${r.message}"
+                }
+            },
+        )
+        return
+    }
+    if (screen is Screen.EditEntry) {
+        val s = screen as Screen.EditEntry
+        val list = VaultState.accounts.value
+        if (list == null || s.index !in list.indices) {
+            // Lost the entry under us (auto-lock, deleted via sync) —
+            // bail back to whatever was on top.
+            screen = s.previous
+            return
+        }
+        AddEditScreen(
+            initial = list[s.index],
+            onCancel = { screen = s.previous },
+            onSave = { acc ->
+                when (val r = VaultState.editAccount(s.index, acc, vaultFile)) {
+                    VaultState.WriteResult.Ok -> screen = s.previous
+                    is VaultState.WriteResult.Failed ->
+                        importResult = "Save failed: ${r.message}"
+                }
+            },
+            onDelete = {
+                when (val r = VaultState.deleteAccount(s.index, vaultFile)) {
+                    VaultState.WriteResult.Ok -> {
+                        // After delete, jump straight to the list — the
+                        // previous screen was probably this entry's
+                        // detail, which is now stale.
+                        screen = Screen.Unlocked()
+                    }
+                    is VaultState.WriteResult.Failed ->
+                        importResult = "Delete failed: ${r.message}"
+                }
+            },
+        )
+        return
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -237,7 +296,13 @@ private fun AppRoot() {
     ) { padding ->
         Box(modifier = Modifier.padding(padding).fillMaxSize()) {
             when (val s = screen) {
-                is Screen.Settings -> {} // handled above; unreachable here
+                is Screen.Settings,
+                is Screen.AddEntry,
+                is Screen.EditEntry -> {
+                    // Already handled by the early-return blocks above —
+                    // unreachable here but the compiler insists on
+                    // exhaustiveness.
+                }
                 is Screen.NoVault -> NoVaultScreen(
                     expectedPath = vaultFile.absolutePath,
                     onPickFile = launchImport,
@@ -298,9 +363,14 @@ private fun AppRoot() {
                     } else if (s.selectedIndex == null) {
                         EntryListScreen(
                             accounts = accounts,
+                            search = s.search,
+                            onSearchChange = { screen = s.copy(search = it) },
                             onTap = { idx ->
                                 VaultState.touch()
                                 screen = s.copy(selectedIndex = idx)
+                            },
+                            onAdd = {
+                                screen = Screen.AddEntry(previous = s)
                             },
                             onLock = {
                                 VaultState.lock()
@@ -324,6 +394,9 @@ private fun AppRoot() {
                             onBack = {
                                 VaultState.touch()
                                 screen = s.copy(selectedIndex = null)
+                            },
+                            onEdit = {
+                                screen = Screen.EditEntry(previous = s, index = s.selectedIndex)
                             },
                         )
                     }
@@ -570,31 +643,81 @@ private fun LockedScreen(
 @Composable
 private fun EntryListScreen(
     accounts: List<Account>,
+    search: String,
+    onSearchChange: (String) -> Unit,
     onTap: (Int) -> Unit,
+    onAdd: () -> Unit,
     onLock: () -> Unit,
 ) {
-    Column(modifier = Modifier.fillMaxSize()) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                "${accounts.size} entries",
-                modifier = Modifier.weight(1f),
-                style = MaterialTheme.typography.titleMedium,
-            )
-            TextButton(onClick = onLock) {
-                Icon(Icons.Default.Lock, contentDescription = null)
-                Spacer(Modifier.width(6.dp))
-                Text("Lock")
+    // Filter on (name + url + username), preserving the original index
+    // so taps still address the vault by its real position.
+    val matching: List<Pair<Int, Account>> = remember(accounts, search) {
+        val q = search.trim().lowercase()
+        if (q.isEmpty()) {
+            accounts.mapIndexed { idx, acc -> idx to acc }
+        } else {
+            accounts.mapIndexedNotNull { idx, acc ->
+                val haystack = (acc.name + " " + acc.url + " " + acc.username).lowercase()
+                if (haystack.contains(q)) idx to acc else null
             }
         }
-        HorizontalDivider()
-        LazyColumn(modifier = Modifier.fillMaxSize()) {
-            itemsIndexed(accounts) { index, acc ->
-                EntryRow(account = acc, onClick = { onTap(index) })
-                HorizontalDivider()
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    if (search.isEmpty())
+                        "${accounts.size} entries"
+                    else
+                        "${matching.size} of ${accounts.size}",
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.titleMedium,
+                )
+                TextButton(onClick = onLock) {
+                    Icon(Icons.Default.Lock, contentDescription = null)
+                    Spacer(Modifier.width(6.dp))
+                    Text("Lock")
+                }
             }
+            OutlinedTextField(
+                value = search,
+                onValueChange = onSearchChange,
+                singleLine = true,
+                placeholder = { Text("Search by name, URL, or username") },
+                trailingIcon = {
+                    if (search.isNotEmpty()) {
+                        IconButton(onClick = { onSearchChange("") }) {
+                            Icon(Icons.Default.Close, contentDescription = "Clear")
+                        }
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp),
+            )
+            HorizontalDivider()
+            LazyColumn(modifier = Modifier.fillMaxSize()) {
+                items(matching.size) { i ->
+                    val (originalIdx, acc) = matching[i]
+                    EntryRow(account = acc, onClick = { onTap(originalIdx) })
+                    HorizontalDivider()
+                }
+                // Bottom spacer so the FAB doesn't cover the last row.
+                item { Spacer(Modifier.height(80.dp)) }
+            }
+        }
+
+        FloatingActionButton(
+            onClick = onAdd,
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(16.dp),
+        ) {
+            Icon(Icons.Default.Add, contentDescription = "Add entry")
         }
     }
 }
@@ -638,7 +761,11 @@ private fun androidx.compose.foundation.lazy.LazyListScope.itemsIndexed(
 // ===================== Screen 3b: entry detail =====================
 
 @Composable
-private fun EntryDetailScreen(account: Account, onBack: () -> Unit) {
+private fun EntryDetailScreen(
+    account: Account,
+    onBack: () -> Unit,
+    onEdit: () -> Unit,
+) {
     val context = LocalContextSafe()
     var revealPassword by remember { mutableStateOf(false) }
 
@@ -662,6 +789,9 @@ private fun EntryDetailScreen(account: Account, onBack: () -> Unit) {
                 overflow = TextOverflow.Ellipsis,
                 maxLines = 1,
             )
+            IconButton(onClick = onEdit) {
+                Icon(Icons.Default.Edit, contentDescription = "Edit")
+            }
         }
         HorizontalDivider()
         Column(

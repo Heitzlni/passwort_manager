@@ -30,6 +30,16 @@ object VaultBridge {
     @JvmStatic
     external fun refreshVault(vaultJson: ByteArray, key: ByteArray): String
 
+    /** Re-encrypt a fresh payload (accounts + tombstones) using the
+     *  cached key + the current file's salt/kdf params, return the
+     *  new on-disk vault.json content. The Kotlin caller writes it. */
+    @JvmStatic
+    external fun saveVault(
+        currentFile: ByteArray,
+        key: ByteArray,
+        payloadJson: String,
+    ): String
+
     /** Decrypt a vault file and return the accounts list + derived
      *  key, or an error. The key is cached by VaultState so we can
      *  silently re-decrypt the file when sync writes a new copy
@@ -62,6 +72,65 @@ object VaultBridge {
             }
         } else null
         return UnlockResult.Success(parseAccounts(arr), derivedKey = key)
+    }
+
+    /** Build the v2 VaultPayload JSON (`{accounts: [...], tombstones:
+     *  [...]}`) that the Rust side and the desktop both expect. */
+    fun buildPayloadJson(accounts: List<Account>, tombstones: List<Tombstone>): String {
+        val obj = JSONObject()
+        val accArr = JSONArray()
+        for (a in accounts) {
+            accArr.put(
+                JSONObject().apply {
+                    put("name", a.name)
+                    put("url", a.url)
+                    put("username", a.username)
+                    put("password", a.password)
+                    put("totp_secret", a.totpSecret)
+                    put("notes", a.notes)
+                    put("history", JSONArray()) // history only managed on desktop for now
+                    put("updated_at", a.updatedAt)
+                },
+            )
+        }
+        val tombArr = JSONArray()
+        for (t in tombstones) {
+            tombArr.put(
+                JSONObject().apply {
+                    put("name", t.name)
+                    put("username", t.username)
+                    put("deleted_at", t.deletedAt)
+                },
+            )
+        }
+        obj.put("accounts", accArr)
+        obj.put("tombstones", tombArr)
+        return obj.toString()
+    }
+
+    /** Encrypt a fresh payload and return the new vault.json bytes
+     *  ready for atomic write. Returns null on failure. */
+    fun save(
+        currentFile: ByteArray,
+        key: ByteArray,
+        accounts: List<Account>,
+        tombstones: List<Tombstone>,
+    ): ByteArray? {
+        val payload = buildPayloadJson(accounts, tombstones)
+        val envelope = try {
+            saveVault(currentFile, key, payload)
+        } catch (_: Throwable) {
+            return null
+        }
+        val obj = try {
+            JSONObject(envelope)
+        } catch (_: Exception) {
+            return null
+        }
+        if (obj.has("err")) return null
+        val fileJson = obj.optString("ok", "")
+        if (fileJson.isEmpty()) return null
+        return fileJson.toByteArray(Charsets.UTF_8)
     }
 
     /** Re-decrypt the vault file with the cached key (no biometric,
@@ -112,6 +181,15 @@ data class Account(
     val notes: String,
     /** Vault format v2: Unix epoch seconds at last create/edit. */
     val updatedAt: Long = 0L,
+)
+
+/** Marks an entry the user deleted on this device, so a cross-device
+ *  sync can propagate the deletion. Matches the Rust schema and is
+ *  emitted as the `tombstones` array inside the v2 VaultPayload. */
+data class Tombstone(
+    val name: String,
+    val username: String,
+    val deletedAt: Long,
 )
 
 sealed class UnlockResult {

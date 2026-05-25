@@ -30,6 +30,12 @@ object VaultState {
     /** Observable so Compose recomposes when the lock state flips. */
     val accounts = mutableStateOf<List<Account>?>(null)
 
+    /** Tombstones (soft-deletes) maintained while unlocked. Pushed to
+     *  the file via [persistTo] on every write so sync can propagate
+     *  the deletion. Loaded from the file on next implementation pass
+     *  — for now we only emit them. */
+    val tombstones = mutableStateOf<List<Tombstone>>(emptyList())
+
     /** Derived AES key from the most recent unlock, used for silent
      *  file re-reads when sync rewrites vault.json underneath us.
      *  Lives only as long as `accounts.value != null`; wiped on lock. */
@@ -42,6 +48,7 @@ object VaultState {
 
     fun unlock(list: List<Account>, derivedKey: ByteArray?, vaultFile: File?) {
         accounts.value = list
+        this.tombstones.value = emptyList() // freshly loaded — see TODO below
         this.derivedKey = derivedKey?.copyOf()
         this.lastVaultMtime = vaultFile?.lastModified() ?: 0L
         rearmAutoLock()
@@ -54,6 +61,7 @@ object VaultState {
         // OS still gets to keep copies in clipboard etc. — wiping
         // those is on the caller.
         accounts.value = null
+        tombstones.value = emptyList()
         // Zero the cached key bytes before dropping the reference so a
         // memory dump after lock has nothing left to find. (The
         // accounts list itself contains the actual secrets — those
@@ -63,6 +71,87 @@ object VaultState {
         derivedKey = null
         lastVaultMtime = 0L
         cancelAutoLock()
+    }
+
+    // ===================== Write path =====================
+
+    /** Outcome of a write attempt. */
+    sealed class WriteResult {
+        object Ok : WriteResult()
+        data class Failed(val message: String) : WriteResult()
+    }
+
+    /** Insert a new account. Stamps updated_at = now; clears any
+     *  matching tombstone (re-creating a previously-deleted entry). */
+    fun addAccount(account: Account, vaultFile: File): WriteResult {
+        if (!isUnlocked) return WriteResult.Failed("vault is locked")
+        val current = accounts.value.orEmpty()
+        val now = System.currentTimeMillis() / 1000
+        val stamped = account.copy(updatedAt = now)
+        val newList = current + stamped
+        val newTombs = tombstones.value.filterNot {
+            it.name == stamped.name && it.username == stamped.username
+        }
+        return persistTo(newList, newTombs, vaultFile)
+    }
+
+    /** Update an account at [idx]. Stamps updated_at = now. */
+    fun editAccount(idx: Int, replacement: Account, vaultFile: File): WriteResult {
+        if (!isUnlocked) return WriteResult.Failed("vault is locked")
+        val current = accounts.value.orEmpty()
+        if (idx !in current.indices) return WriteResult.Failed("entry index out of range")
+        val now = System.currentTimeMillis() / 1000
+        val stamped = replacement.copy(updatedAt = now)
+        val newList = current.toMutableList().apply { this[idx] = stamped }
+        return persistTo(newList, tombstones.value, vaultFile)
+    }
+
+    /** Remove an account and push a tombstone so sync propagates. */
+    fun deleteAccount(idx: Int, vaultFile: File): WriteResult {
+        if (!isUnlocked) return WriteResult.Failed("vault is locked")
+        val current = accounts.value.orEmpty()
+        if (idx !in current.indices) return WriteResult.Failed("entry index out of range")
+        val removed = current[idx]
+        val now = System.currentTimeMillis() / 1000
+        val newList = current.toMutableList().apply { removeAt(idx) }
+        val newTombs = tombstones.value.filterNot {
+            it.name == removed.name && it.username == removed.username
+        } + Tombstone(removed.name, removed.username, now)
+        return persistTo(newList, newTombs, vaultFile)
+    }
+
+    private fun persistTo(
+        newAccounts: List<Account>,
+        newTombstones: List<Tombstone>,
+        vaultFile: File,
+    ): WriteResult {
+        val key = derivedKey ?: return WriteResult.Failed("no cached key (unlock again)")
+        if (!vaultFile.exists()) return WriteResult.Failed("vault file disappeared")
+        val current = try {
+            vaultFile.readBytes()
+        } catch (e: Exception) {
+            return WriteResult.Failed("read failed: ${e.message}")
+        }
+        val newBytes = VaultBridge.save(current, key, newAccounts, newTombstones)
+            ?: return WriteResult.Failed("encrypt failed")
+        val tmp = File(vaultFile.parentFile, "vault.json.tmp")
+        try {
+            tmp.outputStream().use { it.write(newBytes) }
+            if (!tmp.renameTo(vaultFile)) {
+                tmp.delete()
+                return WriteResult.Failed("atomic rename failed")
+            }
+        } catch (e: Exception) {
+            tmp.delete()
+            return WriteResult.Failed("write failed: ${e.message}")
+        }
+        accounts.value = newAccounts
+        tombstones.value = newTombstones
+        // Bump our seen mtime so the live-refresh ticker doesn't try
+        // to re-decrypt the file we just wrote.
+        lastVaultMtime = vaultFile.lastModified()
+        rearmAutoLock()
+        return WriteResult.Ok
     }
 
     /** Bump the auto-lock timer — call on every vault-touching action. */
