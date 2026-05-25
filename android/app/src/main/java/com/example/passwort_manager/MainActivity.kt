@@ -62,7 +62,7 @@ class MainActivity : ComponentActivity() {
 private sealed class Screen {
     object NoVault : Screen()
     data class Locked(val errorMsg: String? = null) : Screen()
-    data class Unlocked(val accounts: List<Account>, val selectedIndex: Int? = null) : Screen()
+    data class Unlocked(val selectedIndex: Int? = null) : Screen()
 }
 
 @Composable
@@ -70,8 +70,30 @@ private fun AppRoot() {
     val context = LocalContextSafe()
     val vaultFile = remember(context) { File(context.getExternalFilesDir(null), "vault.json") }
 
-    var screen by remember { mutableStateOf<Screen>(initialScreen(vaultFile)) }
+    // Snapshot the process-wide unlocked state so we route to the
+    // right screen if the user re-enters the app while still unlocked
+    // (or, conversely, if auto-lock fired while the app was in
+    // background → we drop them back at Locked).
+    val unlockedAccounts = VaultState.accounts.value
+    var screen by remember {
+        mutableStateOf<Screen>(
+            when {
+                unlockedAccounts != null -> Screen.Unlocked()
+                vaultFile.exists() && vaultFile.length() > 0 -> Screen.Locked()
+                else -> Screen.NoVault
+            }
+        )
+    }
     val scope = androidx.compose.runtime.rememberCoroutineScope()
+
+    // If VaultState locks itself (auto-lock or external trigger) while
+    // we're in the Unlocked screen, kick the UI back to Locked.
+    LaunchedEffect(VaultState.accounts.value) {
+        val current = screen
+        if (current is Screen.Unlocked && VaultState.accounts.value == null) {
+            screen = Screen.Locked()
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -85,7 +107,10 @@ private fun AppRoot() {
             when (val s = screen) {
                 is Screen.NoVault -> NoVaultScreen(
                     expectedPath = vaultFile.absolutePath,
-                    onRetry = { screen = initialScreen(vaultFile) },
+                    onRetry = {
+                        screen = if (vaultFile.exists() && vaultFile.length() > 0)
+                            Screen.Locked() else Screen.NoVault
+                    },
                 )
 
                 is Screen.Locked -> LockedScreen(
@@ -97,7 +122,10 @@ private fun AppRoot() {
                                 VaultBridge.unlock(bytes, master)
                             }
                             screen = when (result) {
-                                is UnlockResult.Success -> Screen.Unlocked(result.accounts)
+                                is UnlockResult.Success -> {
+                                    VaultState.unlock(result.accounts)
+                                    Screen.Unlocked()
+                                }
                                 is UnlockResult.Failure -> Screen.Locked(result.message)
                             }
                         }
@@ -105,16 +133,29 @@ private fun AppRoot() {
                 )
 
                 is Screen.Unlocked -> {
-                    if (s.selectedIndex == null) {
+                    val accounts = VaultState.accounts.value
+                    if (accounts == null) {
+                        // Race with auto-lock: go back to Locked.
+                        screen = Screen.Locked()
+                    } else if (s.selectedIndex == null) {
                         EntryListScreen(
-                            accounts = s.accounts,
-                            onTap = { idx -> screen = s.copy(selectedIndex = idx) },
-                            onLock = { screen = Screen.Locked() },
+                            accounts = accounts,
+                            onTap = { idx ->
+                                VaultState.touch()
+                                screen = s.copy(selectedIndex = idx)
+                            },
+                            onLock = {
+                                VaultState.lock()
+                                screen = Screen.Locked()
+                            },
                         )
                     } else {
                         EntryDetailScreen(
-                            account = s.accounts[s.selectedIndex],
-                            onBack = { screen = s.copy(selectedIndex = null) },
+                            account = accounts[s.selectedIndex],
+                            onBack = {
+                                VaultState.touch()
+                                screen = s.copy(selectedIndex = null)
+                            },
                         )
                     }
                 }
@@ -122,9 +163,6 @@ private fun AppRoot() {
         }
     }
 }
-
-private fun initialScreen(vaultFile: File): Screen =
-    if (vaultFile.exists() && vaultFile.length() > 0) Screen.Locked() else Screen.NoVault
 
 @Composable
 private fun LocalContextSafe(): Context =

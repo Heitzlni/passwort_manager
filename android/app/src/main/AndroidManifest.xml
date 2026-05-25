@@ -3,6 +3,7 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <application
+        android:name=".PasswortApp"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
@@ -22,6 +23,38 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+            Spawned by Android when our autofill service replies with an
+            authentication-required dataset (vault was locked at the time
+            of the fill request). Not directly launchable from elsewhere.
+        -->
+        <activity
+            android:name=".AutofillActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Passwort_Manager"
+            android:excludeFromRecents="true" />
+
+        <!--
+            The autofill service itself. Requires BIND_AUTOFILL_SERVICE so
+            only the system can connect to us, and a meta-data resource
+            pointing at our service config (capabilities + settings hook).
+            Users still have to enable it manually under
+            Einstellungen → Passwörter & Konten → Bevorzugter Dienst
+            (the system never auto-enables third-party autofill).
+        -->
+        <service
+            android:name=".PasswortAutofillService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_AUTOFILL_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.autofill.AutofillService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.autofill"
+                android:resource="@xml/autofill_service" />
+        </service>
     </application>
 
 </manifest>

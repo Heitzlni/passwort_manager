@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Configuration meta for PasswortAutofillService. Phase 2 is fill-only;
+    we don't claim to support compatibility-mode autofill yet (that's
+    the API used to drive autofill into legacy WebViews without
+    explicit hints — phase 2.5 territory).
+
+    `settingsActivity` lets the system "Settings → Passwörter → Password
+    Manager" entry deep-link straight to MainActivity for the user to
+    unlock or change preferences.
+-->
+<autofill-service
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:settingsActivity="com.example.passwort_manager.MainActivity" />
