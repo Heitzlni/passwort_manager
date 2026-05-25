@@ -61,10 +61,12 @@ The extension is **signed by Mozilla** via AMO submission, so it installs perman
 
 **While the AMO public listing is still pending Mozilla review:**
 
-1. Sign in to https://addons.mozilla.org/developers/ with the developer account that submitted the extension.
-2. Open **My Add-ons → Password Manager → Version 0.4.0**.
-3. Download the signed `.xpi` (Mozilla signs every submission automatically; you don't have to wait for the review to *use* the signed file yourself).
-4. In Firefox: drag-and-drop the `.xpi` file onto a Firefox window → **Add**.
+The signed `.xpi` is checked into this repo at [releases/passwort-manager-0.4.0.xpi](releases/passwort-manager-0.4.0.xpi). To install:
+
+1. Save it to disk (right-click → "Save Link As..." on the file viewer, or just clone the repo).
+2. In Firefox: drag-and-drop the `.xpi` file onto a Firefox window → **Hinzufügen** ("Add").
+
+Mozilla already signed it during AMO submission, so it sticks across restarts like any normal extension.
 
 Either way, the icon appears in your toolbar and stays there across Firefox restarts.
 

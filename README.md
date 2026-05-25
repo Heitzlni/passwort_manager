@@ -187,7 +187,7 @@ Recipients extract and run `./setup.sh` — no Rust toolchain required.
 ## Caveats / limitations
 
 - **Linux side: X11 hotkeys.** Daemon and GUI work on Wayland, but the auto-type helper relies on X11-grabbed hotkeys for the `Ctrl+Alt+J` / `Ctrl+Alt+S` triggers. On Wayland, bind your compositor's hotkey to `passwortctl fill` / `passwortctl quick-save` instead.
-- **Firefox extension** is Mozilla-signed via AMO submission, so it installs permanently in any Firefox. The public listing on `addons.mozilla.org` is pending Mozilla's review; until then, install the signed `.xpi` from the developer dashboard. See SETUP.md.
+- **Firefox extension** is Mozilla-signed via AMO submission, so it installs permanently in any Firefox. The public listing on `addons.mozilla.org` is pending Mozilla's review; until then, the signed `.xpi` is shipped in this repo at `releases/passwort-manager-0.4.0.xpi` — drag it onto Firefox to install. See SETUP.md.
 - **Chrome on Android needs a flag flip** to use third-party autofill instead of Google's. Search `chrome://flags` for "third-party password manager" → enable → relaunch. Firefox / DuckDuckGo / Brave honor the system default out of the box.
 - **Sync requires the same master password** on both sides (and that you've previously pushed your PC vault onto the phone at least once — fresh-master flow isn't implemented).
 - **Phone is read-only** for the moment. Add / edit / delete happens on Linux and propagates via sync. Write support on Android is the next phase.
