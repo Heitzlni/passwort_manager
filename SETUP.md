@@ -49,11 +49,38 @@ Firefox really doesn't let any external program touch its profile, so the extens
 
 Open the **Password Manager** entry in your application launcher (or run `passwort-manager` in a terminal). Pick a master password (≥ 8 characters). Done — close the app.
 
-### 2 · Load the Firefox extension
+### 2 · Install the Firefox extension
 
-1. Type **exactly this** into Firefox's address bar (the URL is
-   important — `about:addons` will *not* work, you'll get a misleading
-   "addon is damaged" error):
+The extension is **signed by Mozilla** via AMO submission, so it installs permanently in any stable Firefox — no developer mode needed.
+
+**Preferred path (once it's publicly listed on AMO):**
+
+1. Open `addons.mozilla.org` in Firefox, search for **"Password Manager"** (the one for this project).
+2. Click **Add to Firefox** → **Add**.
+3. Done — toolbar icon appears.
+
+**While the AMO public listing is still pending Mozilla review:**
+
+1. Sign in to https://addons.mozilla.org/developers/ with the developer account that submitted the extension.
+2. Open **My Add-ons → Password Manager → Version 0.4.0**.
+3. Download the signed `.xpi` (Mozilla signs every submission automatically; you don't have to wait for the review to *use* the signed file yourself).
+4. In Firefox: drag-and-drop the `.xpi` file onto a Firefox window → **Add**.
+
+Either way, the icon appears in your toolbar and stays there across Firefox restarts.
+
+> **Snap-Firefox gotcha (Ubuntu 22.04+):** snap Firefox is sandboxed and
+> can't read files outside its allowed paths. If you're installing the
+> downloaded `.xpi`, save it to `~/Downloads/` (which the snap can
+> read), then drag it onto Firefox from there. `install-native-host.sh`
+> already detects snap Firefox and writes the native messaging
+> manifest to *both* `~/.mozilla/...` and
+> `~/snap/firefox/common/.mozilla/...` so the daemon side works either way.
+
+### Developer / contributor install (load from source, no signing)
+
+If you've cloned the repo and want to load the extension straight from the source tree (e.g. you're editing `extension/content.js` and want to see the changes), there's a per-session loader:
+
+1. Type **exactly this** into Firefox's address bar (the URL is important — `about:addons` will *not* work, you'll get a misleading "addon is damaged" error):
 
    ```
    about:debugging#/runtime/this-firefox
@@ -61,29 +88,7 @@ Open the **Password Manager** entry in your application launcher (or run `passwo
 2. Click **Load Temporary Add-on…**.
 3. Select `extension/manifest.json` from this repo.
 
-The icon should appear in your toolbar.
-
-> **Snap-Firefox gotcha (Ubuntu 22.04+):** snap Firefox is sandboxed and
-> can't read files outside its allowed paths — `~/code/...` is *outside*.
-> Copy the extension folder to `~/Downloads/` first:
-> ```sh
-> cp -r extension ~/Downloads/passwort-manager-extension
-> ```
-> then load `~/Downloads/passwort-manager-extension/manifest.json` in
-> about:debugging. `install-native-host.sh` already detects snap Firefox
-> and writes the native messaging manifest to *both* `~/.mozilla/...` and
-> `~/snap/firefox/common/.mozilla/...` so the daemon side works either way.
-
-### Permanent extension install (avoid the per-restart reload)
-
-Stable Firefox unloads unsigned extensions on restart. Two real options:
-
-* **Firefox Developer Edition / Nightly / ESR Unbranded.** In `about:config`, set `xpinstall.signatures.required = false`. Pack the extension as `passwort.xpi`:
-  ```sh
-  cd extension && zip -r ../passwort.xpi . && cd ..
-  ```
-  Drag `passwort.xpi` onto Firefox to install permanently.
-* **Submit to addons.mozilla.org** for free signing. One-time submission, then redistributable as a real signed `.xpi` that installs in any Firefox.
+This re-loads every time Firefox restarts, but it gives you instant edit-and-reload while developing. For daily use, install the signed version above.
 
 ## Daily flow afterwards
 

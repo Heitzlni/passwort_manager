@@ -78,7 +78,7 @@ Built as a learning project. Encrypts everything with AES-256-GCM and an Argon2i
 
 Builds everything in release mode and installs the GUI launcher, daemon (auto-starts at every login via systemd), CLI, native messaging host, Firefox manifest, and auto-type helper. Detects missing system libraries on Debian/Ubuntu and offers to `apt install` them.
 
-After that you have **one** prerequisite step (set master password in the GUI) and **one** Firefox step (load the extension via `about:debugging#/runtime/this-firefox`). See [SETUP.md](SETUP.md) for the full walkthrough.
+After that you have **one** prerequisite step (set master password in the GUI) and **one** Firefox step (install the Mozilla-signed extension once — from `addons.mozilla.org` if you find it there, or from the signed `.xpi` until the public listing is approved). See [SETUP.md](SETUP.md) for the full walkthrough.
 
 ## Install (Android)
 
@@ -187,7 +187,7 @@ Recipients extract and run `./setup.sh` — no Rust toolchain required.
 ## Caveats / limitations
 
 - **Linux side: X11 hotkeys.** Daemon and GUI work on Wayland, but the auto-type helper relies on X11-grabbed hotkeys for the `Ctrl+Alt+J` / `Ctrl+Alt+S` triggers. On Wayland, bind your compositor's hotkey to `passwortctl fill` / `passwortctl quick-save` instead.
-- **Firefox extension is unsigned.** It loads as a temporary add-on (vanishes on Firefox restart). Permanent install requires submitting to addons.mozilla.org for signing — see SETUP.md.
+- **Firefox extension** is Mozilla-signed via AMO submission, so it installs permanently in any Firefox. The public listing on `addons.mozilla.org` is pending Mozilla's review; until then, install the signed `.xpi` from the developer dashboard. See SETUP.md.
 - **Chrome on Android needs a flag flip** to use third-party autofill instead of Google's. Search `chrome://flags` for "third-party password manager" → enable → relaunch. Firefox / DuckDuckGo / Brave honor the system default out of the box.
 - **Sync requires the same master password** on both sides (and that you've previously pushed your PC vault onto the phone at least once — fresh-master flow isn't implemented).
 - **Phone is read-only** for the moment. Add / edit / delete happens on Linux and propagates via sync. Write support on Android is the next phase.
