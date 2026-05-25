@@ -30,6 +30,8 @@ import java.io.File
 fun SettingsScreen(
     onBack: () -> Unit,
     onPickVaultFile: () -> Unit,
+    onChangeMaster: () -> Unit,
+    onHealth: () -> Unit,
     onToggleBiometric: (Boolean) -> Unit,
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -92,6 +94,26 @@ fun SettingsScreen(
                     }
                     onToggleBiometric(it)
                 },
+            )
+
+            Spacer(Modifier.height(8.dp))
+            SectionHeader("Master password")
+
+            SettingRow(
+                title = "Change master password",
+                subtitle = "Re-encrypts the entire vault under a new master. " +
+                    "Removes biometric unlock — you'll re-enable it on the next unlock.",
+                onClick = onChangeMaster,
+            )
+
+            Spacer(Modifier.height(8.dp))
+            SectionHeader("Audit")
+
+            SettingRow(
+                title = "Vault health",
+                subtitle = "Local-only check for weak and reused passwords. " +
+                    "Nothing leaves the device.",
+                onClick = onHealth,
             )
 
             Spacer(Modifier.height(8.dp))

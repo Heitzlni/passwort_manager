@@ -120,6 +120,75 @@ object VaultState {
         return persistTo(newList, newTombs, vaultFile)
     }
 
+    /**
+     * Change the master password. Re-derives a fresh key from
+     * [newMaster] + a fresh salt under the current desktop KDF
+     * params, re-encrypts the existing payload, atomically writes
+     * the new vault.json, and replaces the in-memory cached key.
+     *
+     * Returns Failed("wrong current master") if [currentMaster]
+     * doesn't decrypt the current file (i.e. someone is impersonating
+     * the authenticated user). Biometric wrapped master + Keystore
+     * key are wiped since both were tied to the old key.
+     */
+    fun changeMaster(
+        currentMaster: String,
+        newMaster: String,
+        vaultFile: File,
+    ): WriteResult {
+        if (!isUnlocked) return WriteResult.Failed("vault is locked")
+        val key = derivedKey ?: return WriteResult.Failed("no cached key (unlock again)")
+        if (!vaultFile.exists()) return WriteResult.Failed("vault file disappeared")
+        val currentBytes = try {
+            vaultFile.readBytes()
+        } catch (e: Exception) {
+            return WriteResult.Failed("read failed: ${e.message}")
+        }
+
+        // Verify current master by deriving its key + decrypting the
+        // current file. Slow (Argon2id), but it's the right gate for
+        // a high-value action.
+        val verify = VaultBridge.unlock(currentBytes, currentMaster)
+        if (verify !is UnlockResult.Success) {
+            return WriteResult.Failed("Current master password is wrong.")
+        }
+        // Tidy: zero the temporary derived key we just unboxed.
+        verify.derivedKey?.fill(0)
+
+        // Rotate.
+        val rotated = VaultBridge.rotate(currentBytes, key, newMaster)
+            ?: return WriteResult.Failed("Encrypt failed during master rotation.")
+        val (newFileBytes, newKey) = rotated
+
+        val tmp = File(vaultFile.parentFile, "vault.json.tmp")
+        try {
+            tmp.outputStream().use { it.write(newFileBytes) }
+            if (!tmp.renameTo(vaultFile)) {
+                tmp.delete()
+                newKey.fill(0)
+                return WriteResult.Failed("Atomic rename failed.")
+            }
+        } catch (e: Exception) {
+            tmp.delete()
+            newKey.fill(0)
+            return WriteResult.Failed("Write failed: ${e.message}")
+        }
+
+        // Swap the in-memory cached key under our feet, zero the old.
+        derivedKey?.fill(0)
+        derivedKey = newKey
+        lastVaultMtime = vaultFile.lastModified()
+        rearmAutoLock()
+
+        // The biometric wrapped master + Keystore key were tied to
+        // the OLD master — wipe both. The user will re-enroll on
+        // their next master-password unlock if biometric is on.
+        AppSettings.clearWrappedMaster()
+        KeystoreCipher.wipeKey()
+
+        return WriteResult.Ok
+    }
+
     private fun persistTo(
         newAccounts: List<Account>,
         newTombstones: List<Tombstone>,

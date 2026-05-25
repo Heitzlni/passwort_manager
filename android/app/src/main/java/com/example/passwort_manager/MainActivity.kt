@@ -73,6 +73,8 @@ private sealed class Screen {
     data class AddEntry(val previous: Screen) : Screen()
     /** Edit-entry form — opens from the detail screen's edit button. */
     data class EditEntry(val previous: Screen, val index: Int) : Screen()
+    /** Offline weak/reused report. */
+    data class Health(val previous: Screen) : Screen()
 }
 
 @Composable
@@ -99,6 +101,10 @@ private fun AppRoot() {
     // no wrapped master is stored yet, we stash the just-used master
     // here so a LaunchedEffect can run the enrollment prompt.
     var pendingEnrollment by remember { mutableStateOf<String?>(null) }
+    // Modal dialog for "Change master password". When true the dialog
+    // overlays the current screen until the user dismisses or saves.
+    var showChangeMasterDialog by remember { mutableStateOf(false) }
+    var changeMasterResult by remember { mutableStateOf<String?>(null) }
     val scope = androidx.compose.runtime.rememberCoroutineScope()
     val activity = context as? FragmentActivity
 
@@ -224,8 +230,39 @@ private fun AppRoot() {
         SettingsScreen(
             onBack = { screen = s.previous },
             onPickVaultFile = launchImport,
+            onChangeMaster = { showChangeMasterDialog = true },
+            onHealth = { screen = Screen.Health(previous = s) },
             onToggleBiometric = { /* Real unlock-flow wiring in phase 2.5 step 3 */ },
         )
+        if (showChangeMasterDialog) {
+            ChangeMasterDialog(
+                onDismiss = { showChangeMasterDialog = false },
+                onSubmit = { cur, new ->
+                    scope.launch {
+                        val r = withContext(Dispatchers.Default) {
+                            VaultState.changeMaster(cur, new, vaultFile)
+                        }
+                        when (r) {
+                            VaultState.WriteResult.Ok -> {
+                                changeMasterResult = "Master password changed."
+                                showChangeMasterDialog = false
+                            }
+                            is VaultState.WriteResult.Failed -> {
+                                changeMasterResult = r.message
+                            }
+                        }
+                    }
+                },
+                errorMessage = changeMasterResult?.takeIf { showChangeMasterDialog },
+            )
+        }
+        // Toast-style status banner once the dialog is closed.
+        if (!showChangeMasterDialog && changeMasterResult != null) {
+            LaunchedEffect(changeMasterResult) {
+                kotlinx.coroutines.delay(3000)
+                changeMasterResult = null
+            }
+        }
         return
     }
 
@@ -244,6 +281,16 @@ private fun AppRoot() {
                 }
             },
         )
+        return
+    }
+    if (screen is Screen.Health) {
+        val s = screen as Screen.Health
+        val accounts = VaultState.accounts.value
+        if (accounts == null) {
+            screen = s.previous
+            return
+        }
+        HealthScreen(accounts = accounts, onBack = { screen = s.previous })
         return
     }
     if (screen is Screen.EditEntry) {
@@ -298,7 +345,8 @@ private fun AppRoot() {
             when (val s = screen) {
                 is Screen.Settings,
                 is Screen.AddEntry,
-                is Screen.EditEntry -> {
+                is Screen.EditEntry,
+                is Screen.Health -> {
                     // Already handled by the early-return blocks above —
                     // unreachable here but the compiler insists on
                     // exhaustiveness.
@@ -409,6 +457,97 @@ private fun AppRoot() {
 @Composable
 private fun LocalContextSafe(): Context =
     androidx.compose.ui.platform.LocalContext.current
+
+/**
+ * Modal dialog that gates the master-password rotation. Three
+ * fields: current, new, confirm. Server-side (in VaultState) we
+ * re-verify the current master by deriving its key and comparing
+ * to the cached one — so an attacker who somehow has the device
+ * unlocked still can't rotate the master without knowing it.
+ */
+@Composable
+private fun ChangeMasterDialog(
+    onDismiss: () -> Unit,
+    onSubmit: (current: String, new: String) -> Unit,
+    errorMessage: String?,
+) {
+    var current by remember { mutableStateOf("") }
+    var newPw by remember { mutableStateOf("") }
+    var confirm by remember { mutableStateOf("") }
+    var working by remember { mutableStateOf(false) }
+    var localError by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = { if (!working) onDismiss() },
+        title = { Text("Change master password") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = current,
+                    onValueChange = { current = it },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    label = { Text("Current master") },
+                    enabled = !working,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = newPw,
+                    onValueChange = { newPw = it },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    label = { Text("New master") },
+                    enabled = !working,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = confirm,
+                    onValueChange = { confirm = it },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    label = { Text("Confirm new master") },
+                    enabled = !working,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                val msg = localError ?: errorMessage
+                if (msg != null) {
+                    Text(msg, color = MaterialTheme.colorScheme.error)
+                }
+                Text(
+                    "About 1 second of Argon2id verification + re-derivation. " +
+                        "Biometric unlock will need to be re-enrolled afterwards.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                enabled = !working,
+                onClick = {
+                    if (current.isEmpty() || newPw.isEmpty()) {
+                        localError = "Fields can't be empty."
+                        return@Button
+                    }
+                    if (newPw != confirm) {
+                        localError = "New master and confirmation don't match."
+                        return@Button
+                    }
+                    if (newPw.length < 12) {
+                        localError = "New master must be at least 12 characters."
+                        return@Button
+                    }
+                    localError = null
+                    working = true
+                    onSubmit(current, newPw)
+                },
+            ) { Text(if (working) "Working…" else "Change") }
+        },
+        dismissButton = {
+            TextButton(enabled = !working, onClick = onDismiss) { Text("Cancel") }
+        },
+    )
+}
 
 // ===================== Biometric helpers =====================
 

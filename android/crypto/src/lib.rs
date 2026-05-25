@@ -26,6 +26,14 @@ const KEY_LEN: usize = 32;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 
+// KDF parameters used when *rotating* the master password from the
+// Android side. Must match the desktop crate's constants (src/crypto.rs)
+// so a phone-initiated rotation produces a file the desktop opens
+// without an extra round of param upgrades.
+const KDF_M_COST: u32 = 131_072; // 128 MiB
+const KDF_T_COST: u32 = 3;
+const KDF_P_COST: u32 = 4;
+
 // On-disk schema. Now Serialize too: phase-3 write support
 // re-emits a fresh EncryptedVault with the same salt + kdf params
 // (so the file is still openable by the desktop side with the
@@ -200,6 +208,59 @@ fn decrypt_with_key(vault_bytes: &[u8], key: &[u8]) -> Result<String, String> {
     decrypted_accounts_json(&plaintext)
 }
 
+/// Rotate the master password: decrypt the current vault with
+/// `old_key`, derive a fresh key from `new_master` and a fresh salt
+/// using the current desktop KDF parameters, re-encrypt the same
+/// payload under it, and return the new on-disk file bytes plus the
+/// new derived key (so the caller can update VaultState's cached key).
+fn rotate_master(
+    current_bytes: &[u8],
+    old_key: &[u8],
+    new_master: &[u8],
+) -> Result<(String, [u8; KEY_LEN]), String> {
+    if old_key.len() != KEY_LEN {
+        return Err(format!("old key must be {} bytes", KEY_LEN));
+    }
+    let existing: EncryptedVault = serde_json::from_slice(current_bytes)
+        .map_err(|e| format!("parse current vault file: {}", e))?;
+    let nonce = general_purpose::STANDARD
+        .decode(&existing.nonce)
+        .map_err(|_| "nonce is not valid base64".to_string())?;
+    let ciphertext = general_purpose::STANDARD
+        .decode(&existing.ciphertext)
+        .map_err(|_| "ciphertext is not valid base64".to_string())?;
+
+    // Decrypt with the existing key. If this fails the caller passed
+    // the wrong derived key, treat as "current master wrong".
+    let plaintext = decrypt(&ciphertext, &nonce, old_key)
+        .map_err(|_| "current master incorrect".to_string())?;
+
+    // Fresh salt + derive a new key under the current desktop KDF
+    // params so a phone-initiated rotation never produces a file
+    // with weaker params than the desktop would write.
+    let mut new_salt = [0u8; SALT_LEN];
+    OsRng.fill_bytes(&mut new_salt);
+    let new_key = derive_key(new_master, &new_salt, KDF_M_COST, KDF_T_COST, KDF_P_COST);
+    let mut key_out = [0u8; KEY_LEN];
+    key_out.copy_from_slice(&*new_key);
+
+    let (new_nonce, new_ct) =
+        encrypt(&plaintext, &*new_key).map_err(|_| "encrypt failed".to_string())?;
+    let new_vault = EncryptedVault {
+        version: 2,
+        kdf_algo: "argon2id".to_string(),
+        kdf_m_cost: KDF_M_COST,
+        kdf_t_cost: KDF_T_COST,
+        kdf_p_cost: KDF_P_COST,
+        salt: general_purpose::STANDARD.encode(new_salt),
+        nonce: general_purpose::STANDARD.encode(new_nonce),
+        ciphertext: general_purpose::STANDARD.encode(new_ct),
+    };
+    let file_json = serde_json::to_string_pretty(&new_vault)
+        .map_err(|e| format!("serialise rotated vault: {}", e))?;
+    Ok((file_json, key_out))
+}
+
 /// Re-encrypt a freshly-serialised vault payload using the same key
 /// and same salt/kdf params as the existing file. Returns the new
 /// on-disk-format JSON bytes — the Kotlin caller writes them
@@ -362,6 +423,56 @@ pub extern "system" fn Java_com_example_passwort_1manager_VaultBridge_saveVault<
             // envelope is itself valid JSON.
             let escaped = serde_json::to_string(&file_json).unwrap_or_else(|_| "\"\"".to_string());
             format!(r#"{{"ok":{}}}"#, escaped)
+        }
+        Err(msg) => {
+            let msg_json = serde_json::to_string(&msg).unwrap_or_else(|_| "\"\"".to_string());
+            format!(r#"{{"err":{}}}"#, msg_json)
+        }
+    };
+    env.new_string(envelope)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Rotate the master password. Verifies the current master indirectly
+/// by attempting to decrypt the existing file with the cached `old_key`
+/// — if the caller-supplied key doesn't match, the decrypt fails and
+/// we surface a "current master incorrect" error.
+///
+/// Kotlin signature:
+///   external fun rotateMaster(currentFileBytes: ByteArray,
+///                             oldKeyBytes: ByteArray,
+///                             newMasterBytes: ByteArray): String
+///
+/// Success envelope: `{"ok": "<new vault file>", "key": "<b64 new key>"}`
+/// Failure envelope: `{"err": "<message>"}`
+#[no_mangle]
+pub extern "system" fn Java_com_example_passwort_1manager_VaultBridge_rotateMaster<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    current_file: JByteArray<'a>,
+    old_key_bytes: JByteArray<'a>,
+    new_master_bytes: JByteArray<'a>,
+) -> jstring {
+    let current_bytes = match env.convert_byte_array(&current_file) {
+        Ok(b) => b,
+        Err(_) => return make_err(&mut env, "could not read current file bytes"),
+    };
+    let old_key = match env.convert_byte_array(&old_key_bytes) {
+        Ok(b) => Zeroizing::new(b),
+        Err(_) => return make_err(&mut env, "could not read old key bytes"),
+    };
+    let new_master = match env.convert_byte_array(&new_master_bytes) {
+        Ok(b) => Zeroizing::new(b),
+        Err(_) => return make_err(&mut env, "could not read new master bytes"),
+    };
+
+    let envelope = match rotate_master(&current_bytes, &old_key, &new_master) {
+        Ok((file_json, key)) => {
+            let key_b64 = general_purpose::STANDARD.encode(&key);
+            let escaped =
+                serde_json::to_string(&file_json).unwrap_or_else(|_| "\"\"".to_string());
+            format!(r#"{{"ok":{},"key":"{}"}}"#, escaped, key_b64)
         }
         Err(msg) => {
             let msg_json = serde_json::to_string(&msg).unwrap_or_else(|_| "\"\"".to_string());

@@ -40,6 +40,16 @@ object VaultBridge {
         payloadJson: String,
     ): String
 
+    /** Decrypt the vault with the cached `oldKey`, derive a fresh key
+     *  under the new master, re-encrypt, return the new vault file
+     *  bytes + the new derived key. */
+    @JvmStatic
+    external fun rotateMaster(
+        currentFile: ByteArray,
+        oldKey: ByteArray,
+        newMaster: ByteArray,
+    ): String
+
     /** Decrypt a vault file and return the accounts list + derived
      *  key, or an error. The key is cached by VaultState so we can
      *  silently re-decrypt the file when sync writes a new copy
@@ -131,6 +141,42 @@ object VaultBridge {
         val fileJson = obj.optString("ok", "")
         if (fileJson.isEmpty()) return null
         return fileJson.toByteArray(Charsets.UTF_8)
+    }
+
+    /** Change the master password. Returns the new file bytes and
+     *  freshly-derived key on success; null on failure (typically
+     *  because the supplied `oldKey` doesn't decrypt the current
+     *  file, which we report to the user as "wrong current master").
+     */
+    fun rotate(
+        currentFile: ByteArray,
+        oldKey: ByteArray,
+        newMaster: String,
+    ): Pair<ByteArray, ByteArray>? {
+        val newBytes = newMaster.toByteArray(Charsets.UTF_8)
+        val envelope = try {
+            rotateMaster(currentFile, oldKey, newBytes)
+        } catch (_: Throwable) {
+            newBytes.fill(0)
+            return null
+        } finally {
+            newBytes.fill(0)
+        }
+        val obj = try {
+            JSONObject(envelope)
+        } catch (_: Exception) {
+            return null
+        }
+        if (obj.has("err")) return null
+        val fileJson = obj.optString("ok", "")
+        val keyB64 = obj.optString("key", "")
+        if (fileJson.isEmpty() || keyB64.isEmpty()) return null
+        val newKey = try {
+            Base64.decode(keyB64, Base64.NO_WRAP)
+        } catch (_: IllegalArgumentException) {
+            return null
+        }
+        return fileJson.toByteArray(Charsets.UTF_8) to newKey
     }
 
     /** Re-decrypt the vault file with the cached key (no biometric,
