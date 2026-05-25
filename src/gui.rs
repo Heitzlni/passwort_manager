@@ -873,6 +873,14 @@ enum Modal {
     Clients {
         message: Option<(String, bool)>,
     },
+    /// PC-initiated USB sync with the phone. Runs adb pull → decrypt
+    /// → merge → persist → adb push synchronously in the button click
+    /// (one to two seconds blocking UI — short enough to keep the
+    /// code simple, long enough that we explain what's happening).
+    MobileSync {
+        /// Result of the last run, `None` until the user clicks Run.
+        result: Option<Result<crate::sync::SyncStats, String>>,
+    },
 }
 
 #[derive(Default)]
@@ -976,6 +984,11 @@ impl Drop for Modal {
             }
             Modal::Clients { .. } => {
                 // Only client labels / status text — nothing secret.
+            }
+            Modal::MobileSync { .. } => {
+                // The merged payload lives in the live Session, which
+                // has its own zeroize-on-drop. Nothing sensitive
+                // owned here.
             }
         }
     }
@@ -1539,6 +1552,16 @@ impl App {
                                     chooser_rx: None,
                                 });
                             }
+                            if tb.mobile_sync
+                                && ui
+                                    .button("Sync phone")
+                                    .on_hover_text(
+                                        "Two-way merge the vault with an Android phone plugged in over USB",
+                                    )
+                                    .clicked()
+                            {
+                                *modal = Some(Modal::MobileSync { result: None });
+                            }
                         },
                     );
                 });
@@ -2074,6 +2097,7 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
         Modal::ImportForeign { .. } => "Import from another manager",
         Modal::ReviewCaptures { .. } => "Captured while locked — review",
         Modal::Clients { .. } => "Connected apps",
+        Modal::MobileSync { .. } => "Sync with phone (USB)",
     };
 
     // Audit + Import + Tokens want more horizontal room when there's room
@@ -2084,6 +2108,7 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
         Modal::ImportForeign { .. } => 560.0,
         Modal::ReviewCaptures { .. } => 560.0,
         Modal::Clients { .. } => 560.0,
+        Modal::MobileSync { .. } => 480.0,
         Modal::Import { .. } => 500.0,
         Modal::Tokens => 440.0,
         _ => 360.0,
@@ -2882,6 +2907,7 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                     ui.checkbox(&mut cfg.toolbar.health, "Health (offline check)");
                     ui.checkbox(&mut cfg.toolbar.export, "Export");
                     ui.checkbox(&mut cfg.toolbar.import, "Import");
+                    ui.checkbox(&mut cfg.toolbar.mobile_sync, "Sync phone (USB)");
                     if cfg.toolbar != before {
                         match app_config::save(&cfg) {
                             Ok(_) => {
@@ -3897,6 +3923,103 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                 {
                     result = ModalResult::Close;
                 }
+            }
+
+            Modal::MobileSync { result: out } => {
+                ui.colored_label(
+                    COLOR_MUTED,
+                    "Two-way merge the vault with an Android phone plugged in \
+                     over USB. The phone needs to have the same master \
+                     password as this PC (assumes you've previously \
+                     imported your vault on the phone). Deletions on either \
+                     side propagate, newer edits win on conflict.",
+                );
+                ui.add_space(12.0);
+
+                if let Some(r) = out {
+                    match r {
+                        Ok(stats) => {
+                            ui.colored_label(COLOR_OK, "Sync completed.");
+                            ui.add_space(6.0);
+                            ui.label(format!("• Added to phone: {}", stats.added_from_a));
+                            ui.label(format!("• Added to PC: {}", stats.added_from_b));
+                            ui.label(format!("• Unchanged: {}", stats.unchanged));
+                            if stats.resolved_conflicts > 0 {
+                                ui.label(format!(
+                                    "• Resolved conflicts (newer won): {}",
+                                    stats.resolved_conflicts,
+                                ));
+                            }
+                            if stats.deleted_on_a + stats.deleted_on_b > 0 {
+                                ui.label(format!(
+                                    "• Deletions propagated: {}",
+                                    (stats.deleted_on_a + stats.deleted_on_b) / 2,
+                                ));
+                            }
+                            ui.add_space(8.0);
+                            ui.colored_label(
+                                COLOR_MUTED,
+                                "Lock & unlock the phone's app to see the \
+                                 merged vault — its in-memory state is \
+                                 still the pre-sync version.",
+                            );
+                        }
+                        Err(msg) => {
+                            ui.colored_label(COLOR_ERROR, msg.as_str());
+                        }
+                    }
+                } else {
+                    ui.colored_label(
+                        COLOR_MUTED,
+                        "Make sure:\n  • Phone is plugged in over USB\n  \
+                         • USB-debugging is enabled\n  • The phone has \
+                         already imported the vault at least once",
+                    );
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if out.is_none() {
+                        // Idle — show the Run button.
+                        if ui
+                            .add_sized(
+                                egui::vec2(110.0, 28.0),
+                                egui::Button::new(
+                                    egui::RichText::new("Run sync").strong(),
+                                )
+                                .fill(COLOR_ACCENT),
+                            )
+                            .on_hover_text(
+                                "Pulls phone vault → merges → pushes back. \
+                                 Takes a second or two.",
+                            )
+                            .clicked()
+                        {
+                            *out = Some(
+                                crate::sync::run_mobile_sync(session)
+                                    .map_err(|e| e.to_string()),
+                            );
+                        }
+                    } else {
+                        // After a run — let the user trigger another
+                        // pass without closing the modal.
+                        if ui
+                            .add_sized(
+                                egui::vec2(110.0, 28.0),
+                                egui::Button::new("Run again"),
+                            )
+                            .clicked()
+                        {
+                            *out = None;
+                        }
+                    }
+                    if ui
+                        .add_sized(egui::vec2(80.0, 28.0), egui::Button::new("Close"))
+                        .clicked()
+                    {
+                        result = ModalResult::Close;
+                    }
+                });
             }
 
             Modal::Import {

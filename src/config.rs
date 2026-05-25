@@ -60,6 +60,10 @@ pub struct ToolbarConfig {
     pub export: bool,
     #[serde(default = "default_true")]
     pub import: bool,
+    /// Pre-existing configs (no field) default to on — sync is the
+    /// reason the toolbar got the new button.
+    #[serde(default = "default_true")]
+    pub mobile_sync: bool,
 }
 
 impl Default for ToolbarConfig {
@@ -71,6 +75,7 @@ impl Default for ToolbarConfig {
             health: true,
             export: true,
             import: true,
+            mobile_sync: true,
         }
     }
 }

@@ -386,6 +386,30 @@ impl Session {
         Ok(self.accounts.len())
     }
 
+    /// Two-way merge with the payload of another device (typically a
+    /// phone pulled over USB). The session's accounts + tombstones
+    /// become the merged result, persisted to disk. On disk failure
+    /// the prior state is restored. Returns the sync stats so the
+    /// caller can show the user what changed.
+    pub fn merge_with(
+        &mut self,
+        foreign: crate::storage::VaultPayload,
+    ) -> std::io::Result<crate::sync::SyncStats> {
+        let our = crate::storage::VaultPayload {
+            accounts: self.accounts.clone(),
+            tombstones: self.tombstones.clone(),
+        };
+        let (merged, stats) = crate::sync::merge(our, foreign);
+        let backup_accounts = std::mem::replace(&mut self.accounts, merged.accounts);
+        let backup_tombs = std::mem::replace(&mut self.tombstones, merged.tombstones);
+        if let Err(e) = persist(self) {
+            self.accounts = backup_accounts;
+            self.tombstones = backup_tombs;
+            return Err(e);
+        }
+        Ok(stats)
+    }
+
     pub fn delete_account(&mut self, idx: usize) -> std::io::Result<()> {
         if idx >= self.accounts.len() {
             return Err(std::io::Error::new(

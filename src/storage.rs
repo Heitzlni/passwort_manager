@@ -72,7 +72,7 @@ pub struct Tombstone {
 /// v1 vaults serialised this as a bare JSON array of `Account`s.
 /// v2 (current) serialises a JSON object with `accounts` and
 /// `tombstones`. `parse_vault_payload` accepts both shapes.
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct VaultPayload {
     #[serde(default)]
     pub accounts: Vec<Account>,

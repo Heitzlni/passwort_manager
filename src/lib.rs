@@ -14,6 +14,7 @@ pub mod portable;
 pub mod qr;
 pub mod session;
 pub mod storage;
+pub mod sync;
 pub mod typing;
 pub mod vault;
 
