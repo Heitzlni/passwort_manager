@@ -9,7 +9,11 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 const VAULT_FILENAME: &str = "vault.json";
 const APP_DIR_NAME: &str = "passwort-manager";
 const ENV_VAULT_OVERRIDE: &str = "PASSWORT_VAULT_PATH";
-pub const CURRENT_VERSION: u32 = 1;
+/// Encrypted-vault file format version. Bumped to 2 in 2026 when the
+/// plaintext payload changed from a bare JSON array of accounts to
+/// `{"accounts": [...], "tombstones": [...]}` — see `VaultPayload`.
+/// Readers tolerate both shapes; writers always emit v2.
+pub const CURRENT_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct Account {
@@ -40,6 +44,78 @@ pub struct Account {
     /// pre-history vault files readable.
     #[serde(default)]
     pub history: Vec<PasswordHistoryEntry>,
+    /// Unix epoch seconds when this entry was last created or edited.
+    /// Drives "newer wins" during cross-device sync. Older v1 entries
+    /// without this field default to 0 — they always lose to any post-v2
+    /// edit, which is the correct semantics on first sync after upgrade.
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+/// Marks an entry that was deleted, so a cross-device sync can
+/// propagate the deletion instead of treating "missing on side A" as
+/// "needs to be added back from side B". The pair `(name, username)`
+/// is the same identity used everywhere else in the codebase; the
+/// timestamp lets sync drop the tombstone when the entry was
+/// re-created on the other side after the deletion.
+#[derive(Serialize, Deserialize, Clone, Zeroize, ZeroizeOnDrop, PartialEq, Eq, Debug)]
+pub struct Tombstone {
+    pub name: String,
+    #[serde(default)]
+    pub username: String,
+    /// Unix epoch seconds at the moment of deletion.
+    pub deleted_at: u64,
+}
+
+/// The decrypted plaintext inside `EncryptedVault.ciphertext`.
+///
+/// v1 vaults serialised this as a bare JSON array of `Account`s.
+/// v2 (current) serialises a JSON object with `accounts` and
+/// `tombstones`. `parse_vault_payload` accepts both shapes.
+#[derive(Serialize, Deserialize, Default)]
+pub struct VaultPayload {
+    #[serde(default)]
+    pub accounts: Vec<Account>,
+    #[serde(default)]
+    pub tombstones: Vec<Tombstone>,
+}
+
+/// Reader-side view of the payload that doesn't take ownership of
+/// `Account` strings — used in the persist path so we can serialise
+/// straight from the live session without an extra clone.
+#[derive(Serialize)]
+pub struct VaultPayloadRef<'a> {
+    pub accounts: &'a [Account],
+    pub tombstones: &'a [Tombstone],
+}
+
+/// Parse the decrypted plaintext, tolerating either v1 (bare array)
+/// or v2 (object) shape. We sniff the first non-whitespace byte to
+/// decide so we don't pay for two parse attempts.
+pub fn parse_vault_payload(plaintext: &[u8]) -> Result<VaultPayload, serde_json::Error> {
+    let first = plaintext
+        .iter()
+        .find(|&&b| !b.is_ascii_whitespace())
+        .copied();
+    match first {
+        Some(b'{') => serde_json::from_slice(plaintext),
+        // v1 legacy bare-array — wrap in a payload with empty tombstones.
+        _ => serde_json::from_slice::<Vec<Account>>(plaintext)
+            .map(|accounts| VaultPayload {
+                accounts,
+                tombstones: Vec::new(),
+            }),
+    }
+}
+
+/// Current Unix epoch seconds, or 0 on the (impossible-in-practice)
+/// pre-epoch clock. Used for `Account.updated_at` and
+/// `Tombstone.deleted_at`.
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[derive(Serialize, Deserialize, Clone, Zeroize, ZeroizeOnDrop)]

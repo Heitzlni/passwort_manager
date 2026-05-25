@@ -1090,6 +1090,7 @@ mod origin_tests {
             totp_secret: String::new(),
             notes: String::new(),
             history: Vec::new(),
+            updated_at: 0,
         }
     }
 

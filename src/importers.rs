@@ -32,6 +32,9 @@ impl From<Imported> for Account {
             totp_secret: i.totp_secret,
             notes: i.notes,
             history: Vec::new(),
+            // Imported just now → stamp current time so a downstream
+            // sync treats this as the freshest copy.
+            updated_at: crate::storage::now_secs(),
         }
     }
 }

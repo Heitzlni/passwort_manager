@@ -46,6 +46,10 @@ struct Account {
     notes: String,
     #[serde(default)]
     history: Vec<PasswordHistoryEntry>,
+    /// Vault format v2 — Unix epoch seconds at last create/edit.
+    /// Defaults to 0 for entries written by a v1 desktop.
+    #[serde(default)]
+    updated_at: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -53,6 +57,28 @@ struct PasswordHistoryEntry {
     password: String,
     #[serde(default)]
     changed_at: String,
+}
+
+/// Vault format v2 inner shape — accounts plus deletion tombstones.
+/// Read-side only on Android (phase 1 stays read-only).
+#[derive(Deserialize)]
+struct VaultPayload {
+    #[serde(default)]
+    accounts: Vec<Account>,
+    #[serde(default)]
+    #[allow(dead_code)] // surfaced once Android writes/syncs.
+    tombstones: Vec<Tombstone>,
+}
+
+#[derive(Deserialize)]
+struct Tombstone {
+    #[allow(dead_code)]
+    name: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    username: String,
+    #[allow(dead_code)]
+    deleted_at: u64,
 }
 
 fn derive_key(password: &[u8], salt: &[u8], m: u32, t: u32, p: u32) -> Zeroizing<[u8; KEY_LEN]> {
@@ -104,8 +130,19 @@ fn unlock(vault_bytes: &[u8], password: &[u8]) -> Result<String, String> {
     let plaintext = decrypt(&ciphertext, &nonce, &*key)
         .map_err(|_| "wrong password or corrupt vault".to_string())?;
 
-    let accounts: Vec<Account> = serde_json::from_slice(&plaintext)
-        .map_err(|e| format!("parse decrypted accounts: {}", e))?;
+    // v2: JSON object `{accounts: [...], tombstones: [...]}`.
+    // v1: bare JSON array of accounts. Sniff the first non-ws byte.
+    let first = plaintext
+        .iter()
+        .find(|&&b| !b.is_ascii_whitespace())
+        .copied();
+    let accounts: Vec<Account> = match first {
+        Some(b'{') => serde_json::from_slice::<VaultPayload>(&plaintext)
+            .map_err(|e| format!("parse decrypted payload: {}", e))?
+            .accounts,
+        _ => serde_json::from_slice::<Vec<Account>>(&plaintext)
+            .map_err(|e| format!("parse decrypted accounts (legacy): {}", e))?,
+    };
     serde_json::to_string(&accounts).map_err(|e| format!("serialize accounts: {}", e))
 }
 

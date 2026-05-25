@@ -60,6 +60,7 @@ object VaultBridge {
                 password = a.optString("password"),
                 totpSecret = a.optString("totp_secret"),
                 notes = a.optString("notes"),
+                updatedAt = a.optLong("updated_at", 0L),
             )
         }
         return out
@@ -73,6 +74,8 @@ data class Account(
     val password: String,
     val totpSecret: String,
     val notes: String,
+    /** Vault format v2: Unix epoch seconds at last create/edit. */
+    val updatedAt: Long = 0L,
 )
 
 sealed class UnlockResult {

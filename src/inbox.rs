@@ -68,6 +68,9 @@ impl From<Capture> for crate::storage::Account {
             totp_secret: c.totp_secret,
             notes: c.notes,
             history: Vec::new(),
+            // Materialised from a sealed capture at unlock time —
+            // stamp current time so sync treats it as fresh.
+            updated_at: crate::storage::now_secs(),
         }
     }
 }

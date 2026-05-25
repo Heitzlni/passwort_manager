@@ -3,9 +3,9 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{self, KDF_M_COST, KDF_P_COST, KDF_T_COST, KEY_LEN, SALT_LEN};
 use crate::storage::{
-    Account, PasswordHistoryEntry, CURRENT_VERSION, EncryptedVault, LegacyVerifierVault,
-    parse_encrypted, parse_legacy_plaintext, parse_legacy_verifier,
-    read_vault_file, save_encrypted_vault, vault_file_exists,
+    Account, PasswordHistoryEntry, Tombstone, VaultPayloadRef, CURRENT_VERSION, EncryptedVault,
+    LegacyVerifierVault, parse_encrypted, parse_legacy_plaintext, parse_legacy_verifier,
+    parse_vault_payload, read_vault_file, save_encrypted_vault, vault_file_exists,
 };
 
 const LEGACY_VERIFIER_PLAINTEXT: &str = "VERIFY";
@@ -14,16 +14,21 @@ pub const MIN_MASTER_PASSWORD_LEN: usize = 12;
 const PW_HISTORY_KEEP: usize = 10;
 
 fn now_secs() -> String {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs().to_string())
-        .unwrap_or_default()
+    crate::storage::now_secs().to_string()
+}
+
+fn now_u64() -> u64 {
+    crate::storage::now_secs()
 }
 
 pub struct Session {
     pub key: Zeroizing<[u8; KEY_LEN]>,
     pub salt: [u8; SALT_LEN],
     pub accounts: Vec<Account>,
+    /// Tombstones for entries deleted on this device — persisted
+    /// inside the encrypted vault. Drives delete-propagation in
+    /// cross-device sync; otherwise dormant.
+    pub tombstones: Vec<Tombstone>,
 }
 
 impl Drop for Session {
@@ -67,6 +72,7 @@ pub fn setup(password: &[u8], existing: Vec<Account>) -> std::io::Result<Session
         key,
         salt,
         accounts: existing,
+        tombstones: Vec::new(),
     };
     persist(&session)?;
     Ok(session)
@@ -76,6 +82,14 @@ pub fn setup(password: &[u8], existing: Vec<Account>) -> std::io::Result<Session
 /// account list. Doesn't touch any persistent state — used by the import
 /// path to merge a foreign vault into the current one.
 pub fn decrypt_accounts(vault: &EncryptedVault, password: &[u8]) -> Result<Vec<Account>, ()> {
+    decrypt_payload(vault, password).map(|p| p.accounts)
+}
+
+/// Decrypt the full payload (accounts + tombstones). Used by sync.
+pub fn decrypt_payload(
+    vault: &EncryptedVault,
+    password: &[u8],
+) -> Result<crate::storage::VaultPayload, ()> {
     let salt_vec = general_purpose::STANDARD
         .decode(&vault.salt)
         .map_err(|_| ())?;
@@ -98,7 +112,7 @@ pub fn decrypt_accounts(vault: &EncryptedVault, password: &[u8]) -> Result<Vec<A
         vault.kdf_p_cost,
     );
     let plaintext = crypto::decrypt(&ciphertext, &nonce, &*key)?;
-    serde_json::from_slice::<Vec<Account>>(&plaintext).map_err(|_| ())
+    parse_vault_payload(&plaintext).map_err(|_| ())
 }
 
 pub fn login(vault: &EncryptedVault, password: &[u8]) -> Result<Session, ()> {
@@ -127,12 +141,13 @@ pub fn login(vault: &EncryptedVault, password: &[u8]) -> Result<Session, ()> {
     );
 
     let plaintext = crypto::decrypt(&ciphertext, &nonce, &*key)?;
-    let accounts: Vec<Account> = serde_json::from_slice(&plaintext).map_err(|_| ())?;
+    let payload = parse_vault_payload(&plaintext).map_err(|_| ())?;
 
     let mut session = Session {
         key,
         salt,
-        accounts,
+        accounts: payload.accounts,
+        tombstones: payload.tombstones,
     };
 
     if vault.kdf_m_cost != KDF_M_COST
@@ -179,6 +194,7 @@ pub fn login_legacy(legacy: &LegacyVerifierVault, password: &[u8]) -> Result<Ses
             totp_secret: old.totp_secret.clone(),
             notes: old.notes.clone(),
             history: old.history.clone(),
+            updated_at: 0,
         });
     }
 
@@ -188,6 +204,7 @@ pub fn login_legacy(legacy: &LegacyVerifierVault, password: &[u8]) -> Result<Ses
         key: new_key,
         salt: new_salt,
         accounts,
+        tombstones: Vec::new(),
     };
     persist(&session).map_err(|_| ())?;
     Ok(session)
@@ -209,6 +226,12 @@ impl Session {
         totp_secret: String,
         notes: String,
     ) -> std::io::Result<()> {
+        // If a tombstone exists for the same (name, username), the
+        // user is re-creating an entry they previously deleted — drop
+        // the tombstone so it doesn't trigger another delete on next
+        // sync.
+        self.tombstones
+            .retain(|t| !(t.name == name && t.username == username));
         self.accounts.push(Account {
             name,
             url,
@@ -217,6 +240,7 @@ impl Session {
             totp_secret,
             notes,
             history: Vec::new(),
+            updated_at: now_u64(),
         });
         if let Err(e) = persist(self) {
             self.accounts.pop();
@@ -305,6 +329,10 @@ impl Session {
             self.accounts[idx].password = p;
         }
 
+        // Any reachable code path here is a real edit — stamp the
+        // sync-merge timestamp so this version wins on next sync.
+        self.accounts[idx].updated_at = now_u64();
+
         if let Err(e) = persist(self) {
             self.accounts[idx] = backup;
             return Err(e);
@@ -366,8 +394,19 @@ impl Session {
             ));
         }
         let removed = self.accounts.remove(idx);
+        // Drop any prior tombstone for the same identity (would be
+        // weird — the entry was reborn between then and now and we
+        // just deleted it again — but keep the bookkeeping clean).
+        self.tombstones
+            .retain(|t| !(t.name == removed.name && t.username == removed.username));
+        self.tombstones.push(Tombstone {
+            name: removed.name.clone(),
+            username: removed.username.clone(),
+            deleted_at: now_u64(),
+        });
         if let Err(e) = persist(self) {
             self.accounts.insert(idx, removed);
+            self.tombstones.pop();
             return Err(e);
         }
         Ok(())
@@ -405,11 +444,16 @@ impl Session {
 }
 
 fn persist(session: &Session) -> std::io::Result<()> {
-    // Use a Vec writer so the intermediate plaintext JSON lives in a
-    // Zeroizing buffer for its entire lifetime rather than being handed
-    // back from serde_json as a fresh allocation we then *try* to wrap.
+    // v2 payload: object with `accounts` + `tombstones`. We serialise
+    // straight from references on `session` so the live data never
+    // needs an extra clone, and the intermediate plaintext JSON lives
+    // in a Zeroizing buffer for its full lifetime.
     let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
-    serde_json::to_writer(&mut *buf, &session.accounts)
+    let payload = VaultPayloadRef {
+        accounts: &session.accounts,
+        tombstones: &session.tombstones,
+    };
+    serde_json::to_writer(&mut *buf, &payload)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     let plaintext = buf;
     let (nonce, ciphertext) = crypto::encrypt(&plaintext, &*session.key);
