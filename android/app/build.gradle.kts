@@ -119,6 +119,7 @@ dependencies {
     // Brings ContentCopy / Visibility / VisibilityOff etc. that aren't
     // in the (smaller) icons-core artifact pulled in by material3.
     implementation(libs.androidx.compose.material.icons.extended)
+    implementation(libs.androidx.biometric)
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.ui.tooling.preview)

@@ -6,9 +6,9 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.os.Bundle
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.fragment.app.FragmentActivity
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -17,6 +17,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.*
@@ -35,7 +36,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -63,6 +64,8 @@ private sealed class Screen {
     object NoVault : Screen()
     data class Locked(val errorMsg: String? = null) : Screen()
     data class Unlocked(val selectedIndex: Int? = null) : Screen()
+    /** Pushed on top of [previous] — closing it returns to that screen. */
+    data class Settings(val previous: Screen) : Screen()
 }
 
 @Composable
@@ -84,7 +87,74 @@ private fun AppRoot() {
             }
         )
     }
+    var importResult by remember { mutableStateOf<String?>(null) }
+    // After a master-password unlock, if biometric is enabled but
+    // no wrapped master is stored yet, we stash the just-used master
+    // here so a LaunchedEffect can run the enrollment prompt.
+    var pendingEnrollment by remember { mutableStateOf<String?>(null) }
     val scope = androidx.compose.runtime.rememberCoroutineScope()
+    val activity = context as? FragmentActivity
+
+    // SAF file picker — opens the system file chooser so the user can
+    // point us at a vault.json on Downloads, Drive, Nextcloud, anywhere
+    // a DocumentsProvider has reached. We copy the picked content into
+    // the app's private external storage (replacing any prior vault).
+    val filePicker = androidx.activity.compose.rememberLauncherForActivityResult(
+        contract = androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri == null) {
+            return@rememberLauncherForActivityResult
+        }
+        scope.launch {
+            val msg = withContext(Dispatchers.IO) {
+                runCatching {
+                    context.contentResolver.openInputStream(uri).use { input ->
+                        if (input == null) error("could not open picked file")
+                        // Sanity-check: vault.json is small (< 5 MB for any
+                        // realistic vault). Rejects accidentally-picked
+                        // huge files before we slurp them.
+                        val bytes = input.readBytes()
+                        if (bytes.size > 5 * 1024 * 1024) {
+                            error("file is too large to be a vault (${bytes.size / 1024} KB)")
+                        }
+                        // Reject if it doesn't even parse as JSON. Cheap,
+                        // catches "user picked a random binary."
+                        String(bytes).trim().let {
+                            if (!it.startsWith("{")) error("doesn't look like a vault JSON file")
+                        }
+                        // Atomic-ish replace: write to .tmp then rename.
+                        val tmp = File(vaultFile.parentFile, "vault.json.tmp")
+                        tmp.outputStream().use { it.write(bytes) }
+                        if (!tmp.renameTo(vaultFile)) {
+                            tmp.delete()
+                            error("could not replace existing vault file")
+                        }
+                    }
+                }.fold(
+                    onSuccess = { "Imported vault file." },
+                    onFailure = { "Import failed: ${it.message}" },
+                )
+            }
+            importResult = msg
+            // Lock any previously-unlocked session — the new vault may
+            // have a different master. Wipe biometric state for the
+            // same reason: the wrapped master almost certainly no
+            // longer matches the new vault's master.
+            VaultState.lock()
+            AppSettings.clearWrappedMaster()
+            KeystoreCipher.wipeKey()
+            // Route to the right post-import screen.
+            screen = if (vaultFile.exists() && vaultFile.length() > 0)
+                Screen.Locked() else Screen.NoVault
+        }
+    }
+
+    val launchImport: () -> Unit = {
+        // Accept any MIME type — Downloads-provided vault.json on Android
+        // often comes back as application/octet-stream or text/plain,
+        // and Drive sometimes labels it application/json.
+        filePicker.launch(arrayOf("*/*"))
+    }
 
     // If VaultState locks itself (auto-lock or external trigger) while
     // we're in the Unlocked screen, kick the UI back to Locked.
@@ -95,26 +165,71 @@ private fun AppRoot() {
         }
     }
 
+    // Run biometric enrollment when triggered by a master-password
+    // unlock. Stays inside a LaunchedEffect so the prompt is scoped
+    // to the composition and survives recompositions.
+    LaunchedEffect(pendingEnrollment) {
+        val master = pendingEnrollment ?: return@LaunchedEffect
+        val act = activity ?: run { pendingEnrollment = null; return@LaunchedEffect }
+        runBiometricEnrollment(
+            activity = act,
+            master = master,
+            onDone = { pendingEnrollment = null },
+        )
+    }
+
+    // Settings has its own Scaffold/topbar — bypass the outer one.
+    if (screen is Screen.Settings) {
+        SettingsScreen(
+            onBack = { screen = (screen as Screen.Settings).previous },
+            onPickVaultFile = launchImport,
+            onToggleBiometric = { /* Real unlock-flow wiring in phase 2.5 step 3 */ },
+        )
+        return
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("Password Manager") },
+                actions = {
+                    IconButton(onClick = { screen = Screen.Settings(screen) }) {
+                        Icon(Icons.Default.Settings, contentDescription = "Settings")
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(),
             )
         }
     ) { padding ->
         Box(modifier = Modifier.padding(padding).fillMaxSize()) {
             when (val s = screen) {
+                is Screen.Settings -> {} // handled above; unreachable here
                 is Screen.NoVault -> NoVaultScreen(
                     expectedPath = vaultFile.absolutePath,
+                    onPickFile = launchImport,
                     onRetry = {
                         screen = if (vaultFile.exists() && vaultFile.length() > 0)
                             Screen.Locked() else Screen.NoVault
                     },
+                    importResult = importResult,
                 )
 
                 is Screen.Locked -> LockedScreen(
                     errorMsg = s.errorMsg,
+                    biometricAvailable = activity != null
+                        && AppSettings.biometricEnabled
+                        && AppSettings.hasWrappedMaster()
+                        && KeystoreCipher.keyExists(),
+                    onBiometricUnlock = {
+                        val act = activity ?: return@LockedScreen
+                        runBiometricUnlock(
+                            activity = act,
+                            scope = scope,
+                            vaultFile = vaultFile,
+                            onError = { msg -> screen = Screen.Locked(msg) },
+                            onResult = { newScreen -> screen = newScreen },
+                        )
+                    },
                     onUnlock = { master ->
                         scope.launch {
                             val bytes = vaultFile.readBytes()
@@ -124,6 +239,15 @@ private fun AppRoot() {
                             screen = when (result) {
                                 is UnlockResult.Success -> {
                                     VaultState.unlock(result.accounts)
+                                    // Offer biometric enrollment if the
+                                    // user has the pref on but hasn't
+                                    // wrapped a master yet.
+                                    if (activity != null
+                                        && AppSettings.biometricEnabled
+                                        && !AppSettings.hasWrappedMaster()
+                                    ) {
+                                        pendingEnrollment = master
+                                    }
                                     Screen.Unlocked()
                                 }
                                 is UnlockResult.Failure -> Screen.Locked(result.message)
@@ -168,10 +292,123 @@ private fun AppRoot() {
 private fun LocalContextSafe(): Context =
     androidx.compose.ui.platform.LocalContext.current
 
+// ===================== Biometric helpers =====================
+
+/**
+ * Drives the "Unlock with fingerprint" button on LockedScreen.
+ * Resolves the stored wrapped master via KeystoreCipher, runs the
+ * biometric prompt, decrypts, and replays the standard unlock flow
+ * via VaultBridge.
+ */
+private fun runBiometricUnlock(
+    activity: FragmentActivity,
+    scope: kotlinx.coroutines.CoroutineScope,
+    vaultFile: File,
+    onError: (String) -> Unit,
+    onResult: (Screen) -> Unit,
+) {
+    val wrapped = AppSettings.loadWrappedMaster() ?: run {
+        onError("No biometric master stored yet."); return
+    }
+    val cipher = try {
+        KeystoreCipher.decryptCipher(wrapped.first)
+    } catch (e: android.security.keystore.KeyPermanentlyInvalidatedException) {
+        // The user changed their biometric enrollment. Clear so we
+        // don't keep prompting with a dead key.
+        AppSettings.clearWrappedMaster()
+        KeystoreCipher.wipeKey()
+        onError("Biometric was changed since setup. Enter master password to re-enable.")
+        return
+    } catch (e: Exception) {
+        onError("Biometric not available: ${e.message}")
+        return
+    }
+
+    BiometricUnlock.prompt(
+        activity = activity,
+        title = "Unlock vault",
+        subtitle = "Touch the fingerprint sensor",
+        negativeButton = "Use master password",
+        cipher = cipher,
+        onSuccess = { authedCipher ->
+            val masterBytes = try {
+                authedCipher.doFinal(wrapped.second)
+            } catch (e: Exception) {
+                onError("Biometric decrypt failed: ${e.message}")
+                return@prompt
+            }
+            val master = String(masterBytes, Charsets.UTF_8)
+            scope.launch {
+                val bytes = vaultFile.readBytes()
+                val result = withContext(Dispatchers.Default) {
+                    VaultBridge.unlock(bytes, master)
+                }
+                when (result) {
+                    is UnlockResult.Success -> {
+                        VaultState.unlock(result.accounts)
+                        onResult(Screen.Unlocked())
+                    }
+                    is UnlockResult.Failure -> {
+                        // The stored master no longer matches the
+                        // current vault (different vault file imported,
+                        // master was changed on Linux side, etc.).
+                        // Drop the wrapped state so we don't keep
+                        // failing biometrics with no escape.
+                        AppSettings.clearWrappedMaster()
+                        onResult(
+                            Screen.Locked(
+                                "Stored fingerprint master no longer matches. Enter master to re-set."
+                            )
+                        )
+                    }
+                }
+            }
+        },
+        onError = onError,
+    )
+}
+
+/** Encrypt the just-used master with a fresh Keystore key + biometric. */
+private fun runBiometricEnrollment(
+    activity: FragmentActivity,
+    master: String,
+    onDone: () -> Unit,
+) {
+    val cipher = try {
+        KeystoreCipher.encryptCipher()
+    } catch (e: Exception) {
+        onDone(); return
+    }
+    BiometricUnlock.prompt(
+        activity = activity,
+        title = "Save fingerprint unlock",
+        subtitle = "Confirm to allow fingerprint to unlock the vault",
+        negativeButton = "Not now",
+        cipher = cipher,
+        onSuccess = { authedCipher ->
+            try {
+                val ct = authedCipher.doFinal(master.toByteArray(Charsets.UTF_8))
+                AppSettings.saveWrappedMaster(authedCipher.iv, ct)
+            } catch (_: Exception) {
+                // best effort — if it fails, biometric just isn't set
+                // up, the user can retry by toggling the setting.
+            }
+            onDone()
+        },
+        onError = { onDone() },
+        onCancel = { onDone() },
+    )
+}
+
 // ===================== Screen 1: no vault =====================
 
 @Composable
-private fun NoVaultScreen(expectedPath: String, onRetry: () -> Unit) {
+private fun NoVaultScreen(
+    expectedPath: String,
+    onPickFile: () -> Unit,
+    onRetry: () -> Unit,
+    importResult: String?,
+) {
     Column(
         modifier = Modifier.fillMaxSize().padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -181,8 +418,17 @@ private fun NoVaultScreen(expectedPath: String, onRetry: () -> Unit) {
             style = MaterialTheme.typography.headlineSmall,
         )
         Text(
-            "Copy your encrypted vault.json onto the phone first. " +
-                "From your laptop, plug in the phone over USB and run:",
+            "Move your encrypted vault.json from your laptop onto this phone. " +
+                "Either pick it through the file chooser (recommended — works with " +
+                "Downloads, Drive, Nextcloud, anything), or push it over USB:",
+        )
+        Spacer(Modifier.height(4.dp))
+        Button(onClick = onPickFile) { Text("Pick vault file…") }
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "USB option (advanced):",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         SelectionContainerCompat {
             Text(
@@ -191,14 +437,12 @@ private fun NoVaultScreen(expectedPath: String, onRetry: () -> Unit) {
                 style = MaterialTheme.typography.bodySmall,
             )
         }
-        Text(
-            "Then come back and tap Retry. The file lives in this app's " +
-                "private external storage — no permissions needed, and the " +
-                "Linux side and Android side stay in sync if you re-push.",
-            style = MaterialTheme.typography.bodySmall,
-        )
         Spacer(Modifier.height(8.dp))
-        Button(onClick = onRetry) { Text("Retry") }
+        OutlinedButton(onClick = onRetry) { Text("Already pushed — refresh") }
+        if (importResult != null) {
+            Spacer(Modifier.height(8.dp))
+            Text(importResult, color = MaterialTheme.colorScheme.primary)
+        }
     }
 }
 
@@ -217,7 +461,12 @@ private fun SelectionContainerCompat(content: @Composable () -> Unit) {
 // ===================== Screen 2: locked =====================
 
 @Composable
-private fun LockedScreen(errorMsg: String?, onUnlock: (String) -> Unit) {
+private fun LockedScreen(
+    errorMsg: String?,
+    biometricAvailable: Boolean,
+    onBiometricUnlock: () -> Unit,
+    onUnlock: (String) -> Unit,
+) {
     var password by remember { mutableStateOf("") }
     var working by remember { mutableStateOf(false) }
 
@@ -226,6 +475,18 @@ private fun LockedScreen(errorMsg: String?, onUnlock: (String) -> Unit) {
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text("Unlock vault", style = MaterialTheme.typography.headlineSmall)
+
+        if (biometricAvailable) {
+            Button(
+                onClick = onBiometricUnlock,
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Unlock with fingerprint") }
+            Text(
+                "Or type your master password:",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
 
         OutlinedTextField(
             value = password,
@@ -336,6 +597,11 @@ private fun EntryDetailScreen(account: Account, onBack: () -> Unit) {
     val context = LocalContextSafe()
     var revealPassword by remember { mutableStateOf(false) }
 
+    // Tick once per second so the TOTP countdown + rollover refresh.
+    // Only spins up if the entry actually has a TOTP secret — saves
+    // a coroutine for accounts that don't use 2FA.
+    val nowSec = produceTotpTicker(enabled = account.totpSecret.isNotEmpty())
+
     Column(modifier = Modifier.fillMaxSize()) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(8.dp),
@@ -373,6 +639,13 @@ private fun EntryDetailScreen(account: Account, onBack: () -> Unit) {
                 revealed = revealPassword,
                 onToggleReveal = { revealPassword = !revealPassword },
             )
+            if (account.totpSecret.isNotEmpty()) {
+                TotpRow(
+                    secret = account.totpSecret,
+                    nowSec = nowSec,
+                    onCopy = { code -> copyToClipboard(context, "totp", code) },
+                )
+            }
             if (account.url.isNotEmpty()) {
                 FieldRow(label = "URL", value = account.url, copyable = true,
                     onCopy = { copyToClipboard(context, "url", account.url) },
@@ -383,6 +656,71 @@ private fun EntryDetailScreen(account: Account, onBack: () -> Unit) {
                     onCopy = {}, masked = false)
             }
         }
+    }
+}
+
+/**
+ * Produces a 1-Hz tick of Unix seconds for live TOTP countdown.
+ * Returns 0 when [enabled] is false so the consumer can short-circuit.
+ */
+@Composable
+private fun produceTotpTicker(enabled: Boolean): Long {
+    if (!enabled) return 0L
+    var now by remember { mutableLongStateOf(System.currentTimeMillis() / 1000) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            kotlinx.coroutines.delay(1000)
+            now = System.currentTimeMillis() / 1000
+        }
+    }
+    return now
+}
+
+@Composable
+private fun TotpRow(secret: String, nowSec: Long, onCopy: (String) -> Unit) {
+    val code = remember(nowSec, secret) { TotpHelper.compute(secret, nowSec) }
+    if (code == null) {
+        FieldRow(
+            label = "2FA code",
+            value = "stored secret isn't valid Base32",
+            copyable = false,
+            onCopy = {},
+            masked = false,
+        )
+        return
+    }
+
+    Column {
+        Text(
+            "2FA code",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(2.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            // Show as three-then-three: "123 456" — easier to read.
+            val pretty = code.digits.substring(0, 3) + " " + code.digits.substring(3)
+            Text(
+                text = pretty,
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.headlineSmall,
+                fontFamily = FontFamily.Monospace,
+            )
+            Text(
+                "${code.secondsRemaining}s",
+                style = MaterialTheme.typography.bodySmall,
+                color = if (code.secondsRemaining <= 5)
+                    MaterialTheme.colorScheme.error
+                else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            IconButton(onClick = { onCopy(code.digits) }) {
+                Icon(Icons.Default.ContentCopy, contentDescription = "Copy")
+            }
+        }
+        LinearProgressIndicator(
+            progress = { code.secondsRemaining / 30f },
+            modifier = Modifier.fillMaxWidth(),
+        )
     }
 }
 

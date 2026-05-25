@@ -13,9 +13,12 @@ import android.app.Application
 class PasswortApp : Application() {
     override fun onCreate() {
         super.onCreate()
-        // Touching the singleton here ensures it's initialized eagerly
-        // (instead of lazily on first call from an arbitrary thread).
-        @Suppress("unused")
-        val ignored = VaultState
+        AppSettings.init(this)
+        // Push the saved auto-lock value into VaultState so a vault
+        // unlocked later in this process uses the user's preference.
+        VaultState.setAutoLockTimeoutMs(
+            if (AppSettings.autoLockMinutes <= 0) Long.MAX_VALUE / 2
+            else AppSettings.autoLockMinutes * 60L * 1000L
+        )
     }
 }
