@@ -261,6 +261,26 @@ impl From<std::io::Error> for MobileSyncError {
 /// Returns the [SyncStats] so the caller can render a "what
 /// happened" summary.
 pub fn run_mobile_sync(session: &mut Session) -> Result<SyncStats, MobileSyncError> {
+    run_mobile_sync_inner(session, None)
+}
+
+/// Variant of [run_mobile_sync] that re-derives the phone's key from
+/// a user-supplied master password. Used when the phone's salt has
+/// diverged from the PC's (e.g. someone ran "change master" on both
+/// sides independently). After this kind of sync, the PC's vault
+/// file is pushed onto the phone wholesale — including the PC's salt
+/// — so subsequent syncs go back to the fast cached-key path.
+pub fn run_mobile_sync_with_master(
+    session: &mut Session,
+    master: &[u8],
+) -> Result<SyncStats, MobileSyncError> {
+    run_mobile_sync_inner(session, Some(master))
+}
+
+fn run_mobile_sync_inner(
+    session: &mut Session,
+    master: Option<&[u8]>,
+) -> Result<SyncStats, MobileSyncError> {
     let adb = check_adb_available()?;
 
     // Pull phone vault to a unique temp location so concurrent syncs
@@ -287,13 +307,20 @@ pub fn run_mobile_sync(session: &mut Session) -> Result<SyncStats, MobileSyncErr
     let phone_vault: EncryptedVault = serde_json::from_str(&phone_bytes)
         .map_err(|_| MobileSyncError::PhoneVaultMissing)?;
 
-    // Decrypt with the same master key the desktop is currently
-    // sitting on. If the phone's vault was encrypted with a different
-    // master password, this fails — and there's no way to tell from
-    // the error which one is "right", so we just report a generic
-    // password-mismatch.
-    let phone_payload =
-        decrypt_with_current_key(&phone_vault, session).map_err(|_| MobileSyncError::PhoneDecryptFailed)?;
+    // Decrypt the phone's vault. Two paths:
+    //   * Fast path (no master supplied): the phone's vault was
+    //     written by a previous sync from this PC, so its salt
+    //     matches our cached key and we can decrypt without Argon2id.
+    //   * Master path: the user gave us a master because the fast
+    //     path failed (typically: independent master rotations on
+    //     both sides → divergent salts even with the same password).
+    //     Re-derive a fresh key against the phone's salt + kdf.
+    let phone_payload = match master {
+        Some(m) => decrypt_with_master(&phone_vault, m)
+            .map_err(|_| MobileSyncError::PhoneDecryptFailed)?,
+        None => decrypt_with_current_key(&phone_vault, session)
+            .map_err(|_| MobileSyncError::PhoneDecryptFailed)?,
+    };
 
     let stats = session.merge_with(phone_payload).map_err(MobileSyncError::Io)?;
 
@@ -406,6 +433,41 @@ fn push_phone_vault(adb: &std::path::Path) -> Result<(), MobileSyncError> {
         ));
     }
     Ok(())
+}
+
+/// Decrypts a foreign `EncryptedVault` by deriving its key from a
+/// user-supplied master password and the foreign file's own salt +
+/// kdf params. Always works whether or not the foreign side shares
+/// the desktop's current salt — at the cost of one Argon2id pass.
+/// Used by [run_mobile_sync_with_master] for the post-rotation
+/// recovery case.
+fn decrypt_with_master(
+    foreign: &EncryptedVault,
+    master: &[u8],
+) -> Result<VaultPayload, ()> {
+    use base64::{engine::general_purpose, Engine};
+
+    let salt = general_purpose::STANDARD
+        .decode(&foreign.salt)
+        .map_err(|_| ())?;
+    if salt.len() != crate::crypto::SALT_LEN {
+        return Err(());
+    }
+    let nonce = general_purpose::STANDARD
+        .decode(&foreign.nonce)
+        .map_err(|_| ())?;
+    let ct = general_purpose::STANDARD
+        .decode(&foreign.ciphertext)
+        .map_err(|_| ())?;
+    let key = crate::crypto::derive_key(
+        master,
+        &salt,
+        foreign.kdf_m_cost,
+        foreign.kdf_t_cost,
+        foreign.kdf_p_cost,
+    );
+    let plaintext = crate::crypto::decrypt(&ct, &nonce, &*key)?;
+    crate::storage::parse_vault_payload(&plaintext).map_err(|_| ())
 }
 
 /// Decrypts a foreign `EncryptedVault` using the session's current key.

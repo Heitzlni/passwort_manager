@@ -880,6 +880,15 @@ enum Modal {
     MobileSync {
         /// Result of the last run, `None` until the user clicks Run.
         result: Option<Result<crate::sync::SyncStats, String>>,
+        /// True after a fast-path attempt failed with PhoneDecryptFailed
+        /// — typically because of divergent master rotations on the two
+        /// sides. Reveals the master-password input field below so the
+        /// user can supply the master for an Argon2id re-derive.
+        needs_master: bool,
+        /// Buffer for the master input. Cleared on success.
+        master: String,
+        /// Toggle for the master input's password-visibility eye.
+        show_master: bool,
     },
 }
 
@@ -985,10 +994,11 @@ impl Drop for Modal {
             Modal::Clients { .. } => {
                 // Only client labels / status text — nothing secret.
             }
-            Modal::MobileSync { .. } => {
+            Modal::MobileSync { master, .. } => {
                 // The merged payload lives in the live Session, which
-                // has its own zeroize-on-drop. Nothing sensitive
-                // owned here.
+                // has its own zeroize-on-drop. Only the master-input
+                // buffer is owned here; zero it on close.
+                master.zeroize();
             }
         }
     }
@@ -1560,7 +1570,12 @@ impl App {
                                     )
                                     .clicked()
                             {
-                                *modal = Some(Modal::MobileSync { result: None });
+                                *modal = Some(Modal::MobileSync {
+                                    result: None,
+                                    needs_master: false,
+                                    master: String::new(),
+                                    show_master: false,
+                                });
                             }
                         },
                     );
@@ -3925,14 +3940,17 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                 }
             }
 
-            Modal::MobileSync { result: out } => {
+            Modal::MobileSync {
+                result: out,
+                needs_master,
+                master,
+                show_master,
+            } => {
                 ui.colored_label(
                     COLOR_MUTED,
                     "Two-way merge the vault with an Android phone plugged in \
-                     over USB. The phone needs to have the same master \
-                     password as this PC (assumes you've previously \
-                     imported your vault on the phone). Deletions on either \
-                     side propagate, newer edits win on conflict.",
+                     over USB. Same master password on both sides. Deletions \
+                     propagate; newer edits win on conflict.",
                 );
                 ui.add_space(12.0);
 
@@ -3968,7 +3986,7 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                             ui.colored_label(COLOR_ERROR, msg.as_str());
                         }
                     }
-                } else {
+                } else if !*needs_master {
                     ui.colored_label(
                         COLOR_MUTED,
                         "Make sure:\n  • Phone is plugged in over USB\n  \
@@ -3977,9 +3995,33 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                     );
                 }
 
+                // Master-password fallback. Shown when the fast path
+                // failed because the phone's salt diverged (typical
+                // cause: someone changed master on both sides
+                // independently, even with the same password).
+                if *needs_master {
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        COLOR_ERROR,
+                        "Phone's salt doesn't match — likely an independent \
+                         master rotation. Enter the master password the \
+                         phone is using so we can re-derive its key:",
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(master)
+                                .password(!*show_master)
+                                .hint_text("Phone's master password")
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+                    ui.checkbox(show_master, "Show password");
+                }
+
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    if out.is_none() {
+                    if out.is_none() && !*needs_master {
                         // Idle — show the Run button.
                         if ui
                             .add_sized(
@@ -3995,10 +4037,48 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                             )
                             .clicked()
                         {
-                            *out = Some(
-                                crate::sync::run_mobile_sync(session)
-                                    .map_err(|e| e.to_string()),
-                            );
+                            match crate::sync::run_mobile_sync(session) {
+                                Ok(stats) => *out = Some(Ok(stats)),
+                                Err(crate::sync::MobileSyncError::PhoneDecryptFailed) => {
+                                    *needs_master = true;
+                                }
+                                Err(e) => *out = Some(Err(e.to_string())),
+                            }
+                        }
+                    } else if out.is_none() && *needs_master {
+                        // Master prompt up — retry button derives the key
+                        // from the typed master.
+                        if ui
+                            .add_sized(
+                                egui::vec2(160.0, 28.0),
+                                egui::Button::new(
+                                    egui::RichText::new("Retry with master").strong(),
+                                )
+                                .fill(COLOR_ACCENT),
+                            )
+                            .clicked()
+                            && !master.is_empty()
+                        {
+                            match crate::sync::run_mobile_sync_with_master(
+                                session,
+                                master.as_bytes(),
+                            ) {
+                                Ok(stats) => {
+                                    master.zeroize();
+                                    *needs_master = false;
+                                    *show_master = false;
+                                    *out = Some(Ok(stats));
+                                }
+                                Err(crate::sync::MobileSyncError::PhoneDecryptFailed) => {
+                                    // Wrong master typed — leave the
+                                    // prompt up with an inline error.
+                                    *out = Some(Err(
+                                        "That master didn't decrypt the phone's vault. Try again."
+                                            .to_string(),
+                                    ));
+                                }
+                                Err(e) => *out = Some(Err(e.to_string())),
+                            }
                         }
                     } else {
                         // After a run — let the user trigger another
@@ -4011,6 +4091,9 @@ fn render_modal(ctx: &egui::Context, modal: &mut Modal, session: &mut Session) -
                             .clicked()
                         {
                             *out = None;
+                            *needs_master = false;
+                            master.zeroize();
+                            *show_master = false;
                         }
                     }
                     if ui
