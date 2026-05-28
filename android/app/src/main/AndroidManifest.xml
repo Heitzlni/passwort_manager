@@ -2,6 +2,12 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- Required only for the optional HIBP audit screen. We make one
+         outbound HTTPS request per audited entry, sending the first 5
+         hex chars of the SHA-1 of each password — never the password
+         itself. See HibpClient.kt + AuditScreen.kt. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <application
         android:name=".PasswortApp"
         android:allowBackup="true"
@@ -31,6 +37,16 @@
         -->
         <activity
             android:name=".AutofillActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Passwort_Manager"
+            android:excludeFromRecents="true" />
+
+        <!-- Launched from PasswortAutofillService.onSaveRequest when the
+             user submits a login form in another app. The activity
+             carries the captured username + password + host as Intent
+             extras and lets the user confirm before we persist. -->
+        <activity
+            android:name=".SaveActivity"
             android:exported="false"
             android:theme="@style/Theme.Passwort_Manager"
             android:excludeFromRecents="true" />

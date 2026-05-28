@@ -30,8 +30,10 @@ import java.io.File
 fun SettingsScreen(
     onBack: () -> Unit,
     onPickVaultFile: () -> Unit,
+    onExportVault: () -> Unit,
     onChangeMaster: () -> Unit,
     onHealth: () -> Unit,
+    onAudit: () -> Unit,
     onToggleBiometric: (Boolean) -> Unit,
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -116,6 +118,13 @@ fun SettingsScreen(
                 onClick = onHealth,
             )
 
+            SettingRow(
+                title = "HIBP audit",
+                subtitle = "Check every password against haveibeenpwned.com " +
+                    "(k-anonymous — only a 5-char SHA-1 prefix leaves the device).",
+                onClick = onAudit,
+            )
+
             Spacer(Modifier.height(8.dp))
             SectionHeader("Vault file")
 
@@ -124,6 +133,14 @@ fun SettingsScreen(
                 subtitle = "Pick a vault.json from Downloads or any folder. " +
                     "Replaces the current local copy.",
                 onClick = onPickVaultFile,
+            )
+
+            SettingRow(
+                title = "Export vault…",
+                subtitle = "Save the encrypted vault.json to a folder of " +
+                    "your choice (Downloads, Drive, USB stick). The file is " +
+                    "the same encrypted blob — useless without your master.",
+                onClick = onExportVault,
             )
 
             SettingRow(

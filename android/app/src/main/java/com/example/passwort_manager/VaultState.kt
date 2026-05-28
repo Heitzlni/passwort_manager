@@ -295,6 +295,62 @@ object VaultState {
         return accounts.value.orEmpty().filter { entryMatchesHost(it, needle) }
     }
 
+    /**
+     * Broader autofill-match used for native apps where the package
+     * name is the only signal we have. Tries (in order):
+     *   1. The exact `webDomain` from the form, if any.
+     *   2. A `<brand>.com` reconstruction from the package
+     *      (`com.spotify.music` → `spotify.com`).
+     *   3. An entry-name substring match against the package's
+     *      "brand" segment, normalised to letters+digits — catches
+     *      cases like an entry called "Spotify Family" matching
+     *      package `com.spotify.music`.
+     *
+     * Tighter than fuzzy matching (we don't show every entry); only
+     * fires when the package brand is at least 3 chars to avoid
+     * everything matching common 1–2 letter prefixes.
+     */
+    fun findByHostOrPackage(webDomain: String, packageName: String): List<Account> {
+        val accs = accounts.value.orEmpty()
+        if (accs.isEmpty()) return emptyList()
+
+        // 1) Strict web match if we have a webDomain.
+        if (webDomain.isNotBlank()) {
+            val byHost = accs.filter { entryMatchesHost(it, webDomain.lowercase()) }
+            if (byHost.isNotEmpty()) return byHost
+        }
+
+        // 2 + 3) Try the package brand.
+        val brand = packageBrand(packageName)
+        if (brand.length < 3) return emptyList()
+
+        // 2) Strict <brand>.com host match.
+        val byBrandHost = accs.filter { entryMatchesHost(it, "$brand.com") }
+        if (byBrandHost.isNotEmpty()) return byBrandHost
+
+        // 3) Entry-name fuzzy match — only if the entry's name
+        // contains the brand and the brand isn't a generic word.
+        if (brand in GENERIC_PKG_SEGMENTS) return emptyList()
+        return accs.filter { acc ->
+            val normalised = acc.name.lowercase().filter { it.isLetterOrDigit() }
+            normalised.isNotEmpty() && normalised.contains(brand)
+        }
+    }
+
+    /** Pick the most-likely-brand segment from a package name like
+     *  `com.spotify.music`. Drops generic stems (`com`, `app`,
+     *  `android`, …) and returns the first meaningful segment. */
+    private fun packageBrand(packageName: String): String {
+        if (packageName.isBlank()) return ""
+        val parts = packageName.split('.').map { it.lowercase() }
+        return parts.firstOrNull { it.length >= 3 && it !in GENERIC_PKG_SEGMENTS }.orEmpty()
+    }
+
+    private val GENERIC_PKG_SEGMENTS = setOf(
+        "com", "org", "net", "io", "co", "app", "android", "google",
+        "samsung", "huawei", "oneplus", "xiaomi", "oppo", "vivo",
+    )
+
     /** Mirror of `entry_matches_host` in src/ipc.rs — same matching rule. */
     private fun entryMatchesHost(a: Account, host: String): Boolean {
         val urlHost = hostFromUrl(a.url)

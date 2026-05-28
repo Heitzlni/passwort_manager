@@ -26,6 +26,17 @@ androidx-compose-ui-test-junit4 = { group = "androidx.compose.ui", name = "ui-te
 androidx-compose-material3 = { group = "androidx.compose.material3", name = "material3" }
 androidx-compose-material-icons-extended = { group = "androidx.compose.material", name = "material-icons-extended" }
 androidx-biometric = { group = "androidx.biometric", name = "biometric", version = "1.1.0" }
+# Pinned explicitly because androidx.biometric:1.1.0 pulls in an old
+# androidx.fragment whose FragmentActivity.startActivityForResult
+# rejects the high-bit request codes that
+# rememberLauncherForActivityResult generates — crashes any SAF
+# picker (Open / Create Document) the moment it's launched from a
+# FragmentActivity-derived activity. 1.8.4 removed that legacy check.
+androidx-fragment = { group = "androidx.fragment", name = "fragment-ktx", version = "1.8.4" }
+# Inline presentations for autofill — required for the chip above the
+# keyboard to show reliably on modern Android (API 30+) and some OEM
+# skins like Nothing OS 4 that suppress legacy RemoteViews-only chips.
+androidx-autofill = { group = "androidx.autofill", name = "autofill", version = "1.1.0" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

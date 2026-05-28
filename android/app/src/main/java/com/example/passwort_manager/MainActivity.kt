@@ -75,6 +75,8 @@ private sealed class Screen {
     data class EditEntry(val previous: Screen, val index: Int) : Screen()
     /** Offline weak/reused report. */
     data class Health(val previous: Screen) : Screen()
+    /** Online HIBP audit. */
+    data class Audit(val previous: Screen) : Screen()
 }
 
 @Composable
@@ -169,6 +171,39 @@ private fun AppRoot() {
         filePicker.launch(arrayOf("*/*"))
     }
 
+    // Storage Access Framework "Create Document" — picks a save location
+    // (Downloads, Drive, USB stick, …) and we write the current
+    // encrypted vault.json bytes there. No re-encryption needed: the
+    // file on disk is already the encrypted backup form.
+    val exportPicker = androidx.activity.compose.rememberLauncherForActivityResult(
+        contract = androidx.activity.result.contract.ActivityResultContracts.CreateDocument(
+            "application/json",
+        ),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val msg = withContext(Dispatchers.IO) {
+                runCatching {
+                    if (!vaultFile.exists()) error("no vault on this device")
+                    val src = vaultFile.readBytes()
+                    context.contentResolver.openOutputStream(uri).use { out ->
+                        if (out == null) error("could not write to picked location")
+                        out.write(src)
+                    }
+                }.fold(
+                    onSuccess = { "Exported vault." },
+                    onFailure = { "Export failed: ${it.message}" },
+                )
+            }
+            importResult = msg
+        }
+    }
+    val launchExport: () -> Unit = {
+        val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmm", java.util.Locale.US)
+            .format(java.util.Date())
+        exportPicker.launch("passwort-vault-$stamp.json")
+    }
+
     // If VaultState locks itself (auto-lock or external trigger) while
     // we're in the Unlocked screen, kick the UI back to Locked.
     LaunchedEffect(VaultState.accounts.value) {
@@ -230,8 +265,10 @@ private fun AppRoot() {
         SettingsScreen(
             onBack = { screen = s.previous },
             onPickVaultFile = launchImport,
+            onExportVault = launchExport,
             onChangeMaster = { showChangeMasterDialog = true },
             onHealth = { screen = Screen.Health(previous = s) },
+            onAudit = { screen = Screen.Audit(previous = s) },
             onToggleBiometric = { /* Real unlock-flow wiring in phase 2.5 step 3 */ },
         )
         if (showChangeMasterDialog) {
@@ -293,6 +330,16 @@ private fun AppRoot() {
         HealthScreen(accounts = accounts, onBack = { screen = s.previous })
         return
     }
+    if (screen is Screen.Audit) {
+        val s = screen as Screen.Audit
+        val accounts = VaultState.accounts.value
+        if (accounts == null) {
+            screen = s.previous
+            return
+        }
+        AuditScreen(accounts = accounts, onBack = { screen = s.previous })
+        return
+    }
     if (screen is Screen.EditEntry) {
         val s = screen as Screen.EditEntry
         val list = VaultState.accounts.value
@@ -346,7 +393,8 @@ private fun AppRoot() {
                 is Screen.Settings,
                 is Screen.AddEntry,
                 is Screen.EditEntry,
-                is Screen.Health -> {
+                is Screen.Health,
+                is Screen.Audit -> {
                     // Already handled by the early-return blocks above —
                     // unreachable here but the compiler insists on
                     // exhaustiveness.
