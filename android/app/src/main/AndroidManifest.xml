@@ -71,6 +71,38 @@
                 android:name="android.autofill"
                 android:resource="@xml/autofill_service" />
         </service>
+
+        <!--
+            Android 14+ Credential Manager provider. Used by modern apps
+            (Discord, Google services, Material-3 apps) that prefer the
+            unified credentials API over legacy AutofillManager.
+            Capabilities advertised in res/xml/credential_provider.xml.
+
+            Users enable our app under:
+              Einstellungen → Passwörter, Passkeys und Konten → Anbieter
+        -->
+        <service
+            android:name=".PasswortCredentialProviderService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_CREDENTIAL_PROVIDER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.credentials.CredentialProviderService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.credentials.provider"
+                android:resource="@xml/credential_provider" />
+        </service>
+
+        <!-- Backing activity for credential-fill entries — opens when
+             the user taps one of our credential rows in the system
+             picker. Returns the (username, password) via
+             PendingIntentHandler.setGetCredentialResponse. -->
+        <activity
+            android:name=".CredentialFillActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Passwort_Manager"
+            android:excludeFromRecents="true" />
     </application>
 
 </manifest>

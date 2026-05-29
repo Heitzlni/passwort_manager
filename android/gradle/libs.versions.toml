@@ -37,6 +37,12 @@ androidx-fragment = { group = "androidx.fragment", name = "fragment-ktx", versio
 # keyboard to show reliably on modern Android (API 30+) and some OEM
 # skins like Nothing OS 4 that suppress legacy RemoteViews-only chips.
 androidx-autofill = { group = "androidx.autofill", name = "autofill", version = "1.1.0" }
+# Android 14+ unified Credential Manager API. Newer apps (Discord,
+# Google Play services, most Material-3 apps) prefer this over the
+# legacy AutofillService — adding our app as a CredentialProvider
+# is what gets us into their "choose a provider" picker.
+androidx-credentials = { group = "androidx.credentials", name = "credentials", version = "1.3.0" }
+androidx-credentials-play-services-auth = { group = "androidx.credentials", name = "credentials-play-services-auth", version = "1.3.0" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

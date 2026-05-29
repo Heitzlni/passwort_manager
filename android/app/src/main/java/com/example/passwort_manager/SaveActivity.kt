@@ -3,6 +3,8 @@
 package com.example.passwort_manager
 
 import android.content.Context
+import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -46,18 +48,30 @@ class SaveActivity : FragmentActivity() {
         const val EXTRA_CAPTURED_PASSWORD = "pwm_save_password"
         const val EXTRA_HOST = "pwm_save_host"
         const val EXTRA_PACKAGE = "pwm_save_package"
+        /** Set by PasswortCredentialProviderService when this activity is
+         *  launched from the Credential Manager save flow rather than
+         *  the legacy AutofillService.onSaveRequest path. Drives where
+         *  we read the typed credentials from (intent extras vs the
+         *  CreateCredentialRequest the framework attaches). */
+        const val EXTRA_FROM_CREDENTIAL_MANAGER = "pwm_save_from_cm"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        val capturedUsername = intent.getStringExtra(EXTRA_CAPTURED_USERNAME).orEmpty()
-        val capturedPassword = intent.getStringExtra(EXTRA_CAPTURED_PASSWORD).orEmpty()
+        val fromCm = intent.getBooleanExtra(EXTRA_FROM_CREDENTIAL_MANAGER, false)
+        val cmCreds = if (fromCm) extractCredentialManagerCredentials() else null
+
+        val capturedUsername = cmCreds?.first
+            ?: intent.getStringExtra(EXTRA_CAPTURED_USERNAME).orEmpty()
+        val capturedPassword = cmCreds?.second
+            ?: intent.getStringExtra(EXTRA_CAPTURED_PASSWORD).orEmpty()
         val host = intent.getStringExtra(EXTRA_HOST).orEmpty()
         val pkg = intent.getStringExtra(EXTRA_PACKAGE).orEmpty()
 
         if (capturedPassword.isBlank()) {
+            if (fromCm) failCredentialManager("no password in create request")
             finish(); return
         }
 
@@ -69,11 +83,61 @@ class SaveActivity : FragmentActivity() {
                         capturedPassword = capturedPassword,
                         host = host,
                         pkg = pkg,
-                        onDone = { finish() },
+                        onDone = { saved ->
+                            if (fromCm) {
+                                if (saved) succeedCredentialManager()
+                                else failCredentialManager("user cancelled")
+                            }
+                            finish()
+                        },
                     )
                 }
             }
         }
+    }
+
+    /** Pull username + password out of the [androidx.credentials]
+     *  request the framework attaches when we're launched from the
+     *  Credential Manager save picker. Returns null if the request
+     *  isn't the expected password-create shape. */
+    private fun extractCredentialManagerCredentials(): Pair<String, String>? {
+        if (Build.VERSION.SDK_INT < 34) return null
+        return try {
+            val req = androidx.credentials.provider.PendingIntentHandler
+                .retrieveProviderCreateCredentialRequest(intent) ?: return null
+            val credReq = req.callingRequest
+            if (credReq is androidx.credentials.CreatePasswordRequest) {
+                credReq.id to credReq.password
+            } else null
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun succeedCredentialManager() {
+        if (Build.VERSION.SDK_INT < 34) return
+        try {
+            val data = Intent()
+            androidx.credentials.provider.PendingIntentHandler
+                .setCreateCredentialResponse(
+                    data,
+                    androidx.credentials.CreatePasswordResponse(),
+                )
+            setResult(android.app.Activity.RESULT_OK, data)
+        } catch (_: Throwable) { /* best effort */ }
+    }
+
+    private fun failCredentialManager(reason: String) {
+        if (Build.VERSION.SDK_INT < 34) return
+        try {
+            val data = Intent()
+            androidx.credentials.provider.PendingIntentHandler
+                .setCreateCredentialException(
+                    data,
+                    androidx.credentials.exceptions.CreateCredentialUnknownException(reason),
+                )
+            setResult(android.app.Activity.RESULT_OK, data)
+        } catch (_: Throwable) { /* best effort */ }
     }
 }
 
@@ -83,7 +147,7 @@ private fun SaveFlow(
     capturedPassword: String,
     host: String,
     pkg: String,
-    onDone: () -> Unit,
+    onDone: (saved: Boolean) -> Unit,
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val vaultFile = remember(context) { File(context.getExternalFilesDir(null), "vault.json") }
@@ -104,7 +168,7 @@ private fun SaveFlow(
         SavePhase.Unlock -> UnlockGate(
             vaultFile = vaultFile,
             host = host,
-            onCancel = onDone,
+            onCancel = { onDone(false) },
         )
         SavePhase.Form -> SaveForm(
             capturedUsername = capturedUsername,
@@ -277,10 +341,10 @@ private fun SaveForm(
     host: String,
     pkg: String,
     vaultFile: File,
-    onDone: () -> Unit,
+    onDone: (saved: Boolean) -> Unit,
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
-    val accounts = VaultState.accounts.value ?: run { onDone(); return }
+    val accounts = VaultState.accounts.value ?: run { onDone(false); return }
 
     // Detect an existing entry for the same (host, username) so we can
     // surface "Update" instead of always creating duplicates.
@@ -315,7 +379,7 @@ private fun SaveForm(
             TopAppBar(
                 title = { Text(if (match != null) "Update entry" else "Save new entry") },
                 navigationIcon = {
-                    IconButton(onClick = onDone) {
+                    IconButton(onClick = { onDone(false) }) {
                         Icon(Icons.Default.ArrowBack, contentDescription = "Cancel")
                     }
                 },
@@ -399,7 +463,7 @@ private fun SaveForm(
                             )
                         }
                         when (result) {
-                            VaultState.WriteResult.Ok -> onDone()
+                            VaultState.WriteResult.Ok -> onDone(true)
                             is VaultState.WriteResult.Failed -> {
                                 error = result.message
                                 busy = false
@@ -409,7 +473,7 @@ private fun SaveForm(
                 ) {
                     Text(if (match != null) "Update" else "Save")
                 }
-                OutlinedButton(onClick = onDone) { Text("Cancel") }
+                OutlinedButton(onClick = { onDone(false) }) { Text("Cancel") }
             }
         }
     }
