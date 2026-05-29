@@ -16,6 +16,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
@@ -183,6 +184,13 @@ private fun SaveFlow(
 
 private enum class SavePhase { Unlock, Form }
 
+/** Saving target. NEW = create a new entry. UPDATE = overwrite the
+ *  selected existing entry's fields (password / username / etc.). */
+private sealed class SaveTarget {
+    object New : SaveTarget()
+    data class Update(val index: Int) : SaveTarget()
+}
+
 // ===================== Phase 1: unlock the vault =====================
 
 @Composable
@@ -346,15 +354,37 @@ private fun SaveForm(
     val context = androidx.compose.ui.platform.LocalContext.current
     val accounts = VaultState.accounts.value ?: run { onDone(false); return }
 
-    // Detect an existing entry for the same (host, username) so we can
-    // surface "Update" instead of always creating duplicates.
-    val match: Pair<Int, Account>? = remember(accounts, host, capturedUsername) {
-        if (host.isBlank()) return@remember null
-        accounts.withIndex()
-            .firstOrNull { (_, a) ->
-                hostMatches(a, host) && a.username.trim().equals(capturedUsername.trim(), ignoreCase = true)
-            }
-            ?.let { it.index to it.value }
+    // All entries matching the calling host — not just exact
+    // (host, username) hits. Used to surface an "Update existing?"
+    // choice when the user logs in with a username we've never seen
+    // for this host, but a sibling entry does exist.
+    val hostMatches: List<Pair<Int, Account>> = remember(accounts, host) {
+        if (host.isBlank()) emptyList()
+        else accounts.withIndex()
+            .filter { hostMatches(it.value, host) }
+            .map { it.index to it.value }
+    }
+
+    // Pre-select the right action:
+    //   - exact-username match → update that entry
+    //   - host matches but no username match → save as new (default),
+    //     but the user can still pick "Update X" from the chooser
+    //   - no host matches → save as new (default; no chooser visible)
+    val exactMatchIdx: Int? = remember(hostMatches, capturedUsername) {
+        hostMatches.firstOrNull { (_, a) ->
+            a.username.trim().equals(capturedUsername.trim(), ignoreCase = true)
+        }?.first
+    }
+
+    var target: SaveTarget by remember {
+        mutableStateOf(if (exactMatchIdx != null) SaveTarget.Update(exactMatchIdx) else SaveTarget.New)
+    }
+    // When the target switches to Update, pre-fill the form with the
+    // existing entry's data; when it switches back to New, restore the
+    // captured / default values.
+    val targetAccount: Account? = when (val t = target) {
+        is SaveTarget.Update -> accounts.getOrNull(t.index)
+        is SaveTarget.New -> null
     }
 
     val defaultName = remember(host, pkg) {
@@ -365,19 +395,32 @@ private fun SaveForm(
         }
     }
 
-    var name by remember { mutableStateOf(match?.second?.name ?: defaultName) }
-    var url by remember { mutableStateOf(match?.second?.url.orEmpty().ifEmpty { defaultUrlFor(host) }) }
-    var username by remember { mutableStateOf(capturedUsername) }
-    var password by remember { mutableStateOf(capturedPassword) }
+    var name by remember(target) {
+        mutableStateOf(targetAccount?.name ?: defaultName)
+    }
+    var url by remember(target) {
+        mutableStateOf(targetAccount?.url.orEmpty().ifEmpty { defaultUrlFor(host) })
+    }
+    var username by remember(target) {
+        mutableStateOf(if (targetAccount != null) capturedUsername.ifEmpty { targetAccount.username } else capturedUsername)
+    }
+    var password by remember(target) { mutableStateOf(capturedPassword) }
     var revealPassword by remember { mutableStateOf(false) }
-    var notes by remember { mutableStateOf(match?.second?.notes.orEmpty()) }
+    var notes by remember(target) { mutableStateOf(targetAccount?.notes.orEmpty()) }
     var error by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(if (match != null) "Update entry" else "Save new entry") },
+                title = {
+                    Text(
+                        when (target) {
+                            is SaveTarget.Update -> "Update entry"
+                            is SaveTarget.New -> "Save new entry"
+                        },
+                    )
+                },
                 navigationIcon = {
                     IconButton(onClick = { onDone(false) }) {
                         Icon(Icons.Default.ArrowBack, contentDescription = "Cancel")
@@ -394,14 +437,47 @@ private fun SaveForm(
                 .padding(horizontal = 16.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            if (match != null) {
+            // Target chooser — only shown when there's at least one
+            // existing entry on the same host. Gives the user the
+            // explicit choice between updating an existing entry
+            // (overwriting username/password) or creating a fresh one.
+            if (hostMatches.isNotEmpty()) {
                 Surface(tonalElevation = 2.dp, modifier = Modifier.fillMaxWidth()) {
-                    Text(
-                        "An entry for \"${match.second.name}\" / ${match.second.username.ifEmpty { "(no username)" }} already exists. " +
-                            "Saving will update its password — the old one is kept in history.",
-                        modifier = Modifier.padding(12.dp),
-                        style = MaterialTheme.typography.bodySmall,
-                    )
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text(
+                            "Existing entries for ${host.ifEmpty { pkg }}:",
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        for ((idx, acc) in hostMatches) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                RadioButton(
+                                    selected = (target as? SaveTarget.Update)?.index == idx,
+                                    onClick = { target = SaveTarget.Update(idx) },
+                                )
+                                Spacer(Modifier.width(4.dp))
+                                Text(
+                                    "Update " + acc.name +
+                                        if (acc.username.isNotEmpty()) " (${acc.username})" else "",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                )
+                            }
+                        }
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            RadioButton(
+                                selected = target is SaveTarget.New,
+                                onClick = { target = SaveTarget.New },
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Text("Save as new entry", style = MaterialTheme.typography.bodyMedium)
+                        }
+                    }
                 }
             }
             LabelledField("Name", name, { name = it })
@@ -437,30 +513,38 @@ private fun SaveForm(
                     enabled = !busy && name.isNotBlank() && password.isNotEmpty(),
                     onClick = {
                         busy = true
-                        val result = if (match != null) {
-                            VaultState.editAccount(
-                                idx = match.first,
-                                replacement = match.second.copy(
-                                    name = name.trim(),
-                                    url = url.trim(),
-                                    username = username.trim(),
-                                    password = password,
-                                    notes = notes,
-                                ),
-                                vaultFile = vaultFile,
-                            )
-                        } else {
-                            VaultState.addAccount(
-                                Account(
-                                    name = name.trim(),
-                                    url = url.trim(),
-                                    username = username.trim(),
-                                    password = password,
-                                    totpSecret = "",
-                                    notes = notes,
-                                ),
-                                vaultFile = vaultFile,
-                            )
+                        val result = when (val t = target) {
+                            is SaveTarget.Update -> {
+                                val existing = accounts.getOrNull(t.index)
+                                if (existing == null) {
+                                    VaultState.WriteResult.Failed("entry no longer exists")
+                                } else {
+                                    VaultState.editAccount(
+                                        idx = t.index,
+                                        replacement = existing.copy(
+                                            name = name.trim(),
+                                            url = url.trim(),
+                                            username = username.trim(),
+                                            password = password,
+                                            notes = notes,
+                                        ),
+                                        vaultFile = vaultFile,
+                                    )
+                                }
+                            }
+                            is SaveTarget.New -> {
+                                VaultState.addAccount(
+                                    Account(
+                                        name = name.trim(),
+                                        url = url.trim(),
+                                        username = username.trim(),
+                                        password = password,
+                                        totpSecret = "",
+                                        notes = notes,
+                                    ),
+                                    vaultFile = vaultFile,
+                                )
+                            }
                         }
                         when (result) {
                             VaultState.WriteResult.Ok -> onDone(true)
@@ -471,7 +555,7 @@ private fun SaveForm(
                         }
                     },
                 ) {
-                    Text(if (match != null) "Update" else "Save")
+                    Text(if (target is SaveTarget.Update) "Update" else "Save")
                 }
                 OutlinedButton(onClick = { onDone(false) }) { Text("Cancel") }
             }

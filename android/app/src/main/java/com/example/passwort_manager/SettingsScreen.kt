@@ -79,6 +79,27 @@ fun SettingsScreen(
                 onClick = { showAutoLockDialog = true },
             )
 
+            // Accessibility-fallback autofill — what Bitwarden /
+            // 1Password use when the official framework can't see an
+            // app's fields. Sends the user straight to the system
+            // Accessibility settings to enable us.
+            SettingRow(
+                title = "Accessibility-fill (advanced)",
+                subtitle = "Enable a stronger autofill fallback that works in " +
+                    "apps the Android Autofill Framework can't read. " +
+                    "Adds a notification \"Tap to fill\" when our app " +
+                    "sees a login form. The permission is broad — " +
+                    "tap to read the system warning before enabling.",
+                onClick = {
+                    val intent = android.content.Intent(
+                        android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS,
+                    ).apply {
+                        flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    context.startActivity(intent)
+                },
+            )
+
             SettingSwitchRow(
                 title = "Biometric unlock",
                 subtitle = biometricSubtitle(biometricState, biometric),

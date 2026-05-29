@@ -1,3 +1,12 @@
 <resources>
     <string name="app_name">Passwort_Manager</string>
+    <string name="shortcut_add_short">Add credential</string>
+    <string name="shortcut_add_long">Add credential to Password Manager</string>
+    <string name="tile_quick_save">Save credential</string>
+    <string name="accessibility_service_description">
+        Lets Password Manager autofill credentials and offer to save new
+        ones in apps where the Android Autofill Framework doesn\'t work.
+        We only act on screens with login fields and never send any data
+        off-device.
+    </string>
 </resources>

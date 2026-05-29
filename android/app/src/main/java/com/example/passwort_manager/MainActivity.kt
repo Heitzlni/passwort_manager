@@ -5,6 +5,7 @@ package com.example.passwort_manager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -40,16 +41,32 @@ import kotlinx.coroutines.withContext
 import java.io.File
 
 class MainActivity : FragmentActivity() {
+
+    companion object {
+        /** Triggers the launcher shortcut + Quick Settings tile flow:
+         *  open straight to Add Entry after unlock. */
+        const val ACTION_ADD_ENTRY = "com.example.passwort_manager.ACTION_ADD_ENTRY"
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        val openAddEntry = intent?.action == ACTION_ADD_ENTRY
         setContent {
             Passwort_ManagerTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    AppRoot()
+                    AppRoot(openAddEntryOnUnlock = openAddEntry)
                 }
             }
         }
+    }
+
+    /** Subsequent shortcut taps while we're already running. */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        // Re-deliver to onCreate state via setIntent so AppRoot's
+        // initial composition picks up the new action.
+        setIntent(intent)
     }
 }
 
@@ -80,9 +97,13 @@ private sealed class Screen {
 }
 
 @Composable
-private fun AppRoot() {
+private fun AppRoot(openAddEntryOnUnlock: Boolean = false) {
     val context = LocalContextSafe()
     val vaultFile = remember(context) { File(context.getExternalFilesDir(null), "vault.json") }
+    // Tracks the "user came in via Add-Entry shortcut" intent so we
+    // can jump there as soon as the vault is unlocked. Drained after
+    // the first navigation so re-entries don't keep re-routing.
+    var pendingAddEntry by remember { mutableStateOf(openAddEntryOnUnlock) }
 
     // Snapshot the process-wide unlocked state so we route to the
     // right screen if the user re-enters the app while still unlocked
@@ -210,6 +231,20 @@ private fun AppRoot() {
         val current = screen
         if (current is Screen.Unlocked && VaultState.accounts.value == null) {
             screen = Screen.Locked()
+        }
+    }
+
+    // Shortcut / Quick-Tile path: as soon as we land in the unlocked
+    // list screen, jump straight to Add Entry. One-shot, then we
+    // clear the pending flag so a manual back-out lands the user on
+    // the list and not back in Add.
+    LaunchedEffect(VaultState.accounts.value, pendingAddEntry) {
+        if (pendingAddEntry && VaultState.accounts.value != null) {
+            val current = screen
+            if (current is Screen.Unlocked && current.selectedIndex == null) {
+                screen = Screen.AddEntry(previous = current)
+                pendingAddEntry = false
+            }
         }
     }
 

@@ -419,12 +419,18 @@ data class ParsedStructure(
  *   - the app's package name (the source application),
  *   - every input field that looks like it wants a username or password.
  *
- * We rely on Android's autofillHints first; if the app didn't set any
- * we fall back to inputType / hint-text heuristics. This matches
- * what every other password manager does.
+ * Detection happens in two passes. The first pass uses Android's
+ * autofillHints, HTML attributes, inputType, and id/hint heuristics
+ * — the rigorous path. The second pass "promotes" plausible-but-
+ * unclassified text fields when the first pass found a password
+ * field but no username (very common pattern: the username is
+ * unmarked, the password is marked). This catches apps whose login
+ * forms our classifier alone would silently drop (Discord's current
+ * login screen is the motivating example).
  */
 fun parseStructure(structure: AssistStructure): ParsedStructure {
     val fields = mutableListOf<TargetField>()
+    val candidates = mutableListOf<AutofillId>()
     var webDomain = ""
     val packageName = structure.activityComponent?.packageName.orEmpty()
 
@@ -433,23 +439,85 @@ fun parseStructure(structure: AssistStructure): ParsedStructure {
         if (webDomain.isEmpty()) {
             webDomain = findWebDomain(root)
         }
-        walk(root, fields)
+        walk(root, fields, candidates)
+    }
+
+    val hasPassword = fields.any { it.kind == FieldKind.Password }
+    val hasUsername = fields.any { it.kind == FieldKind.Username }
+
+    if (hasPassword && !hasUsername && candidates.isNotEmpty()) {
+        // Common case: site/app marked its password but not its email
+        // field. Promote the first plausible text input as Username.
+        // Inserted at index 0 so it shows up before the password in
+        // the dataset values (matches form order).
+        val classifiedIds = fields.map { it.id }.toHashSet()
+        val promoted = candidates.firstOrNull { it !in classifiedIds }
+        if (promoted != null) {
+            fields.add(0, TargetField(promoted, FieldKind.Username))
+        }
+    }
+
+    if (fields.isEmpty() && candidates.size >= 2) {
+        // Last resort: no classifier hit but at least two plausible
+        // text inputs exist. Assume the first is username and the
+        // second is password. False positives are filtered out by
+        // the host-match step (we only fill if a vault entry matches
+        // the calling host/package).
+        fields += TargetField(candidates[0], FieldKind.Username)
+        fields += TargetField(candidates[1], FieldKind.Password)
     }
 
     return ParsedStructure(webDomain = webDomain, packageName = packageName, fields = fields)
 }
 
-private fun walk(node: AssistStructure.ViewNode, out: MutableList<TargetField>) {
+private fun walk(
+    node: AssistStructure.ViewNode,
+    out: MutableList<TargetField>,
+    candidates: MutableList<AutofillId>,
+) {
     val id = node.autofillId
     if (id != null) {
         val kind = classify(node)
         if (kind != null) {
             out += TargetField(id, kind)
+        } else if (looksLikeTextInput(node)) {
+            candidates += id
         }
     }
     for (i in 0 until node.childCount) {
-        walk(node.getChildAt(i), out)
+        walk(node.getChildAt(i), out, candidates)
     }
+}
+
+/**
+ * Heuristic: "this node might be a text input we just couldn't
+ * classify." Used by the promotion / last-resort fallback. Filters
+ * out obviously non-input nodes (containers, images, labels) so we
+ * don't pull garbage into the dataset.
+ */
+private fun looksLikeTextInput(node: AssistStructure.ViewNode): Boolean {
+    val cls = node.className.orEmpty()
+    if (cls.contains("EditText", ignoreCase = true)) return true
+    if (cls.contains("TextInput", ignoreCase = true)) return true
+    // Compose text fields land here under various inner-class names.
+    if (cls.contains("Compose", ignoreCase = true) && cls.contains("Text")) return true
+    // Browser/webview-rendered input — has htmlInfo even without classify.
+    val html = node.htmlInfo
+    if (html != null && html.tag.equals("input", ignoreCase = true)) {
+        // Skip obvious non-text input types (submit/checkbox/radio/etc.).
+        val type = html.attributes
+            ?.firstOrNull { it.first.equals("type", ignoreCase = true) }
+            ?.second
+            ?.lowercase()
+            ?: "text"
+        return type in setOf(
+            "text", "email", "tel", "url", "search", "password", "",
+        )
+    }
+    // Native field with a text-class inputType — could be text without
+    // any of the more specific variations we already handle.
+    val inputClass = node.inputType and 0x000F
+    return inputClass == 0x00000001 // TYPE_CLASS_TEXT
 }
 
 private fun classify(node: AssistStructure.ViewNode): FieldKind? {

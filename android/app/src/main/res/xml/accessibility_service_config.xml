@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    AccessibilityService config for the autofill fallback. Listens to
+    the minimum set of events needed to:
+      - Detect when a login form appears (window state / content
+        changed, view focused)
+      - Detect when the user types into a field (text changed)
+      - Detect when the form goes away (window state changed)
+
+    We need canRetrieveWindowContent so we can walk the UI tree to
+    find password / username fields. flagReportViewIds lets us key
+    the de-dupe tracking by stable view-resource-id.
+-->
+<accessibility-service
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowContentChanged|typeWindowStateChanged|typeViewFocused|typeViewTextChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows|flagReportViewIds"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/accessibility_service_description"
+    android:notificationTimeout="200"
+    android:settingsActivity="com.example.passwort_manager.MainActivity" />

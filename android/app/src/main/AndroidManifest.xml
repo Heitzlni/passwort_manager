@@ -8,6 +8,11 @@
          itself. See HibpClient.kt + AuditScreen.kt. -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Required by the accessibility-fill fallback so we can post the
+         "tap to fill" / "save credential?" notifications. Runtime-
+         requested on Android 13+. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:name=".PasswortApp"
         android:allowBackup="true"
@@ -28,7 +33,61 @@
 
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Triggered by the app shortcut (long-press the launcher
+                 icon) AND by the Quick Settings tile. Routes straight
+                 into the Add Entry form after unlock. -->
+            <intent-filter>
+                <action android:name="com.example.passwort_manager.ACTION_ADD_ENTRY" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <!-- Static app shortcuts for the launcher long-press menu. -->
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
         </activity>
+
+        <!-- Accessibility fallback autofill — the same approach
+             Bitwarden / 1Password use when the Autofill Framework
+             can't see an app's fields. User has to enable it under
+             Settings → Accessibility → Installed services and
+             confirm the scary system warning.
+
+             FillTriggerActivity is a transparent shim that the
+             accessibility "tap to fill" notification opens; it
+             calls into the running service to inject text via
+             ACTION_SET_TEXT and finishes immediately. -->
+        <service
+            android:name=".PasswortAccessibilityService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <activity
+            android:name=".FillTriggerActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- Quick Settings tile users can pin to their notification
+             shade for one-tap "save credential" access. Always works
+             regardless of which app they were in. -->
+        <service
+            android:name=".QuickSaveTileService"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher"
+            android:label="@string/tile_quick_save"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
 
         <!--
             Spawned by Android when our autofill service replies with an

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Static app shortcuts surfaced on long-press of the launcher icon.
+    The "Add credential" shortcut is the always-works fallback when
+    the Autofill / Credential Manager save flow doesn't fire — the
+    user can long-press the app icon and jump straight to the Add
+    Entry form to record what they just typed in another app.
+-->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="add_entry"
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutShortLabel="@string/shortcut_add_short"
+        android:shortcutLongLabel="@string/shortcut_add_long">
+        <intent
+            android:action="com.example.passwort_manager.ACTION_ADD_ENTRY"
+            android:targetPackage="com.example.passwort_manager"
+            android:targetClass="com.example.passwort_manager.MainActivity" />
+        <categories android:name="android.shortcut.conversation" />
+    </shortcut>
+</shortcuts>
