@@ -75,14 +75,37 @@
             android:excludeFromRecents="true"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
+        <!-- Receives notification taps from PasswortAccessibilityService
+             to queue a fill request without bouncing through a
+             transparent Activity. Skipping the Activity transition
+             keeps the target app (Discord etc.) in the foreground the
+             whole time, so the fill feels instant. -->
+        <receiver
+            android:name=".FillBroadcastReceiver"
+            android:exported="false" />
+
         <!-- Quick Settings tile users can pin to their notification
              shade for one-tap "save credential" access. Always works
              regardless of which app they were in. -->
         <service
             android:name=".QuickSaveTileService"
             android:exported="true"
-            android:icon="@mipmap/ic_launcher"
+            android:icon="@drawable/ic_lock_status"
             android:label="@string/tile_quick_save"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <!-- Companion to QuickSaveTileService: "Fill credential" — opens
+             our app in pick-to-fill mode so the user can inject any
+             saved credential into the form they had open underneath. -->
+        <service
+            android:name=".QuickFillTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_lock_status"
+            android:label="@string/tile_quick_fill"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
             <intent-filter>
                 <action android:name="android.service.quicksettings.action.QS_TILE" />
@@ -100,15 +123,19 @@
             android:theme="@style/Theme.Passwort_Manager"
             android:excludeFromRecents="true" />
 
-        <!-- Launched from PasswortAutofillService.onSaveRequest when the
-             user submits a login form in another app. The activity
-             carries the captured username + password + host as Intent
-             extras and lets the user confirm before we persist. -->
+        <!-- Launched from PasswortAutofillService.onSaveRequest, the
+             accessibility-fill service, or Credential Manager when the
+             user submits a login form. Lives in its own task (empty
+             taskAffinity) so finishAndRemoveTask() returns the user
+             to the app they were logging into rather than uncovering
+             MainActivity in the manager's task. -->
         <activity
             android:name=".SaveActivity"
             android:exported="false"
             android:theme="@style/Theme.Passwort_Manager"
-            android:excludeFromRecents="true" />
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:launchMode="singleTask" />
 
         <!--
             The autofill service itself. Requires BIND_AUTOFILL_SERVICE so

@@ -13,7 +13,7 @@
 -->
 <accessibility-service
     xmlns:android="http://schemas.android.com/apk/res/android"
-    android:accessibilityEventTypes="typeWindowContentChanged|typeWindowStateChanged|typeViewFocused|typeViewTextChanged"
+    android:accessibilityEventTypes="typeWindowContentChanged|typeWindowStateChanged|typeViewFocused|typeViewTextChanged|typeViewClicked"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows|flagReportViewIds"
     android:canRetrieveWindowContent="true"

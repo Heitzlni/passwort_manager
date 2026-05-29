@@ -2,8 +2,6 @@ package com.example.passwort_manager
 
 import android.app.Activity
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 
 /**
  * Transparent shim activity that the accessibility-fill notification
@@ -22,15 +20,16 @@ class FillTriggerActivity : Activity() {
         val username = intent.getStringExtra(PasswortAccessibilityService.EXTRA_USERNAME).orEmpty()
         val password = intent.getStringExtra(PasswortAccessibilityService.EXTRA_PASSWORD).orEmpty()
 
-        // Small delay so this activity actually finishes / the previous
-        // (target) window regains focus before the service injects
-        // text. Without the delay the service writes to *this*
-        // activity's (empty) window, not the target form.
-        Handler(Looper.getMainLooper()).postDelayed({
-            PasswortAccessibilityService.instance?.fillCurrentForm(username, password)
-        }, 250)
+        // Queue the inject and bow out. The service consumes the
+        // request when the next accessibility event arrives showing
+        // a password field — by then the target app has actually
+        // regained focus and rootInActiveWindow points at its tree.
+        //
+        // A fixed delay (we used to use 250ms) was racey on slower
+        // devices: by the time the service ran, focus had only just
+        // started transitioning back to the source app.
+        PasswortAccessibilityService.instance?.queueQuickFill(username, password)
 
-        // Bow out immediately.
         finish()
     }
 }

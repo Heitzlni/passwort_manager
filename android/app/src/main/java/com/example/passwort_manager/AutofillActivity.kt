@@ -15,14 +15,26 @@ import android.widget.RemoteViews
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.fragment.app.FragmentActivity
+import androidx.compose.foundation.background
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.example.passwort_manager.ui.theme.Passwort_ManagerTheme
+import com.example.passwort_manager.ui.theme.PurpleGlow
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -68,8 +80,11 @@ class AutofillActivity : FragmentActivity() {
         packageNameFromCaller = intent.getStringExtra(PasswortAutofillService.EXTRA_PACKAGE_NAME).orEmpty()
 
         setContent {
-            Passwort_ManagerTheme {
-                Surface(modifier = Modifier.fillMaxSize()) {
+            Passwort_ManagerTheme(darkTheme = true) {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background,
+                ) {
                     UnlockForAutofill(
                         host = effectiveHost(),
                         onCancel = ::cancelAndFinish,
@@ -228,76 +243,166 @@ private fun UnlockForAutofill(
         VaultState.accounts.value?.let(onUnlocked)
     }
 
-    Column(
-        modifier = Modifier.fillMaxSize().padding(20.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+    val pwInteraction = remember { MutableInteractionSource() }
+    val pwFocused by pwInteraction.collectIsFocusedAsState()
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(
+                Brush.radialGradient(
+                    colors = listOf(
+                        PurpleGlow.copy(alpha = 0.10f),
+                        MaterialTheme.colorScheme.background,
+                    ),
+                    radius = 900f,
+                )
+            )
+            .padding(horizontal = 20.dp),
+        contentAlignment = Alignment.Center,
     ) {
-        Text("Unlock to fill", style = MaterialTheme.typography.headlineSmall)
-        if (host.isNotEmpty()) {
-            Text(
-                "For: $host",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-
-        if (biometricReady) {
-            Button(
-                enabled = !busy,
-                onClick = {
-                    val act = activity ?: return@Button
-                    busy = true
-                    runAutofillBiometricUnlock(
-                        activity = act,
-                        scope = scope,
-                        vaultFile = vaultFile,
-                        onError = { msg -> error = msg; busy = false },
-                        onSuccess = { accs -> onUnlocked(accs) },
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 420.dp)
+                .shadow(
+                    elevation = 24.dp,
+                    shape = RoundedCornerShape(24.dp),
+                    ambientColor = PurpleGlow,
+                    spotColor = PurpleGlow,
+                ),
+            shape = RoundedCornerShape(24.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant,
+            tonalElevation = 4.dp,
+        ) {
+            Column(
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 28.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                // Glowing lock badge — visual anchor and a hint at
+                // which app the user has just been routed into.
+                Box(
+                    modifier = Modifier
+                        .size(64.dp)
+                        .shadow(
+                            elevation = 20.dp,
+                            shape = RoundedCornerShape(20.dp),
+                            ambientColor = PurpleGlow,
+                            spotColor = PurpleGlow,
+                        )
+                        .background(
+                            color = MaterialTheme.colorScheme.primaryContainer,
+                            shape = RoundedCornerShape(20.dp),
+                        ),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        Icons.Default.Lock,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                        modifier = Modifier.size(32.dp),
                     )
-                },
-                modifier = Modifier.fillMaxWidth(),
-            ) { Text("Unlock with fingerprint") }
-            Text(
-                "Or type your master password:",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
+                }
 
-        OutlinedTextField(
-            value = password,
-            onValueChange = { password = it },
-            label = { Text("Master password") },
-            singleLine = true,
-            visualTransformation = PasswordVisualTransformation(),
-            keyboardOptions = KeyboardOptions.Default,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        if (error != null) Text(error!!, color = MaterialTheme.colorScheme.error)
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Button(
-                enabled = password.isNotEmpty() && !busy,
-                onClick = {
-                    busy = true
-                    scope.launch {
-                        val bytes = vaultFile.readBytes()
-                        val r = withContext(Dispatchers.Default) {
-                            VaultBridge.unlock(bytes, password)
-                        }
-                        when (r) {
-                            is UnlockResult.Success -> {
-                                VaultState.unlock(r.accounts, r.derivedKey, vaultFile)
-                                onUnlocked(r.accounts)
+                Text(
+                    "Unlock to fill",
+                    style = MaterialTheme.typography.headlineSmall.copy(
+                        fontWeight = FontWeight.SemiBold,
+                    ),
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                if (host.isNotEmpty()) {
+                    Text(
+                        host,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+
+                if (biometricReady) {
+                    Button(
+                        enabled = !busy,
+                        onClick = {
+                            val act = activity ?: return@Button
+                            busy = true
+                            runAutofillBiometricUnlock(
+                                activity = act,
+                                scope = scope,
+                                vaultFile = vaultFile,
+                                onError = { msg -> error = msg; busy = false },
+                                onSuccess = { accs -> onUnlocked(accs) },
+                            )
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("Unlock with fingerprint") }
+                    Text(
+                        "Or type your master password:",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+
+                // Purple halo while focused — subtle but enough to
+                // signal "this is the active field". The shadow tint
+                // requires API 28+ which we already require.
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    label = { Text("Master password") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions.Default,
+                    interactionSource = pwInteraction,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .shadow(
+                            elevation = if (pwFocused) 18.dp else 0.dp,
+                            shape = RoundedCornerShape(8.dp),
+                            ambientColor = PurpleGlow,
+                            spotColor = PurpleGlow,
+                        ),
+                )
+                if (error != null) {
+                    Text(
+                        error!!,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    OutlinedButton(
+                        onClick = onCancel,
+                        modifier = Modifier.weight(1f),
+                    ) { Text("Cancel") }
+                    Button(
+                        enabled = password.isNotEmpty() && !busy,
+                        modifier = Modifier.weight(1f),
+                        onClick = {
+                            busy = true
+                            scope.launch {
+                                val bytes = vaultFile.readBytes()
+                                val r = withContext(Dispatchers.Default) {
+                                    VaultBridge.unlock(bytes, password)
+                                }
+                                when (r) {
+                                    is UnlockResult.Success -> {
+                                        VaultState.unlock(r.accounts, r.derivedKey, vaultFile)
+                                        onUnlocked(r.accounts)
+                                    }
+                                    is UnlockResult.Failure -> {
+                                        error = r.message
+                                        busy = false
+                                    }
+                                }
                             }
-                            is UnlockResult.Failure -> {
-                                error = r.message
-                                busy = false
-                            }
-                        }
-                    }
-                },
-            ) { Text(if (busy) "Unlocking…" else "Unlock") }
-            OutlinedButton(onClick = onCancel) { Text("Cancel") }
+                        },
+                    ) { Text(if (busy) "Unlocking…" else "Unlock") }
+                }
+            }
         }
     }
 }

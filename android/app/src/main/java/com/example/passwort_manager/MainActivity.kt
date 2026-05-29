@@ -46,16 +46,26 @@ class MainActivity : FragmentActivity() {
         /** Triggers the launcher shortcut + Quick Settings tile flow:
          *  open straight to Add Entry after unlock. */
         const val ACTION_ADD_ENTRY = "com.example.passwort_manager.ACTION_ADD_ENTRY"
+        /** Quick-Fill tile flow: open the account list in pick-to-fill
+         *  mode after unlock. Tapping a row queues its credentials in
+         *  the accessibility service and finishes the activity so the
+         *  previous app comes back to the foreground for the inject. */
+        const val ACTION_PICK_AND_FILL = "com.example.passwort_manager.ACTION_PICK_AND_FILL"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         val openAddEntry = intent?.action == ACTION_ADD_ENTRY
+        val pickAndFill = intent?.action == ACTION_PICK_AND_FILL
         setContent {
             Passwort_ManagerTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    AppRoot(openAddEntryOnUnlock = openAddEntry)
+                    AppRoot(
+                        openAddEntryOnUnlock = openAddEntry,
+                        pickAndFillOnUnlock = pickAndFill,
+                        finishActivity = { finish() },
+                    )
                 }
             }
         }
@@ -88,6 +98,9 @@ private sealed class Screen {
     data class Settings(val previous: Screen) : Screen()
     /** New-entry form — opens from the list's FAB. */
     data class AddEntry(val previous: Screen) : Screen()
+    /** Pick-account-to-fill — Quick-Fill tile. Tapping a row queues
+     *  its credentials in the accessibility service and finishes. */
+    data class PickAndFill(val search: String = "") : Screen()
     /** Edit-entry form — opens from the detail screen's edit button. */
     data class EditEntry(val previous: Screen, val index: Int) : Screen()
     /** Offline weak/reused report. */
@@ -97,13 +110,18 @@ private sealed class Screen {
 }
 
 @Composable
-private fun AppRoot(openAddEntryOnUnlock: Boolean = false) {
+private fun AppRoot(
+    openAddEntryOnUnlock: Boolean = false,
+    pickAndFillOnUnlock: Boolean = false,
+    finishActivity: () -> Unit = {},
+) {
     val context = LocalContextSafe()
     val vaultFile = remember(context) { File(context.getExternalFilesDir(null), "vault.json") }
     // Tracks the "user came in via Add-Entry shortcut" intent so we
     // can jump there as soon as the vault is unlocked. Drained after
     // the first navigation so re-entries don't keep re-routing.
     var pendingAddEntry by remember { mutableStateOf(openAddEntryOnUnlock) }
+    var pendingPickAndFill by remember { mutableStateOf(pickAndFillOnUnlock) }
 
     // Snapshot the process-wide unlocked state so we route to the
     // right screen if the user re-enters the app while still unlocked
@@ -248,6 +266,14 @@ private fun AppRoot(openAddEntryOnUnlock: Boolean = false) {
         }
     }
 
+    // Quick-Fill tile path: jump straight to the picker once unlocked.
+    LaunchedEffect(VaultState.accounts.value, pendingPickAndFill) {
+        if (pendingPickAndFill && VaultState.accounts.value != null) {
+            screen = Screen.PickAndFill()
+            pendingPickAndFill = false
+        }
+    }
+
     // Run biometric enrollment when triggered by a master-password
     // unlock. Stays inside a LaunchedEffect so the prompt is scoped
     // to the composition and survives recompositions.
@@ -335,6 +361,37 @@ private fun AppRoot(openAddEntryOnUnlock: Boolean = false) {
                 changeMasterResult = null
             }
         }
+        return
+    }
+
+    // Quick-Fill picker — owns its own UI, gets early-returned just
+    // like Settings / AddEntry. Picking a row queues credentials
+    // in the accessibility service and finishes MainActivity so the
+    // previous app comes back to the foreground for the inject.
+    if (screen is Screen.PickAndFill) {
+        val s = screen as Screen.PickAndFill
+        val accounts = VaultState.accounts.value
+        if (accounts == null) {
+            // Auto-lock fired between unlock and now — bounce to
+            // LockedScreen by clearing our screen state. The user
+            // will need to re-enter the master password.
+            screen = Screen.Locked()
+            return
+        }
+        androidx.activity.compose.BackHandler { finishActivity() }
+        PickToFillScreen(
+            accounts = accounts,
+            search = s.search,
+            onSearchChange = { screen = s.copy(search = it) },
+            onPick = { account ->
+                PasswortAccessibilityService.instance?.queueQuickFill(
+                    username = account.username,
+                    password = account.password,
+                )
+                finishActivity()
+            },
+            onCancel = { finishActivity() },
+        )
         return
     }
 
@@ -429,7 +486,8 @@ private fun AppRoot(openAddEntryOnUnlock: Boolean = false) {
                 is Screen.AddEntry,
                 is Screen.EditEntry,
                 is Screen.Health,
-                is Screen.Audit -> {
+                is Screen.Audit,
+                is Screen.PickAndFill -> {
                     // Already handled by the early-return blocks above —
                     // unreachable here but the compiler insists on
                     // exhaustiveness.
@@ -857,6 +915,80 @@ private fun LockedScreen(
             "Argon2id with 128 MiB memory takes about half a second on this phone.",
             style = MaterialTheme.typography.bodySmall,
         )
+    }
+}
+
+// ===================== Quick-Fill picker =====================
+//
+// Looks like EntryListScreen but the tap behavior is "inject these
+// credentials into whatever form is open underneath us", not "open
+// the detail view". Reached only via the Quick-Fill tile.
+
+@Composable
+private fun PickToFillScreen(
+    accounts: List<Account>,
+    search: String,
+    onSearchChange: (String) -> Unit,
+    onPick: (Account) -> Unit,
+    onCancel: () -> Unit,
+) {
+    val matching: List<Account> = remember(accounts, search) {
+        val q = search.trim().lowercase()
+        if (q.isEmpty()) accounts
+        else accounts.filter {
+            (it.name + " " + it.url + " " + it.username).lowercase().contains(q)
+        }
+    }
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Pick credential to fill") },
+                navigationIcon = {
+                    IconButton(onClick = onCancel) {
+                        Icon(Icons.Default.Close, contentDescription = "Cancel")
+                    }
+                },
+            )
+        }
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .padding(padding)
+                .fillMaxSize(),
+        ) {
+            OutlinedTextField(
+                value = search,
+                onValueChange = onSearchChange,
+                singleLine = true,
+                placeholder = { Text("Search by name, URL, or username") },
+                trailingIcon = {
+                    if (search.isNotEmpty()) {
+                        IconButton(onClick = { onSearchChange("") }) {
+                            Icon(Icons.Default.Close, contentDescription = "Clear")
+                        }
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+            )
+            Text(
+                "Tap an entry to inject its credentials into the form " +
+                    "you had open before opening the tile.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 16.dp),
+            )
+            HorizontalDivider(modifier = Modifier.padding(top = 8.dp))
+            LazyColumn(modifier = Modifier.fillMaxSize()) {
+                items(matching.size) { i ->
+                    val acc = matching[i]
+                    EntryRow(account = acc, onClick = { onPick(acc) })
+                    HorizontalDivider()
+                }
+                item { Spacer(Modifier.height(80.dp)) }
+            }
+        }
     }
 }
 

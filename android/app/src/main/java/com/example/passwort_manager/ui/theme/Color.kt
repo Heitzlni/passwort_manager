@@ -2,10 +2,28 @@ package com.example.passwort_manager.ui.theme
 
 import androidx.compose.ui.graphics.Color
 
-val Purple80 = Color(0xFFD0BCFF)
-val PurpleGrey80 = Color(0xFFCCC2DC)
-val Pink80 = Color(0xFFEFB8C8)
+// Brand purple — the same #7C6DD8 lock fill from the Linux app's
+// packaging/passwort-manager.svg. Brighter variants are layered on
+// dark backgrounds; deeper variants are used in light mode.
+val PurpleBrand = Color(0xFF7C6DD8)
+val PurpleVivid = Color(0xFF9C82FF)
+val PurpleGlow = Color(0xFFB59CFF)
+val PurpleDeep = Color(0xFF4A3C9E)
 
-val Purple40 = Color(0xFF6650a4)
-val PurpleGrey40 = Color(0xFF625b71)
-val Pink40 = Color(0xFF7D5260)
+// Container / tint accents that reach for the same purple family
+// without competing with the foreground.
+val PurpleContainerDark = Color(0xFF2F2546)
+val PurpleContainerLight = Color(0xFFE7DFFF)
+val PurpleTint = Color(0xFFCEC1FF)
+
+// Surfaces — slightly purple-tinged neutrals so the app reads as
+// "ours" even on screens that show mostly background.
+val SurfaceDark = Color(0xFF15131C)
+val SurfaceVariantDark = Color(0xFF231F30)
+val OnSurfaceDark = Color(0xFFEDE7FA)
+val OnSurfaceVariantDark = Color(0xFFC9C0DD)
+
+val SurfaceLight = Color(0xFFFBF8FF)
+val SurfaceVariantLight = Color(0xFFEDE6F8)
+val OnSurfaceLight = Color(0xFF1B1726)
+val OnSurfaceVariantLight = Color(0xFF494157)

@@ -49,6 +49,11 @@ class SaveActivity : FragmentActivity() {
         const val EXTRA_CAPTURED_PASSWORD = "pwm_save_password"
         const val EXTRA_HOST = "pwm_save_host"
         const val EXTRA_PACKAGE = "pwm_save_package"
+        /** Set when the accessibility capture couldn't reliably read
+         *  the password (mask glyphs in the buffer). Drives the
+         *  "Couldn't read the password" banner and disables the
+         *  password's blank-check early-return. */
+        const val EXTRA_CAPTURE_PARTIAL = "pwm_save_partial"
         /** Set by PasswortCredentialProviderService when this activity is
          *  launched from the Credential Manager save flow rather than
          *  the legacy AutofillService.onSaveRequest path. Drives where
@@ -70,10 +75,13 @@ class SaveActivity : FragmentActivity() {
             ?: intent.getStringExtra(EXTRA_CAPTURED_PASSWORD).orEmpty()
         val host = intent.getStringExtra(EXTRA_HOST).orEmpty()
         val pkg = intent.getStringExtra(EXTRA_PACKAGE).orEmpty()
+        val capturePartial = intent.getBooleanExtra(EXTRA_CAPTURE_PARTIAL, false)
 
-        if (capturedPassword.isBlank()) {
+        // Empty password is OK in the partial-capture case — the
+        // user types it in by hand. Otherwise the intent is malformed.
+        if (capturedPassword.isBlank() && !capturePartial) {
             if (fromCm) failCredentialManager("no password in create request")
-            finish(); return
+            finishToOriginatingApp(); return
         }
 
         setContent {
@@ -84,17 +92,27 @@ class SaveActivity : FragmentActivity() {
                         capturedPassword = capturedPassword,
                         host = host,
                         pkg = pkg,
+                        capturePartial = capturePartial,
                         onDone = { saved ->
                             if (fromCm) {
                                 if (saved) succeedCredentialManager()
                                 else failCredentialManager("user cancelled")
                             }
-                            finish()
+                            finishToOriginatingApp()
                         },
                     )
                 }
             }
         }
+    }
+
+    /** Close this activity AND drop its task entirely, so the system
+     *  brings whatever the user had open before (the app they were
+     *  logging into) back to the foreground. Without this, the next
+     *  visible thing is the manager's MainActivity if it was in the
+     *  task stack — which feels like getting kicked into the wrong app. */
+    private fun finishToOriginatingApp() {
+        finishAndRemoveTask()
     }
 
     /** Pull username + password out of the [androidx.credentials]
@@ -148,6 +166,7 @@ private fun SaveFlow(
     capturedPassword: String,
     host: String,
     pkg: String,
+    capturePartial: Boolean = false,
     onDone: (saved: Boolean) -> Unit,
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -176,6 +195,7 @@ private fun SaveFlow(
             capturedPassword = capturedPassword,
             host = host,
             pkg = pkg,
+            capturePartial = capturePartial,
             vaultFile = vaultFile,
             onDone = onDone,
         )
@@ -348,6 +368,7 @@ private fun SaveForm(
     capturedPassword: String,
     host: String,
     pkg: String,
+    capturePartial: Boolean = false,
     vaultFile: File,
     onDone: (saved: Boolean) -> Unit,
 ) {
@@ -390,7 +411,7 @@ private fun SaveForm(
     val defaultName = remember(host, pkg) {
         when {
             host.isNotEmpty() -> host
-            pkg.isNotEmpty() -> pkg
+            pkg.isNotEmpty() -> friendlyAppName(pkg)
             else -> ""
         }
     }
@@ -437,6 +458,34 @@ private fun SaveForm(
                 .padding(horizontal = 16.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
+            if (capturePartial) {
+                // The accessibility capture only got mask glyphs back
+                // from the password field — common in browsers and a
+                // few apps that fully mask events before they dispatch.
+                // We still want to save the entry; the user just types
+                // the password by hand on this screen.
+                Surface(
+                    tonalElevation = 2.dp,
+                    modifier = Modifier.fillMaxWidth(),
+                    color = MaterialTheme.colorScheme.errorContainer,
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text(
+                            "Couldn't read the password",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                        )
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            "The form's password field hid its characters from us " +
+                                "(common in browsers and some apps). Type or paste " +
+                                "the password below to save the entry.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                        )
+                    }
+                }
+            }
             // Target chooser — only shown when there's at least one
             // existing entry on the same host. Gives the user the
             // explicit choice between updating an existing entry
@@ -589,6 +638,20 @@ private fun LabelledField(
 }
 
 // ===================== Helpers =====================
+
+/** Turn "com.example.foo" into "Foo", "com.discord" into "Discord",
+ *  "org.mozilla.firefox" into "Firefox". Picks the first segment that
+ *  isn't a generic TLD-like prefix, falling back to the whole package
+ *  name if everything looks generic. Used as the default entry name
+ *  when the accessibility-save flow only has the package name to go on. */
+private fun friendlyAppName(pkg: String): String {
+    val parts = pkg.split('.').filter { it.isNotEmpty() }
+    if (parts.isEmpty()) return pkg
+    val skip = setOf("com", "org", "net", "io", "co", "app", "android", "google")
+    val pick = parts.dropWhile { it.lowercase() in skip }.firstOrNull()
+        ?: parts.last()
+    return pick.replaceFirstChar { it.uppercase() }
+}
 
 /** Same host-matching rule as [VaultState.findByHost], inlined here so
  *  SaveActivity doesn't need to expose any extra surface. */

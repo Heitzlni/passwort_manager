@@ -1,58 +1,59 @@
 package com.example.passwort_manager.ui.theme
 
-import android.app.Activity
-import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.dynamicDarkColorScheme
-import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
-import androidx.compose.ui.platform.LocalContext
 
-private val DarkColorScheme = darkColorScheme(
-    primary = Purple80,
-    secondary = PurpleGrey80,
-    tertiary = Pink80
+private val DarkColors = darkColorScheme(
+    primary = PurpleVivid,
+    onPrimary = OnSurfaceDark,
+    primaryContainer = PurpleContainerDark,
+    onPrimaryContainer = PurpleGlow,
+    secondary = PurpleTint,
+    onSecondary = OnSurfaceDark,
+    tertiary = PurpleGlow,
+    background = SurfaceDark,
+    onBackground = OnSurfaceDark,
+    surface = SurfaceDark,
+    onSurface = OnSurfaceDark,
+    surfaceVariant = SurfaceVariantDark,
+    onSurfaceVariant = OnSurfaceVariantDark,
 )
 
-private val LightColorScheme = lightColorScheme(
-    primary = Purple40,
-    secondary = PurpleGrey40,
-    tertiary = Pink40
-
-    /* Other default colors to override
-    background = Color(0xFFFFFBFE),
-    surface = Color(0xFFFFFBFE),
-    onPrimary = Color.White,
-    onSecondary = Color.White,
-    onTertiary = Color.White,
-    onBackground = Color(0xFF1C1B1F),
-    onSurface = Color(0xFF1C1B1F),
-    */
+private val LightColors = lightColorScheme(
+    primary = PurpleBrand,
+    onPrimary = OnSurfaceLight.copy(alpha = 0.0f).copy(red = 1f, green = 1f, blue = 1f),
+    primaryContainer = PurpleContainerLight,
+    onPrimaryContainer = PurpleDeep,
+    secondary = PurpleDeep,
+    onSecondary = SurfaceLight,
+    tertiary = PurpleBrand,
+    background = SurfaceLight,
+    onBackground = OnSurfaceLight,
+    surface = SurfaceLight,
+    onSurface = OnSurfaceLight,
+    surfaceVariant = SurfaceVariantLight,
+    onSurfaceVariant = OnSurfaceVariantLight,
 )
 
+/**
+ * App theme. Dynamic color (Material You) is deliberately OFF so the
+ * brand purple comes through on every phone — otherwise on Material
+ * You devices the launcher's wallpaper-derived palette overrides us
+ * and the app reads as generic blue/green/whatever the user's
+ * wallpaper happens to be.
+ */
 @Composable
 fun Passwort_ManagerTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
-    // Dynamic color is available on Android 12+
-    dynamicColor: Boolean = true,
-    content: @Composable () -> Unit
+    content: @Composable () -> Unit,
 ) {
-    val colorScheme = when {
-        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
-            val context = LocalContext.current
-            if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
-        }
-
-        darkTheme -> DarkColorScheme
-        else -> LightColorScheme
-    }
-
+    val colors = if (darkTheme) DarkColors else LightColors
     MaterialTheme(
-        colorScheme = colorScheme,
+        colorScheme = colors,
         typography = Typography,
-        content = content
+        content = content,
     )
 }
